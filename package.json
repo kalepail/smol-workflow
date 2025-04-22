@@ -1,0 +1,16 @@
+{
+	"name": "smol-workflow",
+	"version": "0.0.0",
+	"scripts": {
+		"start": "wrangler dev --test-scheduled",
+		"start:remote": "wrangler dev --remote",
+		"deploy": "wrangler deploy",
+		"cf-typegen": "wrangler types"
+	},
+	"devDependencies": {
+		"@types/node": "^22.14.1",
+		"itty-fetcher": "^0.9.4",
+		"typescript": "^5.8.3",
+		"wrangler": "^4.12.0"
+	}
+}

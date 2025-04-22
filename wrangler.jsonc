@@ -1,0 +1,137 @@
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+    "$schema": "node_modules/wrangler/config-schema.json",
+    "name": "smol-workflow",
+    "main": "src/index.ts",
+    "compatibility_date": "2025-03-15",
+    "compatibility_flags": [
+        "nodejs_compat"
+    ],
+    "observability": {
+        "enabled": true,
+        "logs": {
+            "invocation_logs": false
+        }
+    },
+    "workflows": [
+        {
+            "name": "smol-workflow",
+            "binding": "WORKFLOW",
+            "class_name": "Workflow"
+        }
+    ],
+    /**
+   * Smart Placement
+   * Docs: https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
+   */
+    // "placement": { "mode": "smart" },
+    /**
+   * Bindings
+   * Bindings allow your Worker to interact with resources on the Cloudflare Developer Platform, including
+   * databases, object storage, AI inference, real-time communication and more.
+   * https://developers.cloudflare.com/workers/runtime-apis/bindings/
+   */
+    "ai": {
+        "binding": "AI"
+    },
+    "durable_objects": {
+        "bindings": [
+            {
+                "name": "DURABLE_OBJECT",
+                "class_name": "SmolDurableObject"
+            },
+            {
+                "name": "DO_STATE",
+                "class_name": "SmolState"
+            }
+        ]
+    },
+    // "queues": {
+    //   "producers": [
+    //     {
+    //       "queue": "smol-queue",
+    //       "binding": "QUEUE",
+    //       "delivery_delay": 0,
+    //     }
+    //   ],
+    //   "consumers": [
+    //     {
+    //       "queue": "smol-queue",
+    //       "max_batch_size": 10,
+    //       "max_batch_timeout": 5,
+    //       "max_retries": 6,
+    //       "dead_letter_queue": "smol-queue-dlq",
+    //       "retry_delay": 0,
+    //       // "max_concurrency": 10
+    //     }, {
+    //       "queue": "smol-queue-dlq",
+    //       // "max_retries": 0
+    //     }
+    //   ]
+    // },
+    /**
+   * Environment Variables
+   * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
+   */
+    // "vars": { "MY_VARIABLE": "production_value" },
+    /**
+   * Note: Use secrets to store sensitive data.
+   * https://developers.cloudflare.com/workers/configuration/secrets/
+   */
+    /**
+   * Static Assets
+   * https://developers.cloudflare.com/workers/static-assets/binding/
+   */
+    // "assets": { "directory": "./public/", "binding": "ASSETS" },
+    /**
+   * Service Bindings (communicate between multiple Workers)
+   * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
+   */
+    "services": [
+        {
+            "binding": "AISONGGENERATOR",
+            "service": "aisonggenerator-worker"
+        }
+    ],
+    "migrations": [
+        {
+            "tag": "v1",
+            "new_classes": [
+                "SmolDurableObject"
+            ]
+        },
+        {
+            "tag": "v2",
+            "new_classes": [
+                "SmolState"
+            ]
+        }
+    ],
+    "triggers": {
+        "crons": [
+            "* * * * *"
+        ],
+    },
+    "r2_buckets": [
+        {
+            "binding": "SMOL_BUCKET",
+            "bucket_name": "smol-r2"
+        }
+    ],
+    "kv_namespaces": [
+        {
+            "binding": "SMOL_KV",
+            "id": "a42b9877d5c947e1917a2f0f56bbbc7f"
+        }
+    ],
+    "d1_databases": [
+        {
+            "binding": "SMOL_D1",
+            "database_name": "smol-d1",
+            "database_id": "fd81569c-6984-4935-824f-efa4f79e247b"
+        }
+    ]
+}
