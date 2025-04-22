@@ -26,7 +26,7 @@ export async function generateLyrics(env: Env, prompt: string, description: stri
 }
 
 // Generate a song from lyrics
-export async function generateSongs(env: Env, lyrics: AiSongGeneratorLyrics): Promise<number[]> {
+export async function generateSongs(env: Env, lyrics: AiSongGeneratorLyrics): Promise<number[] | string[]> {
     return env.AISONGGENERATOR.fetch('http://aisonggenerator-worker/api/songs', {
         method: 'POST',
         headers: {
@@ -42,7 +42,7 @@ export async function generateSongs(env: Env, lyrics: AiSongGeneratorLyrics): Pr
         })
 }
 
-export async function getSongs(env: Env, ids: number[]): Promise<AiSongGeneratorSong[]> {
+export async function getSongs(env: Env, ids: number[] | string[]): Promise<AiSongGeneratorSong[]> {
     return env.AISONGGENERATOR.fetch(`http://aisonggenerator-worker/api/songs?ids=${ids.join(',')}`)
         .then(async (res) => {
             if (res.ok)

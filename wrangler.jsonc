@@ -110,11 +110,11 @@
             ]
         }
     ],
-    "triggers": {
-        "crons": [
-            "* * * * *"
-        ],
-    },
+    // "triggers": {
+    //     "crons": [
+    //         "* * * * *"
+    //     ],
+    // },
     "r2_buckets": [
         {
             "binding": "SMOL_BUCKET",

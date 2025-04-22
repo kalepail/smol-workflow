@@ -1,25 +1,9 @@
-import { DurableObject, WorkflowEvent } from 'cloudflare:workers';
+import { DurableObject } from 'cloudflare:workers';
 
 export class SmolState extends DurableObject<Env> {
     constructor(state: DurableObjectState, env: Env) {
         super(state, env);
     }
-
-    setLatestTweet(tweetId: string) {
-        return this.ctx.storage.put('latestTweet', tweetId);
-    }
-    getLatestTweet() {
-        return this.ctx.storage.get<string>('latestTweet');
-    }
-    
-    // async getCount() {
-    //     const count = await this.ctx.storage.get<number>('count') || 0
-    //     return Math.max(count, 0);
-    // }
-    // async setCount(n: number) {
-    //     const count = await this.getCount();
-    //     return this.ctx.storage.put('count', Math.max(count + n, 0));
-    // }
 }
 
 export class SmolDurableObject extends DurableObject<Env> {
@@ -36,8 +20,6 @@ export class SmolDurableObject extends DurableObject<Env> {
         switch (step) {
             case 'payload':
             break;
-            case 'send_tweet_id':
-            break;
 
             case 'image_base64':
                 await this.env.SMOL_BUCKET.put(`${this.id}.png`, Buffer.from(data, 'base64'));
@@ -45,11 +27,8 @@ export class SmolDurableObject extends DurableObject<Env> {
 
             case 'description':
             break;
-
             case 'lyrics':
-                await this.env.SMOL_KV.put(this.id, JSON.stringify(data));
             break;
-
             case 'nsfw':
             break;
             case 'song_ids':
@@ -75,13 +54,19 @@ export class SmolDurableObject extends DurableObject<Env> {
         }
     }
 
-    // TODO consider adding a timestamp
     async getSteps() {
-        // TODO backfill image, audio and lyrics from their respective storage
         return Object.fromEntries((await this.ctx.storage.list()).entries());
     }
 
-    async flush() {
+    async setToFlush() {
+        await this.ctx.storage.setAlarm(Date.now() + (1000 * 60))
+    }
+
+    private async flush() {
         await this.ctx.storage.deleteAll();
+    }
+
+    async alarm() {
+        await this.flush();
     }
 }

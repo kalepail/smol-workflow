@@ -3,8 +3,6 @@ import { pixellab } from './ai/pixellab';
 import { imageDescribe } from './ai/cf';
 import { generateLyrics, generateSongs, getSongs } from './ai/aisonggenerator';
 import { checkNSFW } from './ai/nsfw';
-import { twitter } from './twitter';
-import { getToken } from './oauth';
 import { NonRetryableError } from 'cloudflare:workflows';
 
 // ensure gen can be paid for
@@ -24,19 +22,24 @@ import { NonRetryableError } from 'cloudflare:workflows';
 
 export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 	async run(event: WorkflowEvent<WorkflowParams>, step: WorkflowStep) {
-		const { retry_id } = event.payload;
-
-		let retry_steps: WorkflowSteps | undefined = undefined;
+		let retry_steps: WorkflowSteps | undefined;
+		let payload = event.payload;
+	
+		const { retry_id } = payload;	
 
 		if (retry_id) {
 			const retry_doid = this.env.DURABLE_OBJECT.idFromString(retry_id);
 			const retry_stub = this.env.DURABLE_OBJECT.get(retry_doid);
 
 			retry_steps = await retry_stub.getSteps() as WorkflowSteps;
-			event.payload = retry_steps.payload;
+			payload = retry_steps.payload;
 		}
 
-		let { tweet_id, tweet_author, prompt } = event.payload;
+		const { address, prompt } = payload;
+
+		if (!address) {
+			throw new NonRetryableError("event.payload missing address");
+		}
 
 		if (!prompt) {
 			throw new NonRetryableError("event.payload missing prompt");
@@ -55,30 +58,6 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 		const stub = this.env.DURABLE_OBJECT.get(doid);
 
 		await step.do('save payload', config, async () => stub.saveStep('payload', event.payload));
-
-		let send_tweet_id = retry_steps?.send_tweet_id
-
-		if (!send_tweet_id && tweet_id && tweet_author) {
-			send_tweet_id = await step.do(
-				'send tweet',
-				config,
-				async () => {
-					let tweet: any = await twitter.post('/tweets', {
-						text: `@${tweet_author} here's your smol: https://smol.xyz/?id=${event.instanceId}`,
-						reply: {
-							in_reply_to_tweet_id: tweet_id
-						}
-					}, {
-						headers: {
-							'Authorization': await getToken(this.env),
-						}
-					});
-					return tweet?.data?.id;
-				}
-			);
-
-			await step.do('save tweet', config, () => stub.saveStep('send_tweet_id', send_tweet_id))
-		}
 
 		let image_base64 = retry_steps?.image_base64 || await step.do(
 			'generate image',
@@ -190,15 +169,24 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 				// job id
 				// image ids
 			// consider saving job data to KV so we can toss the DO
+			await this.env.SMOL_KV.put(event.instanceId, JSON.stringify({
+				payload,
+				image_base64,
+				description,
+				lyrics,
+				nsfw,
+				song_ids,
+				songs,
+			}));
+			await stub.setToFlush();
 		});
 
 		return [
-			tweet_id,
-			prompt,
-			send_tweet_id,
+			payload,
 			image_base64,
 			description,
 			lyrics,
+			nsfw,
 			song_ids,
 			songs,
 		];
