@@ -26,13 +26,17 @@ export async function generateLyrics(env: Env, prompt: string, description: stri
 }
 
 // Generate a song from lyrics
-export async function generateSongs(env: Env, lyrics: AiSongGeneratorLyrics): Promise<number[] | string[]> {
+export async function generateSongs(env: Env, lyrics: AiSongGeneratorLyrics, is_public = true, is_instrumental = false): Promise<number[] | string[]> {
     return env.AISONGGENERATOR.fetch('http://aisonggenerator-worker/api/songs', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
         },
-        body: JSON.stringify(lyrics)
+        body: JSON.stringify({
+            ...lyrics,
+            public: is_public,
+            instrumental: is_instrumental
+        })
     })
         .then(async (res) => {
             if (res.ok)

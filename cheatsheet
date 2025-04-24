@@ -1,0 +1,2 @@
+npx wrangler d1 execute smol-d1 --remote --file=./schema.sql
+npx wrangler d1 execute smol-d1 --remote --command="SELECT Id FROM Smols WHERE Address <> 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF'"

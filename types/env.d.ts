@@ -27,4 +27,6 @@ type WorkflowParams = {
 	address?: string
 	prompt?: string
 	retry_id?: string
+	public?: boolean
+	instrumental?: boolean
 }

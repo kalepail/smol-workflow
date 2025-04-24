@@ -20,22 +20,52 @@ import { NonRetryableError } from 'cloudflare:workflows';
 // [maybe refund if error]
 // deliver results
 
+// TODO store a version for each smol to make it easier to debug in the future 
+
+const config: WorkflowStepConfig = {
+	retries: {
+		limit: 5,
+		delay: '10 second',
+		backoff: 'exponential',
+	},
+	timeout: '5 minutes',
+}
+
 export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 	async run(event: WorkflowEvent<WorkflowParams>, step: WorkflowStep) {
 		let retry_steps: WorkflowSteps | undefined;
 		let payload = event.payload;
-	
-		const { retry_id } = payload;	
+
+		const { retry_id } = payload;
 
 		if (retry_id) {
-			const retry_doid = this.env.DURABLE_OBJECT.idFromString(retry_id);
-			const retry_stub = this.env.DURABLE_OBJECT.get(retry_doid);
+			await step.do(
+				'retry workflow',
+				config,
+				async () => {
+					try {
+						const retry_doid = this.env.DURABLE_OBJECT.idFromString(retry_id);
+						const retry_stub = this.env.DURABLE_OBJECT.get(retry_doid);
 
-			retry_steps = await retry_stub.getSteps() as WorkflowSteps;
-			payload = retry_steps.payload;
+						retry_steps = await retry_stub.getSteps() as WorkflowSteps;
+						payload = {
+							...payload, // original payload
+							...retry_steps?.payload // previous payload (notably we keep the original address)
+						};
+
+					// if for some reason the above fails (legacy gens)
+					} catch (err) {
+						retry_steps = await this.env.SMOL_KV.get(retry_id, 'json') as WorkflowSteps;
+						payload = {
+							...payload, // original payload
+							...retry_steps?.payload // previous payload (notably we keep the original address)
+						};
+					}
+				}
+			);
 		}
 
-		const { address, prompt } = payload;
+		const { address, prompt, public: is_public = true, instrumental: is_instrumental = false } = payload;
 
 		if (!address) {
 			throw new NonRetryableError("event.payload missing address");
@@ -45,19 +75,10 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 			throw new NonRetryableError("event.payload missing prompt");
 		}
 
-		const config: WorkflowStepConfig = {
-			retries: {
-				limit: 5,
-				delay: '10 second',
-				backoff: 'exponential',
-			},
-			timeout: '5 minutes',
-		}
-
 		const doid = this.env.DURABLE_OBJECT.idFromString(event.instanceId);
 		const stub = this.env.DURABLE_OBJECT.get(doid);
 
-		await step.do('save payload', config, async () => stub.saveStep('payload', event.payload));
+		await step.do('save payload', config, async () => stub.saveStep('payload', payload));
 
 		let image_base64 = retry_steps?.image_base64 || await step.do(
 			'generate image',
@@ -110,7 +131,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 		await step.do('save nsfw check', config, () => stub.saveStep('nsfw', nsfw))
 
 		let song_ids = retry_steps?.song_ids || await step.do('generate songs', config, async () => {
-			let song_ids = await generateSongs(this.env, lyrics);
+			let song_ids = await generateSongs(this.env, lyrics, is_public, is_instrumental);
 			return song_ids;
 		})
 
@@ -132,8 +153,6 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 				let has_audio = false;
 				let is_streaming = false;
 
-				// TODO if any song is ready we should save that so there's at least something to listen to
-				// On the frontend then we'll just hide any songs that aren't ready (only save songs that are ready to DO)
 				for (let song of songs) {
 					if (song.audio) {
 						has_audio = true;
@@ -149,9 +168,6 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 					throw new Error(`Songs missing audio`);
 				}
 
-				// TODO Might not need to keep saving and updating this
-				// Definitely seeing some dead links 
-				// Might should just save this once as it's own step
 				if (is_streaming) {
 					await stub.saveStep('songs', songs)
 					throw new Error('Songs still streaming')
@@ -164,11 +180,22 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 		await step.do('save songs', config, () => stub.saveStep('songs', songs));
 
 		await step.do('complete workflow', config, async () => {
-			// save the whole job to sql
-				// author id
-				// job id
-				// image ids
-			// consider saving job data to KV so we can toss the DO
+			await stub.setToFlush();
+			await this.env.SMOL_D1.prepare(`
+                INSERT INTO Smols (Id, Title, Song_1, Song_2, Address, Public, Instrumental)
+				VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+				ON CONFLICT (Id) DO NOTHING
+            `)
+				.bind(
+					event.instanceId,
+					lyrics.title,
+					songs[0].music_id,
+					songs[1].music_id,
+					address,
+					is_public,
+					is_instrumental
+				)
+				.run()
 			await this.env.SMOL_KV.put(event.instanceId, JSON.stringify({
 				payload,
 				image_base64,
@@ -178,7 +205,18 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 				song_ids,
 				songs,
 			}));
-			await stub.setToFlush();
+			
+
+			if (retry_id) {
+				try {
+					const retry_doid = this.env.DURABLE_OBJECT.idFromString(retry_id);
+					const retry_stub = this.env.DURABLE_OBJECT.get(retry_doid);
+					await retry_stub.setToFlush();
+				} catch {}
+				
+				await this.env.SMOL_D1.prepare(`DELETE FROM Smols WHERE Id = ?1`).bind(retry_id).run()
+				await this.env.SMOL_KV.delete(retry_id);
+			}
 		});
 
 		return [

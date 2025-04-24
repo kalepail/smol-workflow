@@ -7,6 +7,7 @@
     "name": "smol-workflow",
     "main": "src/index.ts",
     "compatibility_date": "2025-03-15",
+    "minify": false,
     "compatibility_flags": [
         "nodejs_compat"
     ],
@@ -118,13 +119,15 @@
     "r2_buckets": [
         {
             "binding": "SMOL_BUCKET",
-            "bucket_name": "smol-r2"
+            "bucket_name": "smol-r2",
+            "preview_bucket_name": "smol-r2"
         }
     ],
     "kv_namespaces": [
         {
             "binding": "SMOL_KV",
-            "id": "a42b9877d5c947e1917a2f0f56bbbc7f"
+            "id": "a42b9877d5c947e1917a2f0f56bbbc7f",
+            "preview_id": "a42b9877d5c947e1917a2f0f56bbbc7f"
         }
     ],
     "d1_databases": [
