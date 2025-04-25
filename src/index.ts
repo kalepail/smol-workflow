@@ -13,12 +13,15 @@ export const app = new Hono<{ Bindings: Env }>()
 // LT token turnstile guard
 // Analytics track plays
 // Place safety caps on prompts
+// Use cookies for auth and start protecting endpoints
+// Implement blockchain
+// clear cache in the right places
 
 app.use('*', cors())
 
 app.get(
-	'/', 
-	cache({ 
+	'/',
+	cache({
 		cacheName: 'smol-workflow',
 		cacheControl: 'public, max-age=30',
 	}),
@@ -39,19 +42,18 @@ app.get(
 
 app.get(
 	'/:id',
-	cache({ cacheName: 'smol-workflow' }),
+	// cache({ cacheName: 'smol-workflow' }),
 	async ({ env, req, ...c }) => {
 		const id = req.param('id');
-		const smol = await env.SMOL_KV.get(id, 'json');
+		const smol = await env.SMOL_KV.get(id, { type: 'json', cacheTtl: 2419200 });
 
 		if (smol) {
+			const smol_d1 = await env.SMOL_D1.prepare(`SELECT * FROM Smols WHERE Id = ?1`).bind(id).first();
+
 			return c.json({
 				do: smol,
 				steps: null,
-			}, {
-				headers: {
-					'Cache-Control': 'public, max-age=2419200, immutable', // 4 weeks in seconds
-				}
+				d1: smol_d1,
 			})
 		} else {
 			const doid = env.DURABLE_OBJECT.idFromString(id);
@@ -67,17 +69,13 @@ app.get(
 			return c.json({
 				do: await stub.getSteps(),
 				steps: instance && await instance.status(),
-			}, {
-				headers: {
-					'Cache-Control': 'public, max-age=5', // 5 seconds
-				}
 			});
 		}
 	}
 );
 
 app.post('/', async ({ env, req, ...c }) => {
-	const body: { 
+	const body: {
 		address: string
 		prompt: string
 		public?: boolean
@@ -98,8 +96,8 @@ app.post('/', async ({ env, req, ...c }) => {
 		params: {
 			address: body.address,
 			prompt: body.prompt,
-			public: body.public || true,
-			instrumental: body.instrumental || false,
+			public: body.public ?? true,
+			instrumental: body.instrumental ?? false,
 		}
 	});
 
@@ -111,7 +109,7 @@ app.post('/', async ({ env, req, ...c }) => {
 app.post('/retry/:id', async ({ env, req, ...c }) => {
 	// TODO Disable retry if there's no need
 
-	const body: { 
+	const body: {
 		address: string
 	} = await req.json();
 
@@ -134,25 +132,72 @@ app.post('/retry/:id', async ({ env, req, ...c }) => {
 	return c.text(instanceId);
 });
 
+app.put('/:smol_id/:song_id', async ({ env, executionCtx, req, ...c }) => {
+	const smol_id = req.param('smol_id');
+	const song_id = req.param('song_id');
+
+	// TODO enforce authorship
+
+	await env.SMOL_D1.prepare(`
+		UPDATE Smols SET 
+			Song_1 = Song_2,
+			Song_2 = (SELECT s.Song_1 FROM Smols s WHERE s.Id = Smols.Id)
+		WHERE Id = ?1
+		AND Song_2 = ?2
+	`)
+		.bind(smol_id, song_id)
+		.run();
+
+	return c.body(null, 204);
+});
+
 app.get(
-	'/song/:id{.+\\.mp3}', 
+	'/song/:id{.+\\.mp3}',
 	cache({
 		cacheName: 'smol-workflow',
 		cacheControl: 'public, max-age=31536000, immutable', // 1 year in seconds
 	}),
 	async ({ env, req, ...c }) => {
 		const id = req.param('id');
-		const song = await env.SMOL_BUCKET.get(id);
+		const rangeHeader = req.header('range')
+		const headers = new Headers()
 
-		if (!song) {
+		let offset: number | undefined
+		let length: number | undefined
+		let status = 200
+
+		if (rangeHeader && rangeHeader.startsWith('bytes=')) {
+			const bytesRange = rangeHeader.replace(/bytes=/, '').split('-')
+			const start = parseInt(bytesRange[0], 10)
+			const end = bytesRange[1] ? parseInt(bytesRange[1], 10) : undefined
+
+			if (!isNaN(start) && (end === undefined || !isNaN(end))) {
+				offset = start
+
+				if (end !== undefined) {
+					length = end - start + 1
+				}
+			}
+		}
+
+		const object = await env.SMOL_BUCKET.get(id, {
+			range: offset !== undefined ? { offset, length } : undefined,
+		})
+
+		if (!object || !object.body) {
 			throw new HTTPException(404, { message: 'Song not found' });
 		}
 
-		return c.body(song.body, {
-			headers: {
-				'Content-Type': 'audio/mpeg'
-			}
-		});
+		object.writeHttpMetadata(headers)
+		headers.set('etag', object.httpEtag)
+
+		if (offset !== undefined) {
+			const end = offset + (length ?? object.size - offset) - 1
+			headers.set('content-range', `bytes ${offset}-${end}/${object.size}`)
+			status = 206
+		}
+
+		return new Response(object.body, { status, headers })
 	}
 );
 
@@ -203,7 +248,7 @@ if (env.MODE === 'dev') {
 			const doid = env.DURABLE_OBJECT.idFromString(id);
 			const stub = env.DURABLE_OBJECT.get(doid);
 			await stub.setToFlush();
-		} catch {}
+		} catch { }
 
 		await env.SMOL_KV.delete(id);
 		await env.SMOL_D1.prepare(`DELETE FROM Smols WHERE Id = ?1`).bind(id).run()

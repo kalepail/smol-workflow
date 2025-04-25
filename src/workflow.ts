@@ -193,7 +193,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 					songs[1].music_id,
 					address,
 					is_public,
-					is_instrumental
+					is_instrumental,
 				)
 				.run()
 			await this.env.SMOL_KV.put(event.instanceId, JSON.stringify({
