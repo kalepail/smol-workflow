@@ -26,33 +26,29 @@ app.get(
 		cacheControl: 'public, max-age=30',
 	}),
 	async ({ env, req, ...c }) => {
-		// const cursor = req.query('cursor');
-		// const { keys, ...rest } = await env.SMOL_KV.list({ limit: 1000, cursor });
+		const { results } = await env.SMOL_D1.prepare(`
+			SELECT Id, Title, Song_1 
+			FROM Smols 
+			WHERE Public = 1 
+			ORDER BY Created_At DESC 
+			LIMIT 1000
+		`).all();
 
-		// return c.json({
-		// 	results: keys.map(({ name }) => name),
-		// 	// @ts-ignore
-		// 	cursor: rest.cursor,
-		// })
-
-		const { results } = await env.SMOL_D1.prepare('SELECT Id FROM Smols WHERE Public = 1 ORDER BY Created_At DESC LIMIT 1000').all();
 		return c.json(results)
 	}
 );
 
 app.get(
 	'/:id',
-	// cache({ cacheName: 'smol-workflow' }),
 	async ({ env, req, ...c }) => {
 		const id = req.param('id');
-		const smol = await env.SMOL_KV.get(id, { type: 'json', cacheTtl: 2419200 });
+		const smol_d1 = await env.SMOL_D1.prepare(`SELECT * FROM Smols WHERE Id = ?1`).bind(id).first();
 
-		if (smol) {
-			const smol_d1 = await env.SMOL_D1.prepare(`SELECT * FROM Smols WHERE Id = ?1`).bind(id).first();
+		if (smol_d1) {
+			const smol_kv = await env.SMOL_KV.get(id, { type: 'json', cacheTtl: 2419200 });
 
 			return c.json({
-				do: smol,
-				steps: null,
+				kv_do: smol_kv,
 				d1: smol_d1,
 			})
 		} else {
@@ -67,8 +63,8 @@ app.get(
 			});
 
 			return c.json({
-				do: await stub.getSteps(),
-				steps: instance && await instance.status(),
+				kv_do: await stub.getSteps(),
+				wf: instance && await instance.status(),
 			});
 		}
 	}

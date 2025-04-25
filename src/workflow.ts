@@ -192,7 +192,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 					songs[0].music_id,
 					songs[1].music_id,
 					address,
-					is_public,
+					typeof nsfw !== 'string' && nsfw?.safe === false ? false : is_public, // if nsfw has been marked unsafe force smol to be private
 					is_instrumental,
 				)
 				.run()
