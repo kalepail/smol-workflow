@@ -6,6 +6,8 @@ import { cors } from 'hono/cors'
 import { Jimp, ResizeStrategy } from 'jimp';
 import { cache } from "hono/cache";
 import { env } from "cloudflare:workers";
+import { verifyAuthentication, verifyRegistration } from "./passkey";
+import { setSignedCookie } from 'hono/cookie'
 
 export const app = new Hono<{ Bindings: Env }>()
 
@@ -17,7 +19,43 @@ export const app = new Hono<{ Bindings: Env }>()
 // Implement blockchain
 // clear cache in the right places
 
-app.use('*', cors())
+app.use('*', cors({
+	origin: (origin) => origin ?? '*',
+	credentials: true,
+}))
+
+app.post('/login', async (c) => {
+	const { env, req } = c;
+	const body = await req.json();
+	const host = req.header('origin') ?? req.header('referer');
+	const { type, response, keyId } = body;
+
+	if (!host) {
+		throw new HTTPException(400, { message: 'Missing origin and referer' });
+	}
+
+	switch (type) {
+		case 'create':
+			await verifyRegistration(host, response)
+			break;
+		case 'connect':
+			const { contractId } = body;
+			await verifyAuthentication(host, keyId, contractId, response)
+			break;
+		default:
+			throw new HTTPException(400, { message: 'Invalid type' });
+	}
+
+	await setSignedCookie(c, 'smol_token', keyId, env.SECRET, {
+		path: '/',
+		secure: true,
+		httpOnly: true,
+		sameSite: 'None',
+		maxAge: 60 * 60 * 24 * 30,
+	});
+
+	return c.body(null, 204);
+});
 
 app.get(
 	'/',
