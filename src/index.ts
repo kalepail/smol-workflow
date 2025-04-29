@@ -7,7 +7,7 @@ import { Jimp, ResizeStrategy } from 'jimp';
 import { cache } from "hono/cache";
 import { env } from "cloudflare:workers";
 import { verifyAuthentication, verifyRegistration } from "./passkey";
-import { setSignedCookie } from 'hono/cookie'
+import { getSignedCookie, setSignedCookie } from 'hono/cookie'
 
 export const app = new Hono<{ Bindings: Env }>()
 
@@ -28,7 +28,7 @@ app.post('/login', async (c) => {
 	const { env, req } = c;
 	const body = await req.json();
 	const host = req.header('origin') ?? req.header('referer');
-	const { type, response, keyId } = body;
+	const { type, response, keyId, contractId } = body;
 
 	if (!host) {
 		throw new HTTPException(400, { message: 'Missing origin and referer' });
@@ -39,14 +39,13 @@ app.post('/login', async (c) => {
 			await verifyRegistration(host, response)
 			break;
 		case 'connect':
-			const { contractId } = body;
 			await verifyAuthentication(host, keyId, contractId, response)
 			break;
 		default:
 			throw new HTTPException(400, { message: 'Invalid type' });
 	}
 
-	await setSignedCookie(c, 'smol_token', keyId, env.SECRET, {
+	await setSignedCookie(c, 'smol_contractid', contractId, env.SECRET, {
 		path: '/',
 		secure: true,
 		httpOnly: true,
@@ -166,21 +165,31 @@ app.post('/retry/:id', async ({ env, req, ...c }) => {
 	return c.text(instanceId);
 });
 
-app.put('/:smol_id/:song_id', async ({ env, executionCtx, req, ...c }) => {
+app.put('/:smol_id/:song_id', async (c) => {
+	const { env, req } = c;
 	const smol_id = req.param('smol_id');
 	const song_id = req.param('song_id');
 
-	// TODO enforce authorship
+	const contractId = await getSignedCookie(c, env.SECRET, 'smol_contractid');
 
-	await env.SMOL_D1.prepare(`
+	if (!contractId) {
+		throw new HTTPException(401, { message: 'Unauthorized' });
+	}
+
+	const result = await env.SMOL_D1.prepare(`
 		UPDATE Smols SET 
 			Song_1 = Song_2,
 			Song_2 = (SELECT s.Song_1 FROM Smols s WHERE s.Id = Smols.Id)
 		WHERE Id = ?1
 		AND Song_2 = ?2
+		AND Address = ?3
 	`)
-		.bind(smol_id, song_id)
+		.bind(smol_id, song_id, contractId)
 		.run();
+		
+	if (result.meta.changes === 0) {
+		throw new HTTPException(404, { message: 'No record found or no update needed' });
+	}
 
 	return c.body(null, 204);
 });
