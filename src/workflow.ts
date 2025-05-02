@@ -179,6 +179,19 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 
 		await step.do('save songs', config, () => stub.saveStep('songs', songs));
 
+		// mint smol on Stellar
+		await step.do('mint smol', config, async () => {
+			// TODO this probably should just be done inline here vs sent to another workflow
+			await this.env.TX_WORKFLOW.create({
+				params: {
+					type: 'mint',
+					owner: address,
+					entropy: event.instanceId,
+					name: lyrics.title,
+				}
+			});
+		})
+
 		await step.do('complete workflow', config, async () => {
 			await stub.setToFlush();
 			await this.env.SMOL_D1.prepare(`
@@ -205,7 +218,6 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 				song_ids,
 				songs,
 			}));
-			
 
 			if (retry_id) {
 				try {

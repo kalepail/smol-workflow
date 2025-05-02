@@ -30,3 +30,10 @@ type WorkflowParams = {
 	public?: boolean
 	instrumental?: boolean
 }
+
+type WorkflowTxParams = {
+	type: 'mint' | 'buy' | 'sell'
+	owner: string
+	entropy: string
+	name?: string
+}

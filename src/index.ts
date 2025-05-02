@@ -1,7 +1,8 @@
 import { HTTPException } from "hono/http-exception";
 import { SmolDurableObject, SmolState } from "./do";
 import { Workflow } from "./workflow";
-import { Hono } from 'hono'
+import { TxWorkflow } from "./tx-workflow";
+import { Context, Hono, Next } from 'hono'
 import { cors } from 'hono/cors'
 import { Jimp, ResizeStrategy } from 'jimp';
 import { cache } from "hono/cache";
@@ -18,6 +19,22 @@ export const app = new Hono<{ Bindings: Env }>()
 // Use cookies for auth and start protecting endpoints
 // Implement blockchain
 // clear cache in the right places
+
+function conditionalCache(options: Parameters<typeof cache>[0]) {
+  const caching = cache(options)
+
+  return async (c: Context, next: Next) => {
+    const range = c.req.header('range')
+
+    if (range) {
+      // Skip cache middleware for range requests
+      return await next()
+    }
+
+    // Apply cache middleware
+    return await caching(c, next)
+  }
+}
 
 app.use('*', cors({
 	origin: (origin) => origin ?? '*',
@@ -55,6 +72,26 @@ app.post('/login', async (c) => {
 
 	return c.body(null, 204);
 });
+
+app.get('/likes', async (c) => {
+	const { env } = c;
+	const contractId = await getSignedCookie(c, env.SECRET, 'smol_contractid');
+
+	if (!contractId) {
+		throw new HTTPException(401, { message: 'Unauthorized' });
+	}
+
+	const { results } = await env.SMOL_D1.prepare(`
+		SELECT Id FROM Likes
+		WHERE "Address" = ?1
+	`)
+	.bind(contractId)
+	.all();
+
+	const likes = results.map((like: any) => like.Id);
+
+	return c.json(likes)
+})
 
 app.get(
 	'/',
@@ -165,6 +202,49 @@ app.post('/retry/:id', async ({ env, req, ...c }) => {
 	return c.text(instanceId);
 });
 
+app.put('/like/:id', async (c) => {
+	const { env, req } = c;
+	const id = req.param('id');
+
+	const contractId = await getSignedCookie(c, env.SECRET, 'smol_contractid');
+
+	if (!contractId) {
+		throw new HTTPException(401, { message: 'Unauthorized' });
+	}
+
+	const deleteResult = await env.SMOL_D1
+		.prepare(`DELETE FROM Likes WHERE Id = ?1 AND "Address" = ?2`)
+		.bind(id, contractId)
+		.run();
+
+	if (deleteResult.meta.changes === 0) {
+		await env.SMOL_D1
+			.prepare(`INSERT INTO Likes (Id, "Address") VALUES (?1, ?2)`)
+			.bind(id, contractId)
+			.run();
+
+		// buy token
+		await env.TX_WORKFLOW.create({
+			params: {
+				type: 'buy',
+				owner: contractId,
+				entropy: id,
+			}
+		});
+	} else {
+		// sell token
+		await env.TX_WORKFLOW.create({
+			params: {
+				type: 'sell',
+				owner: contractId,
+				entropy: id,
+			}
+		});
+	}
+
+	return c.body(null, 204);
+})
+
 app.put('/:smol_id/:song_id', async (c) => {
 	const { env, req } = c;
 	const smol_id = req.param('smol_id');
@@ -186,7 +266,7 @@ app.put('/:smol_id/:song_id', async (c) => {
 	`)
 		.bind(smol_id, song_id, contractId)
 		.run();
-		
+
 	if (result.meta.changes === 0) {
 		throw new HTTPException(404, { message: 'No record found or no update needed' });
 	}
@@ -196,14 +276,17 @@ app.put('/:smol_id/:song_id', async (c) => {
 
 app.get(
 	'/song/:id{.+\\.mp3}',
-	cache({
+	conditionalCache({
 		cacheName: 'smol-workflow',
 		cacheControl: 'public, max-age=31536000, immutable', // 1 year in seconds
 	}),
 	async ({ env, req, ...c }) => {
 		const id = req.param('id');
 		const rangeHeader = req.header('range')
-		const headers = new Headers()
+		const headers = new Headers({
+			'Content-Type': 'audio/mpeg',
+			'Content-Disposition': 'inline',
+		})
 
 		let offset: number | undefined
 		let length: number | undefined
@@ -317,6 +400,7 @@ const handler = {
 
 export {
 	Workflow,
+	TxWorkflow,
 	SmolDurableObject,
 	SmolState,
 	handler as default,

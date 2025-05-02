@@ -22,6 +22,11 @@
             "name": "smol-workflow",
             "binding": "WORKFLOW",
             "class_name": "Workflow"
+        },
+        {
+            "name": "smol-tx-workflow",
+            "binding": "TX_WORKFLOW",
+            "class_name": "TxWorkflow"
         }
     ],
     /**
@@ -78,7 +83,9 @@
    * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
    */
     "vars": { 
-        "RPC_URL": "https://soroban-testnet.stellar.org"
+        "RPC_URL": "https://soroban-testnet.stellar.org",
+        "FP_WASM_HASH": "43b8558d06390583f431b526b221683e9635c5569d5cff4f8caba5737b5cb255",
+        "NETWORK_PASSPHRASE": "Test SDF Network ; September 2015"
     },
     /**
    * Note: Use secrets to store sensitive data.
@@ -97,6 +104,10 @@
         {
             "binding": "AISONGGENERATOR",
             "service": "aisonggenerator-worker"
+        },
+        {
+            "binding": "LAUNCHTUBE",
+            "service": "launchtube" // launchtube-prod
         }
     ],
     "migrations": [
