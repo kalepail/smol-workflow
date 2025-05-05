@@ -1,2 +1,5 @@
 npx wrangler d1 execute smol-d1 --remote --file=./schema.sql
+
+npx wrangler d1 execute smol-d1 --remote --command="UPDATE Smols SET Public = 1 WHERE Id = 'cca0af311ffc644607b6d21de10b7e75ff6e0de7d2a62ff813c76161988ffe05'"
+
 npx wrangler d1 execute smol-d1 --remote --command="SELECT Id FROM Smols WHERE Address <> 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF'"

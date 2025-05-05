@@ -205,6 +205,7 @@ app.post('/retry/:id', async ({ env, req, ...c }) => {
 app.put('/like/:id', async (c) => {
 	const { env, req } = c;
 	const id = req.param('id');
+	const body = await req.json();
 
 	const contractId = await getSignedCookie(c, env.SECRET, 'smol_contractid');
 
@@ -236,8 +237,9 @@ app.put('/like/:id', async (c) => {
 		await env.TX_WORKFLOW.create({
 			params: {
 				type: 'sell',
-				owner: contractId,
-				entropy: id,
+				xdr: body.xdr,
+				// owner: contractId,
+				// entropy: id,
 			}
 		});
 	}

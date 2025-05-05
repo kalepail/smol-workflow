@@ -36,4 +36,5 @@ type WorkflowTxParams = {
 	owner: string
 	entropy: string
 	name?: string
+	xdr?: string
 }
