@@ -143,10 +143,10 @@ app.get(
 app.get(
 	'/me',
 	parseAuth,
-	cache({
-		cacheName: 'smol-workflow',
-		cacheControl: 'public, max-age=30',
-	}),
+	// cache({
+	// 	cacheName: 'smol-workflow',
+	// 	cacheControl: 'public, max-age=30',
+	// }),
 	async (c) => {
 		const { env } = c
 		const payload = c.get('jwtPayload')
