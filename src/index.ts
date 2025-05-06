@@ -8,7 +8,8 @@ import { Jimp, ResizeStrategy } from 'jimp';
 import { cache } from "hono/cache";
 import { env } from "cloudflare:workers";
 import { verifyAuthentication, verifyRegistration } from "./passkey";
-import { getSignedCookie, setSignedCookie } from 'hono/cookie'
+import { sign, verify } from 'hono/jwt'
+import { getCookie, setCookie } from "hono/cookie";
 
 export const app = new Hono<{ Bindings: Env }>()
 
@@ -21,19 +22,39 @@ export const app = new Hono<{ Bindings: Env }>()
 // clear cache in the right places
 
 function conditionalCache(options: Parameters<typeof cache>[0]) {
-  const caching = cache(options)
+	const caching = cache(options)
 
-  return async (c: Context, next: Next) => {
-    const range = c.req.header('range')
+	return async (c: Context, next: Next) => {
+		const range = c.req.header('range')
 
-    if (range) {
-      // Skip cache middleware for range requests
-      return await next()
-    }
+		if (range) {
+			// Skip cache middleware for range requests
+			return await next()
+		}
 
-    // Apply cache middleware
-    return await caching(c, next)
-  }
+		// Apply cache middleware
+		return await caching(c, next)
+	}
+}
+
+async function parseAuth(c: Context, next: Next) {
+	const authHeader = c.req.header('Authorization')
+
+	if (authHeader) {
+		const token = authHeader.split(' ')[1]
+
+		if (token) {
+			c.set('jwtPayload', await verify(token, c.env.SECRET))
+		}
+	} else {
+		const token = getCookie(c, 'smol_token')
+
+		if (token) {
+			c.set('jwtPayload', await verify(token, c.env.SECRET))
+		}
+	}
+
+	return next()
 }
 
 app.use('*', cors({
@@ -62,7 +83,14 @@ app.post('/login', async (c) => {
 			throw new HTTPException(400, { message: 'Invalid type' });
 	}
 
-	await setSignedCookie(c, 'smol_contractid', contractId, env.SECRET, {
+	const payload = {
+		sub: contractId,
+		key: keyId,
+		exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 30, // Token expires in 30 days
+	}
+	const token = await sign(payload, env.SECRET)
+
+	await setCookie(c, 'smol_token', token, {
 		path: '/',
 		secure: true,
 		httpOnly: true,
@@ -70,28 +98,28 @@ app.post('/login', async (c) => {
 		maxAge: 60 * 60 * 24 * 30,
 	});
 
-	return c.body(null, 204);
+	return c.text(token)
 });
 
-app.get('/likes', async (c) => {
-	const { env } = c;
-	const contractId = await getSignedCookie(c, env.SECRET, 'smol_contractid');
+app.get(
+	'/likes', 
+	parseAuth,
+	async (c) => {
+		const { env } = c;
+		const payload = c.get('jwtPayload')
 
-	if (!contractId) {
-		throw new HTTPException(401, { message: 'Unauthorized' });
+		const { results } = await env.SMOL_D1.prepare(`
+			SELECT Id FROM Likes
+			WHERE "Address" = ?1
+		`)
+			.bind(payload.sub)
+			.all();
+
+		const likes = results.map((like: any) => like.Id);
+
+		return c.json(likes)
 	}
-
-	const { results } = await env.SMOL_D1.prepare(`
-		SELECT Id FROM Likes
-		WHERE "Address" = ?1
-	`)
-	.bind(contractId)
-	.all();
-
-	const likes = results.map((like: any) => like.Id);
-
-	return c.json(likes)
-})
+)
 
 app.get(
 	'/',
@@ -107,6 +135,31 @@ app.get(
 			ORDER BY Created_At DESC 
 			LIMIT 1000
 		`).all();
+
+		return c.json(results)
+	}
+);
+
+app.get(
+	'/me',
+	parseAuth,
+	cache({
+		cacheName: 'smol-workflow',
+		cacheControl: 'public, max-age=30',
+	}),
+	async (c) => {
+		const { env } = c
+		const payload = c.get('jwtPayload')
+
+		const { results } = await env.SMOL_D1.prepare(`
+			SELECT Id, Title, Song_1 
+			FROM Smols 
+			WHERE Address = ?1
+			ORDER BY Created_At DESC 
+			LIMIT 1000
+		`)
+			.bind(payload.sub)
+			.all();
 
 		return c.json(results)
 	}
@@ -202,79 +255,77 @@ app.post('/retry/:id', async ({ env, req, ...c }) => {
 	return c.text(instanceId);
 });
 
-app.put('/like/:id', async (c) => {
-	const { env, req } = c;
-	const id = req.param('id');
-	const body = await req.json();
+app.put(
+	'/like/:id', 
+	parseAuth,
+	async (c) => {
+		const { env, req } = c;
+		const id = req.param('id');
+		const body = await req.json();
+		const payload = c.get('jwtPayload')
 
-	const contractId = await getSignedCookie(c, env.SECRET, 'smol_contractid');
-
-	if (!contractId) {
-		throw new HTTPException(401, { message: 'Unauthorized' });
-	}
-
-	const deleteResult = await env.SMOL_D1
-		.prepare(`DELETE FROM Likes WHERE Id = ?1 AND "Address" = ?2`)
-		.bind(id, contractId)
-		.run();
-
-	if (deleteResult.meta.changes === 0) {
-		await env.SMOL_D1
-			.prepare(`INSERT INTO Likes (Id, "Address") VALUES (?1, ?2)`)
-			.bind(id, contractId)
+		const deleteResult = await env.SMOL_D1
+			.prepare(`DELETE FROM Likes WHERE Id = ?1 AND "Address" = ?2`)
+			.bind(id, payload.sub)
 			.run();
 
-		// buy token
-		await env.TX_WORKFLOW.create({
-			params: {
-				type: 'buy',
-				owner: contractId,
-				entropy: id,
-			}
-		});
-	} else {
-		// sell token
-		await env.TX_WORKFLOW.create({
-			params: {
-				type: 'sell',
-				xdr: body.xdr,
-				// owner: contractId,
-				// entropy: id,
-			}
-		});
+		if (deleteResult.meta.changes === 0) {
+			await env.SMOL_D1
+				.prepare(`INSERT INTO Likes (Id, "Address") VALUES (?1, ?2)`)
+				.bind(id, payload.sub)
+				.run();
+
+			// buy token
+			await env.TX_WORKFLOW.create({
+				params: {
+					type: 'buy',
+					owner: payload.sub,
+					entropy: id,
+				}
+			});
+		} else {
+			// sell token
+			await env.TX_WORKFLOW.create({
+				params: {
+					type: 'sell',
+					xdr: body.xdr,
+					// owner: contractId,
+					// entropy: id,
+				}
+			});
+		}
+
+		return c.body(null, 204);
 	}
+)
 
-	return c.body(null, 204);
-})
+app.put(
+	'/:smol_id/:song_id', 
+	parseAuth,
+	async (c) => {
+		const { env, req } = c;
+		const smol_id = req.param('smol_id');
+		const song_id = req.param('song_id');
+		const payload = c.get('jwtPayload')
 
-app.put('/:smol_id/:song_id', async (c) => {
-	const { env, req } = c;
-	const smol_id = req.param('smol_id');
-	const song_id = req.param('song_id');
+		const result = await env.SMOL_D1.prepare(`
+			UPDATE Smols SET 
+				Song_1 = Song_2,
+				Song_2 = (SELECT s.Song_1 FROM Smols s WHERE s.Id = Smols.Id)
+			WHERE Id = ?1
+			AND Song_2 = ?2
+			AND Address = ?3
+		`)
+			.bind(smol_id, song_id, payload.sub)
+			.run();
 
-	const contractId = await getSignedCookie(c, env.SECRET, 'smol_contractid');
+		if (result.meta.changes === 0) {
+			throw new HTTPException(404, { message: 'No record found or no update needed' });
+		}
 
-	if (!contractId) {
-		throw new HTTPException(401, { message: 'Unauthorized' });
+		return c.body(null, 204);
 	}
-
-	const result = await env.SMOL_D1.prepare(`
-		UPDATE Smols SET 
-			Song_1 = Song_2,
-			Song_2 = (SELECT s.Song_1 FROM Smols s WHERE s.Id = Smols.Id)
-		WHERE Id = ?1
-		AND Song_2 = ?2
-		AND Address = ?3
-	`)
-		.bind(smol_id, song_id, contractId)
-		.run();
-
-	if (result.meta.changes === 0) {
-		throw new HTTPException(404, { message: 'No record found or no update needed' });
-	}
-
-	return c.body(null, 204);
-});
+);
 
 app.get(
 	'/song/:id{.+\\.mp3}',
