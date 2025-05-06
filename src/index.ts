@@ -141,7 +141,7 @@ app.get(
 );
 
 app.get(
-	'/me',
+	'/created',
 	parseAuth,
 	// cache({
 	// 	cacheName: 'smol-workflow',
