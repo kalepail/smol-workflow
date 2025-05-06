@@ -102,7 +102,7 @@ app.post('/login', async (c) => {
 });
 
 app.get(
-	'/likes', 
+	'/likes',
 	parseAuth,
 	async (c) => {
 		const { env } = c;
@@ -156,6 +156,32 @@ app.get(
 			FROM Smols 
 			WHERE Address = ?1
 			ORDER BY Created_At DESC 
+			LIMIT 1000
+		`)
+			.bind(payload.sub)
+			.all();
+
+		return c.json(results)
+	}
+);
+
+app.get(
+	'/liked',
+	parseAuth,
+	// cache({
+	// 	cacheName: 'smol-workflow',
+	// 	cacheControl: 'public, max-age=30',
+	// }),
+	async (c) => {
+		const { env } = c
+		const payload = c.get('jwtPayload')
+
+		const { results } = await env.SMOL_D1.prepare(`
+			SELECT s.Id, s.Title, s.Song_1 
+			FROM Smols s
+			INNER JOIN Likes l ON s.Id = l.Id
+			WHERE l."Address" = ?1
+			ORDER BY s.Created_At DESC 
 			LIMIT 1000
 		`)
 			.bind(payload.sub)
@@ -256,7 +282,7 @@ app.post('/retry/:id', async ({ env, req, ...c }) => {
 });
 
 app.put(
-	'/like/:id', 
+	'/like/:id',
 	parseAuth,
 	async (c) => {
 		const { env, req } = c;
@@ -300,7 +326,27 @@ app.put(
 )
 
 app.put(
-	'/:smol_id/:song_id', 
+	'/:id',
+	parseAuth,
+	async (c) => {
+		const { env, req } = c;
+		const id = req.param('id'); // Changed from smol_id to id to match route param
+		const payload = c.get('jwtPayload')
+
+		await env.SMOL_D1.prepare(`
+			UPDATE Smols SET 
+				Public = CASE WHEN Public = 1 THEN 0 ELSE 1 END
+			WHERE Id = ?1 AND "Address" = ?2
+		`)
+			.bind(id, payload.sub)
+			.run();
+
+		return c.body(null, 204);
+	}
+);
+
+app.put(
+	'/:smol_id/:song_id',
 	parseAuth,
 	async (c) => {
 		const { env, req } = c;
@@ -309,17 +355,17 @@ app.put(
 		const payload = c.get('jwtPayload')
 
 		const result = await env.SMOL_D1.prepare(`
-			UPDATE Smols SET 
-				Song_1 = Song_2,
-				Song_2 = (SELECT s.Song_1 FROM Smols s WHERE s.Id = Smols.Id)
-			WHERE Id = ?1
-			AND Song_2 = ?2
-			AND Address = ?3
-		`)
-			.bind(smol_id, song_id, payload.sub)
-			.run();
+            UPDATE Smols SET 
+                Song_1 = Song_2,
+                Song_2 = Song_1
+            WHERE Id = ?1
+            AND Song_2 = ?2
+            AND Address = ?3
+        `)
+            .bind(smol_id, song_id, payload.sub)
+            .run();
 
-		if (result.meta.changes === 0) {
+        if (result.meta.changes === 0) {
 			throw new HTTPException(404, { message: 'No record found or no update needed' });
 		}
 
@@ -417,11 +463,13 @@ app.get(
 	}
 );
 
-// TODO this should be a protected route
-if (env.MODE === 'dev') {
-	app.delete('/:id', async ({ env, req, ...c }) => {
+app.delete(
+	'/:id',
+	parseAuth,
+	async ({ env, req, ...c }) => {
 		const id = req.param('id');
 		const smol: any = await env.SMOL_KV.get(id, 'json');
+		const payload = c.get('jwtPayload');
 
 		try {
 			const doid = env.DURABLE_OBJECT.idFromString(id);
@@ -430,7 +478,13 @@ if (env.MODE === 'dev') {
 		} catch { }
 
 		await env.SMOL_KV.delete(id);
-		await env.SMOL_D1.prepare(`DELETE FROM Smols WHERE Id = ?1`).bind(id).run()
+		await env.SMOL_D1.prepare(`
+			DELETE FROM Smols 
+			WHERE Id = ?1
+			AND "Address" = ?2
+		`)
+			.bind(id, payload.sub)
+			.run()
 		await env.SMOL_BUCKET.delete(`${id}.png`);
 
 		if (smol) {
@@ -440,8 +494,8 @@ if (env.MODE === 'dev') {
 		}
 
 		return c.body(null, 204);
-	});
-}
+	}
+);
 
 app.notFound((c) => {
 	return c.body(null, 404)
