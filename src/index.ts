@@ -6,7 +6,6 @@ import { Context, Hono, Next } from 'hono'
 import { cors } from 'hono/cors'
 import { Jimp, ResizeStrategy } from 'jimp';
 import { cache } from "hono/cache";
-import { env } from "cloudflare:workers";
 import { verifyAuthentication, verifyRegistration } from "./passkey";
 import { sign, verify } from 'hono/jwt'
 import { getCookie, setCookie } from "hono/cookie";
@@ -325,6 +324,7 @@ app.put(
 	}
 )
 
+// Toggle public vs private
 app.put(
 	'/:id',
 	parseAuth,
@@ -332,6 +332,16 @@ app.put(
 		const { env, req } = c;
 		const id = req.param('id'); // Changed from smol_id to id to match route param
 		const payload = c.get('jwtPayload')
+
+		const smol_kv: any = await env.SMOL_KV.get(id, { type: 'json', cacheTtl: 2419200 });
+
+		if (!smol_kv) {
+			throw new HTTPException(404, { message: 'Smol not found' });
+		}
+
+		if (typeof smol_kv.nsfw !== 'string' && smol_kv.nsfw?.safe === false) {
+			throw new HTTPException(400, { message: 'Cannot change visibility of a NSFW smol' });
+		}
 
 		await env.SMOL_D1.prepare(`
 			UPDATE Smols SET 

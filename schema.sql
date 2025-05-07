@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS Smols (
     Public BOOLEAN DEFAULT 1,
     Instrumental BOOLEAN DEFAULT 0,
     Plays INTEGER DEFAULT 0,
-    Holders INTEGER DEFAULT 0,
+    Holders INTEGER DEFAULT 0, -- Likely don't need this as we can count the below table
     "Address" TEXT NOT NULL
 );
 
