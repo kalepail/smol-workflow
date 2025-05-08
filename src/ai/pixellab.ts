@@ -10,7 +10,7 @@ export async function pixellab(description: string, model: 'pixflux' | 'bitforge
 
     description = `
         ${description}.
-        NOTE: Prefer rich scenes to characters and avatars.
+        Prefer rich scenes. Try not to generate characters, people or avatars.
     `
 
     switch (model) {
@@ -39,7 +39,7 @@ async function pixflux(description: string) {
         },
         body: JSON.stringify({
             description,
-            negative_description: "blurry. dithering.",
+            negative_description: "blurry. dithering. photorealism. realistic. characters. people. avatars.",
             text_guidance_scale: 8, // max 20
             image_size: {
                 width,
@@ -72,7 +72,7 @@ async function bitforge(description: string) {
         },
         body: JSON.stringify({
             description,
-            negative_description: "blurry. dithering",
+            negative_description: "blurry. dithering. photorealism. realistic. characters. people. avatars.",
             text_guidance_scale: 8, // max 20
             coverage_percentage: 100 / width * 15,
             image_size: {
