@@ -14,6 +14,9 @@ export async function generateLyrics(env: Env, prompt: string, description: stri
 
                 # Description
                 ${description}
+
+                # NOTES
+                Focus on creativity, story and lyrical variety over strict adherence to the description.
             `
         })
     })

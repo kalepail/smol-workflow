@@ -98,7 +98,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 		await step.do('save generated image', config, () => stub.saveStep('image_base64', image_base64))
 
 		let description = retry_steps?.description || await step.do('describe image', config, async () => {
-			let description = await imageDescribe(this.env, image_base64);
+			let description = await imageDescribe(this.env, image_base64, prompt);
 			return description;
 		});
 
