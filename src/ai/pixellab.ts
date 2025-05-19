@@ -8,10 +8,10 @@ export async function pixellab(description: string, model: 'pixflux' | 'bitforge
     if (!model || !description)
         throw new Error('Missing parameters')
 
-    description = `
-        A rich scene without any characters or people.
-        ${description}.
-    `
+    // description = `
+    //     A rich scene without any characters or people.
+    //     ${description}.
+    // `
 
     switch (model) {
         case 'pixflux':
@@ -39,7 +39,7 @@ async function pixflux(description: string) {
         },
         body: JSON.stringify({
             description,
-            negative_description: "blurry. dithering. photorealism. realistic. characters. people.",
+            negative_description: "blurry. dithering. photorealism.",
             text_guidance_scale: 8, // max 20
             image_size: {
                 width,
@@ -72,7 +72,7 @@ async function bitforge(description: string) {
         },
         body: JSON.stringify({
             description,
-            negative_description: "blurry. dithering. photorealism. realistic. characters. people.",
+            negative_description: "blurry. dithering. photorealism.",
             text_guidance_scale: 8, // max 20
             coverage_percentage: 100 / width * 15,
             image_size: {

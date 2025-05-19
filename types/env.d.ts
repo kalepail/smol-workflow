@@ -29,6 +29,7 @@ type WorkflowParams = {
 	retry_id?: string
 	public?: boolean
 	instrumental?: boolean
+	playlist?: string
 }
 
 type WorkflowTxParams = {

@@ -36,7 +36,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 		let retry_steps: WorkflowSteps | undefined;
 		let payload = event.payload;
 
-		const { retry_id } = payload;
+		const { retry_id, playlist } = payload;
 
 		if (retry_id) {
 			await step.do(
@@ -226,8 +226,12 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 					await retry_stub.setToFlush();
 				} catch {}
 				
-				await this.env.SMOL_D1.prepare(`DELETE FROM Smols WHERE Id = ?1`).bind(retry_id).run()
+				await this.env.SMOL_D1.prepare(`DELETE FROM Smols WHERE Id = ?1`).bind(retry_id).run();
 				await this.env.SMOL_KV.delete(retry_id);
+			}
+
+			if (playlist) {
+				await this.env.SMOL_D1.prepare(`INSERT INTO Playlists (Id, Title) VALUES (?1, ?2)`).bind(event.instanceId, playlist).run()
 			}
 		});
 

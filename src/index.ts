@@ -36,20 +36,28 @@ function conditionalCache(options: Parameters<typeof cache>[0]) {
 	}
 }
 
+// TODO ensure if verify breaks the request fails 
+
 async function parseAuth(c: Context, next: Next) {
 	const authHeader = c.req.header('Authorization')
 
 	if (authHeader) {
 		const token = authHeader.split(' ')[1]
 
-		if (token) {
+		if (token === c.env.SECRET) {
+
+		} else if (token) {
 			c.set('jwtPayload', await verify(token, c.env.SECRET))
+		} else {
+			throw new HTTPException(401, { message: 'Invalid "Authorization" header' });
 		}
 	} else {
 		const token = getCookie(c, 'smol_token')
 
 		if (token) {
 			c.set('jwtPayload', await verify(token, c.env.SECRET))
+		} else {
+			throw new HTTPException(401, { message: 'Invalid "Cookie" token' });
 		}
 	}
 
@@ -66,6 +74,8 @@ app.post('/login', async (c) => {
 	const body = await req.json();
 	const host = req.header('origin') ?? req.header('referer');
 	const { type, response, keyId, contractId } = body;
+	
+	let { username } = body;
 
 	if (!host) {
 		throw new HTTPException(400, { message: 'Missing origin and referer' });
@@ -74,9 +84,12 @@ app.post('/login', async (c) => {
 	switch (type) {
 		case 'create':
 			await verifyRegistration(host, response)
+			await env.SMOL_D1.prepare(`INSERT INTO Users ("Address", Username) VALUES (?1, ?2)`).bind(contractId, username).run();
 			break;
 		case 'connect':
 			await verifyAuthentication(host, keyId, contractId, response)
+			const user = await env.SMOL_D1.prepare(`SELECT Username FROM Users WHERE "Address" = ?1`).bind(contractId).first();
+			username = user?.Username ?? 'Smol';
 			break;
 		default:
 			throw new HTTPException(400, { message: 'Invalid type' });
@@ -85,11 +98,12 @@ app.post('/login', async (c) => {
 	const payload = {
 		sub: contractId,
 		key: keyId,
+		usr: username,
 		exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 30, // Token expires in 30 days
 	}
 	const token = await sign(payload, env.SECRET)
 
-	await setCookie(c, 'smol_token', token, {
+	setCookie(c, 'smol_token', token, {
 		path: '/',
 		secure: true,
 		httpOnly: true,
@@ -191,13 +205,38 @@ app.get(
 );
 
 app.get(
+	'/playlist/:title',
+	cache({
+		cacheName: 'smol-workflow',
+		cacheControl: 'public, max-age=30',
+	}),
+	async (c) => {
+		const { env } = c;
+		const playlistTitle = c.req.param('title');
+
+		const smolsD1Result = await env.SMOL_D1.prepare(`
+			SELECT s.Id, s.Title, s.Song_1 
+			FROM Smols s
+			INNER JOIN Playlists p ON s.Id = p.Id
+			WHERE p.Title = ?1 AND s.Public = 1
+			ORDER BY s.Created_At DESC 
+			LIMIT 1000
+		`)
+			.bind(playlistTitle)
+			.all();
+
+		return c.json(smolsD1Result.results || []);
+	}
+);
+
+app.get(
 	'/:id',
 	async ({ env, req, ...c }) => {
 		const id = req.param('id');
 		const smol_d1 = await env.SMOL_D1.prepare(`SELECT * FROM Smols WHERE Id = ?1`).bind(id).first();
 
 		if (smol_d1) {
-			const smol_kv = await env.SMOL_KV.get(id, { type: 'json', cacheTtl: 2419200 });
+			const smol_kv = await env.SMOL_KV.get(id, 'json');
 
 			return c.json({
 				kv_do: smol_kv,
@@ -228,6 +267,7 @@ app.post('/', async ({ env, req, ...c }) => {
 		prompt: string
 		public?: boolean
 		instrumental?: boolean
+		playlist?: string 
 	} = await req.json();
 
 	if (!body.address) {
@@ -246,6 +286,7 @@ app.post('/', async ({ env, req, ...c }) => {
 			prompt: body.prompt,
 			public: body.public ?? true,
 			instrumental: body.instrumental ?? false,
+			playlist: body.playlist,
 		}
 	});
 
@@ -333,7 +374,7 @@ app.put(
 		const id = req.param('id'); // Changed from smol_id to id to match route param
 		const payload = c.get('jwtPayload')
 
-		const smol_kv: any = await env.SMOL_KV.get(id, { type: 'json', cacheTtl: 2419200 });
+		const smol_kv: any = await env.SMOL_KV.get(id, 'json');
 
 		if (!smol_kv) {
 			throw new HTTPException(404, { message: 'Smol not found' });
@@ -479,7 +520,6 @@ app.delete(
 	async ({ env, req, ...c }) => {
 		const id = req.param('id');
 		const smol: any = await env.SMOL_KV.get(id, 'json');
-		const payload = c.get('jwtPayload');
 
 		try {
 			const doid = env.DURABLE_OBJECT.idFromString(id);
@@ -491,9 +531,8 @@ app.delete(
 		await env.SMOL_D1.prepare(`
 			DELETE FROM Smols 
 			WHERE Id = ?1
-			AND "Address" = ?2
 		`)
-			.bind(id, payload.sub)
+			.bind(id)
 			.run()
 		await env.SMOL_BUCKET.delete(`${id}.png`);
 

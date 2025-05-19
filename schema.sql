@@ -1,6 +1,6 @@
 -- ALTER TABLE Smols ADD COLUMN Instrumental BOOLEAN DEFAULT 0;
 
--- DROP TABLE IF EXISTS Smols;
+-- DROP TABLE IF EXISTS Users;
 
 CREATE TABLE IF NOT EXISTS Smols (
     Id TEXT PRIMARY KEY,
@@ -15,8 +15,19 @@ CREATE TABLE IF NOT EXISTS Smols (
     "Address" TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS Users (
+    Username TEXT PRIMARY KEY,
+    "Address" TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS Likes (
     Id TEXT NOT NULL,
     "Address" TEXT NOT NULL,
     UNIQUE (Id, "Address")
+);
+
+CREATE TABLE IF NOT EXISTS Playlists (
+    Id TEXT NOT NULL,
+    Title TEXT NOT NULL,
+    UNIQUE (Id, Title)
 );
