@@ -11,13 +11,14 @@ CREATE TABLE IF NOT EXISTS Smols (
     Public BOOLEAN DEFAULT 1,
     Instrumental BOOLEAN DEFAULT 0,
     Plays INTEGER DEFAULT 0,
-    Holders INTEGER DEFAULT 0, -- Likely don't need this as we can count the below table
+    Views INTEGER DEFAULT 0,
     "Address" TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS Users (
-    Username TEXT PRIMARY KEY,
-    "Address" TEXT NOT NULL
+    Username TEXT NOT NULL,
+    "Address" TEXT NOT NULL,
+    UNIQUE (Username, "Address")
 );
 
 CREATE TABLE IF NOT EXISTS Likes (

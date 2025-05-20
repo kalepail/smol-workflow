@@ -2,6 +2,8 @@ npx wrangler d1 execute smol-d1 --remote --file=./schema.sql
 
 npx wrangler d1 execute smol-d1 --remote --command="UPDATE Smols SET Public = 1 WHERE Id = 'cca0af311ffc644607b6d21de10b7e75ff6e0de7d2a62ff813c76161988ffe05'"
 
+npx wrangler d1 execute smol-d1 --remote --command="ALTER TABLE Smols RENAME COLUMN Holders TO Views"
+
 npx wrangler d1 execute smol-d1 --remote --command="SELECT * FROM Smols WHERE Address <> 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF'"
 
 npx wrangler d1 execute smol-d1 --remote --command="SELECT * FROM Smols WHERE Id = '8ffb9ff59f8b38b6dea778f4f571ae87239e2b2bfbf3ad9d327e53f0dfb88e7a'"
