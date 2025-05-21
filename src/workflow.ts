@@ -53,7 +53,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 							...retry_steps?.payload // previous payload (notably we keep the original address)
 						};
 
-					// if for some reason the above fails (legacy gens)
+						// if for some reason the above fails (legacy gens)
 					} catch (err) {
 						retry_steps = await this.env.SMOL_KV.get(retry_id, 'json') as WorkflowSteps;
 						payload = {
@@ -130,10 +130,13 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 
 		await step.do('save nsfw check', config, () => stub.saveStep('nsfw', nsfw))
 
-		let song_ids = retry_steps?.song_ids || await step.do('generate songs', config, async () => {
-			let song_ids = await generateSongs(this.env, lyrics, is_public, is_instrumental);
-			return song_ids;
-		})
+		// if retrying and all songs gens were successful, use the existing song ids
+		let song_ids = retry_steps?.song_ids && retry_steps?.songs?.every((song) => song.status === 4)
+			? retry_steps.song_ids
+			: await step.do('generate songs', config, async () => {
+				let song_ids = await generateSongs(this.env, prompt, description, lyrics, is_public, is_instrumental);
+				return song_ids;
+			})
 
 		await step.do('save song ids', config, () => stub.saveStep('song_ids', song_ids));
 
@@ -224,8 +227,8 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 					const retry_doid = this.env.DURABLE_OBJECT.idFromString(retry_id);
 					const retry_stub = this.env.DURABLE_OBJECT.get(retry_doid);
 					await retry_stub.setToFlush();
-				} catch {}
-				
+				} catch { }
+
 				await this.env.SMOL_D1.prepare(`DELETE FROM Smols WHERE Id = ?1`).bind(retry_id).run();
 				await this.env.SMOL_KV.delete(retry_id);
 			}
