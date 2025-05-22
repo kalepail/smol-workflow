@@ -520,10 +520,10 @@ app.get(
 		const shouldIncrementPlays = !rangeHeader || (rangeHeader && rangeHeader.startsWith('bytes=0-'));
 
 		if (shouldIncrementPlays) {
-			const dbId = id.endsWith('.mp3') ? id.slice(0, -4) : id;
+			const dbId = id.replace('.mp3', '');
 			executionCtx.waitUntil(
 				env.SMOL_D1.prepare(
-					"UPDATE Smols SET Plays = Plays + 1 WHERE Song_1 = ?1 OR Song_2 = ?1"
+					"UPDATE Smols SET Plays = Plays + 1 WHERE Song_1 = ? OR Song_2 = ?"
 				).bind(dbId).run()
 			);
 		}
