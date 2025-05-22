@@ -24,9 +24,9 @@ export async function imageDescribe(env: Env, base64: string, prompt: string) {
 
     return response.description
         .trim()
-        // .replace(/^"[^"]+"\s*-\s*/, '')
-        // .replace(/[^\w\s,:-;]/g, '')
-        // .replace(/\s+/g, ' ')
+    // .replace(/^"[^"]+"\s*-\s*/, '')
+    // .replace(/[^\w\s,:-;]/g, '')
+    // .replace(/\s+/g, ' ')
 }
 
 // Generate a title and story based on a prompt and image description

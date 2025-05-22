@@ -131,7 +131,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 		await step.do('save nsfw check', config, () => stub.saveStep('nsfw', nsfw))
 
 		// if retrying and all songs gens were successful, use the existing song ids
-		let song_ids = retry_steps?.song_ids && retry_steps?.songs?.every((song) => song.status === 4)
+		let song_ids = retry_steps?.song_ids && !retry_steps?.songs?.some((song) => song.status < 0)
 			? retry_steps.song_ids
 			: await step.do('generate songs', config, async () => {
 				let song_ids = await generateSongs(this.env, prompt, description, lyrics, is_public, is_instrumental);
@@ -157,17 +157,17 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 				let is_streaming = false;
 
 				for (let song of songs) {
+					if (song.status < 0) {
+						await stub.saveStep('songs', songs)
+						throw new NonRetryableError(`Song ${song.music_id || 'unknown'} has negative status: ${song.status}`);
+					}
+
 					if (song.audio) {
 						has_audio = true;
 					}
 
-					if (song.status < 4 && song.status >= 0) {
+					if (song.status < 4) {
 						is_streaming = true;
-					}
-
-					if (song.status < 0) {
-						await stub.saveStep('songs', songs);
-						throw new NonRetryableError(`Song ${song.music_id || 'unknown'} has negative status: ${song.status}`);
 					}
 				}
 
@@ -178,7 +178,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 
 				if (is_streaming) {
 					await stub.saveStep('songs', songs)
-					throw new Error('Songs still streaming')
+					throw new Error('Songs still streaming');
 				}
 
 				return songs;
