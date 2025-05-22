@@ -161,8 +161,13 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 						has_audio = true;
 					}
 
-					if (song.status < 4) {
+					if (song.status < 4 && song.status >= 0) {
 						is_streaming = true;
+					}
+
+					if (song.status < 0) {
+						await stub.saveStep('songs', songs);
+						throw new NonRetryableError(`Song ${song.music_id || 'unknown'} has negative status: ${song.status}`);
 					}
 				}
 
