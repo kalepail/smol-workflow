@@ -1,23 +1,38 @@
 // Generate lyrics from a prompt
 export async function generateLyrics(env: Env, prompt: string, description: string): Promise<AiSongGeneratorLyrics> {
+    let finalPrompt: string;
+
+    const promptWithDescription = `
+        # Prompt
+        ${prompt}
+
+        # Description
+        ${description}
+
+        # NOTES
+        Focus on creativity, story and lyrical variety over strict adherence to the prompt and description.
+    `;
+    const promptWithoutDescription = `
+        # Prompt
+        ${prompt}
+
+        # NOTES
+        Focus on creativity, story and lyrical variety over strict adherence to the prompt.
+    `;
+
+    if (prompt.length > 500) {
+        finalPrompt = promptWithoutDescription;
+    } else {
+        finalPrompt = promptWithDescription;
+    }
+
     return env.AISONGGENERATOR.fetch(`http://aisonggenerator-worker/api/lyrics`, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-            prompt: `
-                Write a song based off the following initial prompt and image description:
-
-                # Prompt
-                ${prompt}
-
-                # Description
-                ${description}
-
-                # NOTES
-                Focus on creativity, story and lyrical variety over strict adherence to the description.
-            `
+            prompt: finalPrompt
         })
     })
         .then(async (res) => {

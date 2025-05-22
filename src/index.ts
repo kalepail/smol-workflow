@@ -9,6 +9,7 @@ import { cache } from "hono/cache";
 import { verifyAuthentication, verifyRegistration } from "./passkey";
 import { sign, verify } from 'hono/jwt'
 import { getCookie, setCookie } from "hono/cookie";
+import { parseRange } from "./utils";
 
 export const app = new Hono<{ Bindings: Env }>()
 
@@ -464,134 +465,73 @@ app.put(
 );
 
 app.get(
-	'/song/:id{.+\\.mp3}',
+	'/song/:id{.+\.mp3}',
 	conditionalCache({
 		cacheName: 'smol-workflow',
 		cacheControl: 'public, max-age=31536000, immutable', // 1 year in seconds
 	}),
 	async (c) => {
 		const { env, req, executionCtx } = c;
-		const idWithSuffix = req.param('id');
-		const id = idWithSuffix.replace(/\.mp3$/, ''); // Remove .mp3 suffix
-		const rangeHeader = req.header('range')
-		const headers = new Headers({
-			// Explicitly set Content-Type, R2 might not always infer it correctly for .mp3
-			'Content-Type': 'audio/mpeg',
-			'Content-Disposition': 'inline',
-		})
+		const id = req.param('id');
+		const rangeHeader = req.header('range');
 
-		// Fetch only the object metadata first using head()
-		const metadata = await env.SMOL_BUCKET.head(idWithSuffix);
+		const objectMeta = await env.SMOL_BUCKET.head(id);
 
-		if (!metadata) {
+		if (!objectMeta) {
 			throw new HTTPException(404, { message: 'Song not found' });
 		}
 
-		// Set ETag and Last-Modified from the metadata for comparison and for all responses
-		headers.set('ETag', metadata.httpEtag);
-		if (metadata.uploaded) {
-			headers.set('Last-Modified', metadata.uploaded.toUTCString());
-		}
-		// Allow R2 to set other relevant HTTP metadata from the HEAD request (e.g., custom metadata, cache-control from R2)
-		metadata.writeHttpMetadata(headers);
+		const headers = new Headers();
+		objectMeta.writeHttpMetadata(headers);
+		headers.set('Accept-Ranges', 'bytes');
+		headers.set('Content-Type', 'audio/mpeg'); // Assuming MP3 files
 
-		const ifNoneMatch = req.header('if-none-match');
-		if (ifNoneMatch && ifNoneMatch.split(',').map(etag => etag.trim()).includes(metadata.httpEtag)) {
-			// Client has a fresh version, clear unnecessary headers for 304
-			// ETag and Last-Modified should remain. Cache-Control from R2 (via writeHttpMetadata) also good.
-			headers.delete('Content-Type');
-			headers.delete('Content-Disposition');
-			headers.delete('Content-Length');
-			if (rangeHeader) headers.delete('Content-Range');
-			return new Response(null, { status: 304, headers });
-		}
-
-		let offset: number | undefined;
-		let length: number | undefined;
 		let status = 200;
+		let body: ReadableStream | null = null;
 
-		if (rangeHeader && rangeHeader.startsWith('bytes=')) {
-			const bytesRange = rangeHeader.replace(/bytes=/, '').split('-');
-			const start = parseInt(bytesRange[0], 10);
-			let end = bytesRange[1] ? parseInt(bytesRange[1], 10) : undefined;
-
-			if (isNaN(start) || start < 0) {
-				throw new HTTPException(416, { message: 'Invalid range start' });
-			}
-
-			if (start >= metadata.size) {
-				throw new HTTPException(416, { message: 'Range Not Satisfiable: start past end of file' });
-			}
-
-			if (end !== undefined) {
-				if (isNaN(end) || end < start) {
-					throw new HTTPException(416, { message: 'Invalid range end' });
+		if (rangeHeader) {
+			const range = parseRange(rangeHeader, objectMeta.size);
+			if (range) {
+				const object = await env.SMOL_BUCKET.get(id, { range });
+				if (object) {
+					headers.set('Content-Range', `bytes ${range.offset}-${range.offset + (range.length !== undefined ? range.length - 1 : objectMeta.size - 1 - range.offset)}/${objectMeta.size}`);
+					body = object.body;
+					status = 206; // Partial Content
 				}
-				end = Math.min(end, metadata.size - 1);
-				length = end - start + 1;
 			} else {
-				// If no end is specified, serve till the end of the file
-				length = metadata.size - start;
-			}
-			offset = start;
-			status = 206;
-		}
-
-		// Prepare options for the R2 get call
-		const r2GetOptions: R2GetOptions = {};
-		if (status === 206 && offset !== undefined) {
-			r2GetOptions.range = { offset, length }; // length will also be defined here
-		}
-
-		// Fetch the actual object (or range) from R2
-		const object = await env.SMOL_BUCKET.get(idWithSuffix, r2GetOptions);
-
-		if (!object || !object.body) {
-			// This might happen if the object was deleted between HEAD and GET, or R2 error
-			throw new HTTPException(500, { message: 'Failed to retrieve song data after metadata check' });
-		}
-
-		// Clear potentially stale headers from the HEAD request before applying headers from the GET response object
-		// except for ETag and Last-Modified which are stable and already set from metadata.
-		const etagFromMeta = headers.get('ETag');
-		const lastModifiedFromMeta = headers.get('Last-Modified');
-
-		// Create a new Headers object for the final response to avoid modifying the one used for 304 checks
-		const responseHeaders = new Headers();
-
-		// Apply headers from the R2 object (this will set Content-Length, potentially Content-Type, etc.)
-		object.writeHttpMetadata(responseHeaders);
-
-		// Ensure our critical headers are set with desired values
-		if (etagFromMeta) responseHeaders.set('ETag', etagFromMeta);
-		if (lastModifiedFromMeta) responseHeaders.set('Last-Modified', lastModifiedFromMeta);
-		responseHeaders.set('Content-Type', 'audio/mpeg'); // Ensure our desired Content-Type
-		responseHeaders.set('Content-Disposition', 'inline'); // Ensure our desired Content-Disposition
-
-		// Add Accept-Ranges header to indicate server support for range requests
-		responseHeaders.set('Accept-Ranges', 'bytes');
-
-		if (status === 206 && offset !== undefined) {
-			// object.size for a ranged GET is the size of the partial content.
-			responseHeaders.set('Content-Range', `bytes ${offset}-${offset + object.size - 1}/${metadata.size}`);
-			// Content-Length for 206 is set by object.writeHttpMetadata correctly from object.size (partial size)
-		} else if (status === 200) {
-			// Content-Length for 200 should be the full size.
-			// object.writeHttpMetadata (if on a full object) should set this from object.size (full size)
-			// If for some reason it's different from metadata.size (e.g. R2 compression not reflected in HEAD size?), metadata.size is the source of truth for the full file.
-			if (responseHeaders.get('Content-Length') !== metadata.size.toString()) {
-				responseHeaders.set('Content-Length', metadata.size.toString());
+				// Invalid range header, return full content or an error
+				headers.set('Content-Range', `bytes */${objectMeta.size}`);
+				throw new HTTPException(416, { message: 'Range Not Satisfiable' });
 			}
 		}
 
-		// Increment plays non-blockingly
-		executionCtx.waitUntil(
-			env.SMOL_D1.prepare(
-				"UPDATE Smols SET Plays = Plays + 1 WHERE Song_1 = ?1 OR Song_2 = ?1"
-			).bind(id).run()
-		);
+		if (!body) { // If no range or invalid range, serve the full object
+			const object = await env.SMOL_BUCKET.get(id);
+			if (object) {
+				body = object.body;
+			} else {
+				// This case should ideally not be reached if head was successful
+				throw new HTTPException(404, { message: 'Song not found after head request' }); 
+			}
+		}
 
-		return new Response(object.body, { status, headers: responseHeaders });
+		// Increment plays only if it's not a partial content request (or if it is the first part of a range request)
+		// For simplicity, we increment if no range header is present or if the range starts at 0.
+		const shouldIncrementPlays = !rangeHeader || (rangeHeader && rangeHeader.startsWith('bytes=0-'));
+
+		if (shouldIncrementPlays) {
+			const dbId = id.endsWith('.mp3') ? id.slice(0, -4) : id;
+			executionCtx.waitUntil(
+				env.SMOL_D1.prepare(
+					"UPDATE Smols SET Plays = Plays + 1 WHERE Song_1 = ?1 OR Song_2 = ?1"
+				).bind(dbId).run()
+			);
+		}
+
+		return new Response(body, {
+			headers,
+			status
+		});
 	}
 );
 
