@@ -21,21 +21,21 @@ export const app = new Hono<{ Bindings: Env }>()
 // Implement blockchain
 // clear cache in the right places
 
-function conditionalCache(options: Parameters<typeof cache>[0]) {
-	const caching = cache(options)
+// function conditionalCache(options: Parameters<typeof cache>[0]) {
+// 	const caching = cache(options)
 
-	return async (c: Context, next: Next) => {
-		const range = c.req.header('range')
+// 	return async (c: Context, next: Next) => {
+// 		const range = c.req.header('range')
 
-		if (range) {
-			// Skip cache middleware for range requests
-			return await next()
-		}
+// 		if (range) {
+// 			// Skip cache middleware for range requests
+// 			return await next()
+// 		}
 
-		// Apply cache middleware
-		return await caching(c, next)
-	}
-}
+// 		// Apply cache middleware
+// 		return await caching(c, next)
+// 	}
+// }
 
 // TODO ensure if verify breaks the request fails 
 
@@ -488,10 +488,10 @@ app.put(
 
 app.get(
 	'/song/:id{.+\.mp3}',
-	conditionalCache({
-		cacheName: 'smol-workflow',
-		cacheControl: 'public, max-age=31536000, immutable', // 1 year in seconds
-	}),
+	// conditionalCache({
+	// 	cacheName: 'smol-workflow',
+	// 	cacheControl: 'public, max-age=31536000, immutable', // 1 year in seconds
+	// }),
 	async (c) => {
 		const { env, req, executionCtx } = c;
 		const id = req.param('id');
