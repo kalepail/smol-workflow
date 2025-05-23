@@ -44,8 +44,16 @@ export async function generateLyrics(env: Env, prompt: string, description: stri
 }
 
 // Generate a song from lyrics
-export async function generateSongs(env: Env, prompt: string, description: string, lyrics: AiSongGeneratorLyrics, is_public = true, is_instrumental = false): Promise<number[] | string[]> {
-    return env.AISONGGENERATOR.fetch('http://aisonggenerator-worker/api/songs', {
+export async function generateSongs(
+    env: Env, 
+    prompt: string, 
+    description: string, 
+    lyrics: AiSongGeneratorLyrics, 
+    is_public = true, 
+    is_instrumental = false,
+    source = 'aisonggenerator'
+): Promise<number[] | string[]> {
+    return env.AISONGGENERATOR.fetch(`http://aisonggenerator-worker/api/songs?source=${source}`, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
@@ -66,8 +74,12 @@ export async function generateSongs(env: Env, prompt: string, description: strin
         })
 }
 
-export async function getSongs(env: Env, ids: number[] | string[]): Promise<AiSongGeneratorSong[]> {
-    return env.AISONGGENERATOR.fetch(`http://aisonggenerator-worker/api/songs?ids=${ids.join(',')}`)
+export async function getSongs(
+    env: Env, 
+    ids: number[] | string[], 
+    source = 'aisonggenerator'
+): Promise<AiSongGeneratorSong[]> {
+    return env.AISONGGENERATOR.fetch(`http://aisonggenerator-worker/api/songs?ids=${ids.join(',')}&source=${source}`)
         .then(async (res) => {
             if (res.ok)
                 return res.json()

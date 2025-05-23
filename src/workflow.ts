@@ -131,12 +131,24 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 		await step.do('save nsfw check', config, () => stub.saveStep('nsfw', nsfw))
 
 		// if retrying and all songs gens were successful, use the existing song ids
-		let song_ids = retry_steps?.song_ids && !retry_steps?.songs?.some((song) => song.status < 0)
-			? retry_steps.song_ids
-			: await step.do('generate songs', config, async () => {
-				let song_ids = await generateSongs(this.env, prompt, description, lyrics, is_public, is_instrumental);
-				return song_ids;
-			})
+		let source: string;
+		let song_ids: number[] | string[] | undefined = retry_steps?.song_ids && !retry_steps?.songs?.some((song) => song.status < 0) ? retry_steps.song_ids : undefined;
+
+		if (!song_ids) {
+			try {
+				song_ids = await step.do('generate songs (aisonggenerator)', config, async () => {
+					let song_ids = await generateSongs(this.env, prompt, description, lyrics, is_public, is_instrumental, 'aisonggenerator');
+					return song_ids;
+				})
+				source = 'aisonggenerator';
+			} catch {
+				song_ids = await step.do('generate songs (diffrhythm)', config, async () => {
+					let song_ids = await generateSongs(this.env, prompt, description, lyrics, is_public, is_instrumental, 'diffrhythm');
+					return song_ids;
+				})
+				source = 'diffrhythm';
+			}
+		}
 
 		await step.do('save song ids', config, () => stub.saveStep('song_ids', song_ids));
 
@@ -152,7 +164,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 				},
 			} as WorkflowStepConfig,
 			async () => {
-				let songs = await getSongs(this.env, song_ids);
+				let songs = await getSongs(this.env, song_ids, source);
 				let has_audio = false;
 				let is_streaming = false;
 
