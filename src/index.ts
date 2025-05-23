@@ -110,9 +110,31 @@ app.post('/login', async (c) => {
 		httpOnly: true,
 		sameSite: 'None',
 		maxAge: 60 * 60 * 24 * 30,
+		domain: '.' + new URL(req.url).hostname.split('.').slice(-2).join('.'),
 	});
 
 	return c.text(token)
+});
+
+app.post('/logout', async (c) => {
+	const { req } = c;
+	const hostname = new URL(req.url).hostname;
+	const domainParts = hostname.split('.');
+	// Handle localhost or single-name domains, and ensure leading dot for subdomains
+	const rootDomain = domainParts.length > 1 
+		? '.' + domainParts.slice(-2).join('.') 
+		: hostname;
+
+	setCookie(c, 'smol_token', '', { // Set value to empty string
+		path: '/',
+		secure: true,
+		httpOnly: true,
+		sameSite: 'None',
+		maxAge: 0, // Expire immediately
+		domain: rootDomain,
+	});
+
+	return c.body(null, 204);
 });
 
 app.get(

@@ -11,3 +11,4 @@ npx wrangler d1 execute smol-d1 --remote --command="SELECT * FROM Smols WHERE Id
 npx wrangler d1 execute smol-d1 --remote --command="SELECT COUNT(*) FROM Smols"
 
 npx wrangler d1 execute smol-d1 --remote --command="SELECT COUNT(DISTINCT Address) FROM Smols"
+
