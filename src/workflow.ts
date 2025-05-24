@@ -130,8 +130,9 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 
 		await step.do('save nsfw check', config, () => stub.saveStep('nsfw', nsfw))
 
-		// if retrying and all songs gens were successful, use the existing song ids
+		// TODO likely need to save this to the DO so we can retry with the same source if needed
 		let source: string;
+		// if retrying and all songs gens were successful, use the existing song ids
 		let song_ids: number[] | string[] | undefined = retry_steps?.song_ids && !retry_steps?.songs?.some((song) => song.status < 0) ? retry_steps.song_ids : undefined;
 
 		if (!song_ids) {
@@ -170,6 +171,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 
 				for (let song of songs) {
 					if (song.status < 0) {
+						// TODO maybe if we hit this we should retry with `diffrhythm`
 						await stub.saveStep('songs', songs)
 						throw new NonRetryableError(`Song ${song.music_id || 'unknown'} has negative status: ${song.status}`);
 					}
