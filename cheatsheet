@@ -12,3 +12,4 @@ npx wrangler d1 execute smol-d1 --remote --command="SELECT COUNT(*) FROM Smols"
 
 npx wrangler d1 execute smol-d1 --remote --command="SELECT COUNT(DISTINCT Address) FROM Smols"
 
+npx wrangler d1 execute smol-d1 --remote --command="UPDATE Smols SET Public = 1 WHERE Id = 'efd530037ff48ad7da5f77875a062880cd20483b85c0ab769132cfc18f25e15a'"

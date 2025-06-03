@@ -535,7 +535,7 @@ app.get(
 			const dbId = id.replace('.mp3', '');
 			executionCtx.waitUntil(
 				env.SMOL_D1.prepare(
-					"UPDATE Smols SET Plays = Plays + 1 WHERE Song_1 = ? OR Song_2 = ?"
+					"UPDATE Smols SET Plays = Plays + 1 WHERE Song_1 = ?1 OR Song_2 = ?1"
 				).bind(dbId).run()
 			);
 		}
