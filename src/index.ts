@@ -302,14 +302,11 @@ app.get(
 
 		// Determine if requester has liked the smol (if authenticated)
 		const payload = c.get('jwtPayload') as { sub: string } | undefined;
-		console.log('payload', payload);
 		let liked = false;
 		if (payload?.sub) {
 			const likedRow = await env.SMOL_D1.prepare(
 				`SELECT 1 FROM Likes WHERE Id = ?1 AND "Address" = ?2`
 			).bind(id, payload.sub).first();
-
-			console.log('likedRow', likedRow);
 
 			liked = !!likedRow;
 		}
