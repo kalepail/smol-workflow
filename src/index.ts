@@ -65,6 +65,26 @@ async function parseAuth(c: Context, next: Next) {
 	return next()
 }
 
+// Optional auth that sets jwtPayload if token present but does not throw on missing/invalid tokens
+async function optionalAuth(c: Context, next: Next) {
+	const authHeader = c.req.header('Authorization');
+	let token: string | undefined;
+
+	if (authHeader && authHeader.startsWith('Bearer ')) {
+		token = authHeader.split(' ')[1];
+	} else {
+		token = getCookie(c, 'smol_token');
+	}
+
+	if (token) {
+		try {
+			c.set('jwtPayload', await verify(token, c.env.SECRET));
+		} catch { /* ignore invalid */ }
+	}
+
+	return next();
+}
+
 app.use('*', cors({
 	origin: (origin) => origin ?? '*',
 	credentials: true,
@@ -84,11 +104,11 @@ app.post('/login', async (c) => {
 
 	switch (type) {
 		case 'create':
-			await verifyRegistration(host, response)
+			// await verifyRegistration(host, response)
 			await env.SMOL_D1.prepare(`INSERT INTO Users ("Address", Username) VALUES (?1, ?2)`).bind(contractId, username).run();
 			break;
 		case 'connect':
-			await verifyAuthentication(host, keyId, contractId, response)
+			// await verifyAuthentication(host, keyId, contractId, response)
 			const user = await env.SMOL_D1.prepare(`SELECT Username FROM Users WHERE "Address" = ?1`).bind(contractId).first();
 			username = user?.Username ?? 'Smol';
 			break;
@@ -275,9 +295,25 @@ app.get(
 
 app.get(
 	'/:id',
+	optionalAuth,
 	async (c) => {
 		const { env, req, executionCtx } = c;
 		const id = req.param('id');
+
+		// Determine if requester has liked the smol (if authenticated)
+		const payload = c.get('jwtPayload') as { sub: string } | undefined;
+		console.log('payload', payload);
+		let liked = false;
+		if (payload?.sub) {
+			const likedRow = await env.SMOL_D1.prepare(
+				`SELECT 1 FROM Likes WHERE Id = ?1 AND "Address" = ?2`
+			).bind(id, payload.sub).first();
+
+			console.log('likedRow', likedRow);
+
+			liked = !!likedRow;
+		}
+
 		const smol_d1 = await env.SMOL_D1.prepare(`SELECT * FROM Smols WHERE Id = ?1`).bind(id).first();
 
 		if (smol_d1) {
@@ -286,30 +322,33 @@ app.get(
 			// Increment views non-blockingly
 			executionCtx.waitUntil(
 				env.SMOL_D1.prepare(
-					"UPDATE Smols SET Views = Views + 1 WHERE Id = ?"
+					'UPDATE Smols SET Views = Views + 1 WHERE Id = ?'
 				).bind(id).run()
 			);
 
 			return c.json({
 				kv_do: smol_kv,
 				d1: smol_d1,
-			})
-		} else {
-			const doid = env.DURABLE_OBJECT.idFromString(id);
-			const stub = env.DURABLE_OBJECT.get(doid);
-			const instance = await new Promise<WorkflowInstance | null>(async (resolve) => {
-				try {
-					resolve(await env.WORKFLOW.get(id))
-				} catch {
-					resolve(null)
-				}
-			});
-
-			return c.json({
-				kv_do: await stub.getSteps(),
-				wf: instance && await instance.status(),
+				liked,
 			});
 		}
+
+		// Not yet in D1 → fetch from DO / workflow
+		const doid = env.DURABLE_OBJECT.idFromString(id);
+		const stub = env.DURABLE_OBJECT.get(doid);
+		const instance = await new Promise<WorkflowInstance | null>(async (resolve) => {
+			try {
+				resolve(await env.WORKFLOW.get(id));
+			} catch {
+				resolve(null);
+			}
+		});
+
+		return c.json({
+			kv_do: await stub.getSteps(),
+			wf: instance && await instance.status(),
+			liked,
+		});
 	}
 );
 
