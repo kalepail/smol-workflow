@@ -20,7 +20,7 @@ export async function generateLyrics(env: Env, prompt: string, description: stri
         Focus on creativity, story and lyrical variety over strict adherence to the prompt.
     `;
 
-    if (prompt.length > 500) {
+    if (prompt.length > 760) {
         finalPrompt = promptWithoutDescription;
     } else {
         finalPrompt = promptWithDescription;
