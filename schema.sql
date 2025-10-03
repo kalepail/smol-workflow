@@ -1,6 +1,6 @@
 -- ALTER TABLE Smols ADD COLUMN Instrumental BOOLEAN DEFAULT 0;
 
--- DROP TABLE IF EXISTS Users;
+-- DROP TABLE IF EXISTS Mixtapes;
 
 CREATE TABLE IF NOT EXISTS Smols (
     Id TEXT PRIMARY KEY,
@@ -12,7 +12,9 @@ CREATE TABLE IF NOT EXISTS Smols (
     Instrumental BOOLEAN DEFAULT 0,
     Plays INTEGER DEFAULT 0,
     Views INTEGER DEFAULT 0,
-    "Address" TEXT NOT NULL
+    "Address" TEXT NOT NULL,
+    Mint_Token TEXT DEFAULT NULL,
+    Mint_Amm TEXT DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS Users (
@@ -31,4 +33,13 @@ CREATE TABLE IF NOT EXISTS Playlists (
     Id TEXT NOT NULL,
     Title TEXT NOT NULL,
     UNIQUE (Id, Title)
+);
+
+CREATE TABLE IF NOT EXISTS Mixtapes (
+    Id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(8)))),
+    Title TEXT NOT NULL,
+    Desc TEXT NOT NULL,
+    Smols TEXT NOT NULL,
+    "Address" TEXT NOT NULL,
+    Created_At DATETIME DEFAULT CURRENT_TIMESTAMP
 );

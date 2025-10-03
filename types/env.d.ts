@@ -33,9 +33,8 @@ type WorkflowParams = {
 }
 
 type WorkflowTxParams = {
-	type: 'mint' | 'buy' | 'sell'
-	owner: string
+	type: 'mint' | 'batch-mint'
 	entropy: string
-	name?: string
-	xdr?: string
+	xdr: string
+	ids?: string[]
 }

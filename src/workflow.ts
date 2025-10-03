@@ -202,17 +202,23 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 		await step.do('save songs', config, () => stub.saveStep('songs', songs));
 
 		// mint smol on Stellar
-		await step.do('mint smol', config, async () => {
-			// TODO this probably should just be done inline here vs sent to another workflow
-			await this.env.TX_WORKFLOW.create({
-				params: {
-					type: 'mint',
-					owner: address,
-					entropy: event.instanceId,
-					name: lyrics.title,
-				}
-			});
-		})
+		// await step.do('mint smol', config, async () => {
+		// 	// TODO this probably should just be done inline here vs sent to another workflow
+		// 	// TODO actually I want mining smols to be a separate explicit step after a song has been minted
+		// 		// This will ensure the artist thinks the content is worth being minted
+		// 		// And it will allow them to decide the starting price 
+		// 			// (maybe, 
+		// 			// probably not though as that could mess up the 10M ratio, 
+		// 			// though I guess I could scrape whatever is left above the 100 KALE base and immediately sell it into the AMM?)
+		// 	await this.env.TX_WORKFLOW.create({
+		// 		params: {
+		// 			type: 'mint',
+		// 			owner: address,
+		// 			entropy: event.instanceId,
+		// 			name: lyrics.title,
+		// 		}
+		// 	});
+		// });
 
 		await step.do('complete workflow', config, async () => {
 			await stub.setToFlush();

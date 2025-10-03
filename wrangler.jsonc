@@ -6,11 +6,12 @@
     "$schema": "node_modules/wrangler/config-schema.json",
     "name": "smol-workflow",
     "main": "src/index.ts",
-    "compatibility_date": "2025-03-15",
+    "compatibility_date": "2025-09-25",
     "minify": false,
     "compatibility_flags": [
         "nodejs_compat"
     ],
+    "preview_urls": false,
     "observability": {
         "enabled": true,
         "logs": {
@@ -83,9 +84,11 @@
    * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
    */
     "vars": { 
-        "RPC_URL": "https://mainnet.sorobanrpc.com",
-        "FP_WASM_HASH": "0a41411f7250a78da15d6cd6cf78086e19d98bc917dd0a51e03a34f5ab969781",
-        "NETWORK_PASSPHRASE": "Public Global Stellar Network ; September 2015"
+        // "RPC_URL": "https://mainnet.sorobanrpc.com",
+        // "NETWORK_PASSPHRASE": "Public Global Stellar Network ; September 2015"
+        "RPC_URL": "https://soroban-testnet.stellar.org",
+        "NETWORK_PASSPHRASE": "Test SDF Network ; September 2015",
+        "SMOL_CONTRACT_ID": "CBMMM3ZWOFJIOU5DO25EDXFGEKFB5LMBA4PPKPG4FJKJ3GVAQIM7CPA2",
     },
     /**
    * Note: Use secrets to store sensitive data.
@@ -107,7 +110,7 @@
         },
         {
             "binding": "LAUNCHTUBE",
-            "service": "launchtube-prod"
+            "service": "launchtube"
         }
     ],
     "migrations": [

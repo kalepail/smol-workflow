@@ -8,18 +8,18 @@
 		"cf-typegen": "wrangler types"
 	},
 	"devDependencies": {
-		"@cloudflare/workers-types": "^4.20250612.0",
-		"@types/node": "^24.0.1",
-		"itty-fetcher": "^0.9.4",
-		"typescript": "^5.8.3",
-		"wrangler": "^4.20.0"
+		"@cloudflare/workers-types": "^4.20251001.0",
+		"@types/node": "^24.6.2",
+		"itty-fetcher": "^1.0.10",
+		"typescript": "^5.9.3",
+		"wrangler": "^4.41.0"
 	},
 	"dependencies": {
-		"@simplewebauthn/server": "^13.1.1",
-		"@stellar/stellar-sdk": "^13.3.0",
+		"@simplewebauthn/server": "^13.2.1",
+		"@stellar/stellar-sdk": "^14.2.0",
 		"base64url": "^3.0.1",
-		"hono": "^4.7.11",
+		"hono": "^4.9.9",
 		"jimp": "^1.6.0",
-		"fp-sdk": "file:./ext/fp-sdk"
+		"smol-sdk": "file:./ext/smol-sdk"
 	}
 }
