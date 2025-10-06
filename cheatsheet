@@ -14,6 +14,10 @@ npx wrangler d1 execute smol-d1 --remote --command="SELECT COUNT(DISTINCT Addres
 
 npx wrangler d1 execute smol-d1 --remote --command="UPDATE Smols SET Public = 1 WHERE Id = 'efd530037ff48ad7da5f77875a062880cd20483b85c0ab769132cfc18f25e15a'"
 
-npx wrangler d1 execute smol-d1 --remote --command="ALTER TABLE Smols ADD COLUMN mint_token TEXT DEFAULT NULL"
+npx wrangler d1 execute smol-d1 --remote --command="ALTER TABLE Smols ADD COLUMN Mint_Token TEXT DEFAULT NULL"
 
-npx wrangler d1 execute smol-d1 --remote --command="ALTER TABLE Smols ADD COLUMN mint_amm TEXT DEFAULT NULL"
+npx wrangler d1 execute smol-d1 --remote --command="ALTER TABLE Smols ADD COLUMN Mint_Amm TEXT DEFAULT NULL"
+
+npx wrangler d1 execute smol-d1 --remote --command="UPDATE Smols SET Mint_Token = NULL, Mint_Amm = NULL"
+
+npx wrangler d1 execute smol-d1 --remote --command="DELETE FROM Mixtapes"

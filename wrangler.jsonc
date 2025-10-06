@@ -84,11 +84,9 @@
    * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
    */
     "vars": { 
-        // "RPC_URL": "https://mainnet.sorobanrpc.com",
-        // "NETWORK_PASSPHRASE": "Public Global Stellar Network ; September 2015"
-        "RPC_URL": "https://soroban-testnet.stellar.org",
-        "NETWORK_PASSPHRASE": "Test SDF Network ; September 2015",
-        "SMOL_CONTRACT_ID": "CBMMM3ZWOFJIOU5DO25EDXFGEKFB5LMBA4PPKPG4FJKJ3GVAQIM7CPA2",
+        "RPC_URL": "https://rpc.lightsail.network/",
+        "NETWORK_PASSPHRASE": "Public Global Stellar Network ; September 2015",
+        "SMOL_CONTRACT_ID": "CBRNUVLGFM5OYWAGZVGU7CTMP2UJLKZCLFY2ANUCK5UGKND6BBAA5PLA",
     },
     /**
    * Note: Use secrets to store sensitive data.
@@ -110,7 +108,7 @@
         },
         {
             "binding": "LAUNCHTUBE",
-            "service": "launchtube"
+            "service": "launchtube-prod"
         }
     ],
     "migrations": [

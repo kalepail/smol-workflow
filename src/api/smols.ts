@@ -3,8 +3,22 @@ import { HTTPException } from 'hono/http-exception'
 import { cache } from 'hono/cache'
 import type { HonoEnv } from '../types'
 import { parseAuth, optionalAuth } from '../middleware/auth'
+import {
+	parsePaginationParams,
+	buildCursorWhereClause,
+	buildPaginationResponse,
+} from '../utils/pagination'
 
 const smols = new Hono<HonoEnv>()
+
+interface SmolListItem {
+	Id: string
+	Title: string
+	Song_1: string
+	Mint_Token: string | null
+	Mint_Amm: string | null
+	Created_At: string
+}
 
 // Get all public smols
 smols.get(
@@ -14,54 +28,159 @@ smols.get(
 		cacheControl: 'public, max-age=30',
 	}),
 	async (c) => {
-		const { env } = c
-		const { results } = await env.SMOL_D1.prepare(`
-			SELECT Id, Title, Song_1, Mint_Token, Mint_Amm
-			FROM Smols
-			WHERE Public = 1
-			ORDER BY Created_At DESC
-			LIMIT 1000
-		`).all()
+		const { env, req } = c
+		const { limit, cursor } = parsePaginationParams(new URL(req.url))
 
-		return c.json(results)
+		const whereClause = buildCursorWhereClause(cursor, 'Public = 1')
+		const bindings: any[] = []
+
+		// Build query based on whether we have cursor bindings
+		let query: string
+		if (whereClause.length > 1) {
+			// Has cursor bindings
+			query = `
+				SELECT Id, Title, Song_1, Mint_Token, Mint_Amm, Created_At
+				FROM Smols
+				WHERE ${whereClause[0]}
+				ORDER BY Created_At DESC, Id DESC
+				LIMIT ?
+			`
+			bindings.push(whereClause[1], whereClause[2], whereClause[3], limit)
+		} else {
+			// No cursor bindings
+			query = `
+				SELECT Id, Title, Song_1, Mint_Token, Mint_Amm, Created_At
+				FROM Smols
+				WHERE ${whereClause[0]}
+				ORDER BY Created_At DESC, Id DESC
+				LIMIT ?
+			`
+			bindings.push(limit)
+		}
+
+		const { results } = await env.SMOL_D1.prepare(query)
+			.bind(...bindings)
+			.all<SmolListItem>()
+
+		const pagination = buildPaginationResponse(
+			results,
+			limit,
+			(item) => item.Created_At,
+			(item) => item.Id
+		)
+
+		// Remove Created_At from response items
+		const smols = results.map(({ Created_At, ...rest }) => rest)
+
+		return c.json({
+			smols,
+			pagination,
+		})
 	}
 )
 
 // Get smols created by authenticated user
 smols.get('/created', parseAuth, async (c) => {
-	const { env } = c
+	const { env, req } = c
 	const payload = c.get('jwtPayload')!
+	const { limit, cursor } = parsePaginationParams(new URL(req.url))
 
-	const { results } = await env.SMOL_D1.prepare(`
-		SELECT Id, Title, Song_1, Mint_Token, Mint_Amm
-		FROM Smols
-		WHERE Address = ?1
-		ORDER BY Created_At DESC
-		LIMIT 1000
-	`)
-		.bind(payload.sub)
-		.all()
+	const whereClause = buildCursorWhereClause(cursor, 'Address = ?')
+	const bindings: any[] = []
 
-	return c.json(results)
+	let query: string
+	if (whereClause.length > 1) {
+		// Has cursor bindings
+		query = `
+			SELECT Id, Title, Song_1, Mint_Token, Mint_Amm, Created_At
+			FROM Smols
+			WHERE ${whereClause[0]}
+			ORDER BY Created_At DESC, Id DESC
+			LIMIT ?
+		`
+		bindings.push(payload.sub, whereClause[1], whereClause[2], whereClause[3], limit)
+	} else {
+		// No cursor bindings
+		query = `
+			SELECT Id, Title, Song_1, Mint_Token, Mint_Amm, Created_At
+			FROM Smols
+			WHERE ${whereClause[0]}
+			ORDER BY Created_At DESC, Id DESC
+			LIMIT ?
+		`
+		bindings.push(payload.sub, limit)
+	}
+
+	const { results } = await env.SMOL_D1.prepare(query)
+		.bind(...bindings)
+		.all<SmolListItem>()
+
+	const pagination = buildPaginationResponse(
+		results,
+		limit,
+		(item) => item.Created_At,
+		(item) => item.Id
+	)
+
+	const smols = results.map(({ Created_At, ...rest }) => rest)
+
+	return c.json({
+		smols,
+		pagination,
+	})
 })
 
 // Get smols liked by authenticated user
 smols.get('/liked', parseAuth, async (c) => {
-	const { env } = c
+	const { env, req } = c
 	const payload = c.get('jwtPayload')!
+	const { limit, cursor } = parsePaginationParams(new URL(req.url))
 
-	const { results } = await env.SMOL_D1.prepare(`
-		SELECT s.Id, s.Title, s.Song_1, s.Mint_Token, s.Mint_Amm
-		FROM Smols s
-		INNER JOIN Likes l ON s.Id = l.Id
-		WHERE l."Address" = ?1
-		ORDER BY s.Created_At DESC
-		LIMIT 1000
-	`)
-		.bind(payload.sub)
-		.all()
+	const whereClause = buildCursorWhereClause(cursor, 'l."Address" = ?', 's.')
+	const bindings: any[] = []
 
-	return c.json(results)
+	let query: string
+	if (whereClause.length > 1) {
+		// Has cursor bindings
+		query = `
+			SELECT s.Id, s.Title, s.Song_1, s.Mint_Token, s.Mint_Amm, s.Created_At
+			FROM Smols s
+			INNER JOIN Likes l ON s.Id = l.Id
+			WHERE ${whereClause[0]}
+			ORDER BY s.Created_At DESC, s.Id DESC
+			LIMIT ?
+		`
+		bindings.push(payload.sub, whereClause[1], whereClause[2], whereClause[3], limit)
+	} else {
+		// No cursor bindings
+		query = `
+			SELECT s.Id, s.Title, s.Song_1, s.Mint_Token, s.Mint_Amm, s.Created_At
+			FROM Smols s
+			INNER JOIN Likes l ON s.Id = l.Id
+			WHERE ${whereClause[0]}
+			ORDER BY s.Created_At DESC, s.Id DESC
+			LIMIT ?
+		`
+		bindings.push(payload.sub, limit)
+	}
+
+	const { results } = await env.SMOL_D1.prepare(query)
+		.bind(...bindings)
+		.all<SmolListItem>()
+
+	const pagination = buildPaginationResponse(
+		results,
+		limit,
+		(item) => item.Created_At,
+		(item) => item.Id
+	)
+
+	const smols = results.map(({ Created_At, ...rest }) => rest)
+
+	return c.json({
+		smols,
+		pagination,
+	})
 })
 
 // Get specific smol by ID

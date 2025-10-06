@@ -3,8 +3,8 @@ import { basicNodeSigner } from "@stellar/stellar-sdk/minimal/contract";
 import { env, WorkflowEntrypoint, WorkflowEvent, WorkflowStep, WorkflowStepConfig } from "cloudflare:workers";
 import { Client as SmolClient } from "smol-sdk";
 
-const keypair = Keypair.fromRawEd25519Seed(hash(Buffer.from('kalepail')));
-const publicKey = keypair.publicKey();
+// const keypair = Keypair.fromRawEd25519Seed(hash(Buffer.from('kalepail')));
+// const publicKey = keypair.publicKey();
 
 const KP = Keypair.fromSecret(env.SK)
 const PK = KP.publicKey()

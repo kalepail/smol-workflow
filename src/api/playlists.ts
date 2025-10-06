@@ -1,6 +1,11 @@
 import { Hono } from 'hono'
 import { cache } from 'hono/cache'
 import type { HonoEnv } from '../types'
+import {
+	parsePaginationParams,
+	buildCursorWhereClause,
+	buildPaginationResponse,
+} from '../utils/pagination'
 
 const playlists = new Hono<HonoEnv>()
 
@@ -18,6 +23,7 @@ interface Smol {
 	Views: number
 	Mint_Token: string | null
 	Mint_Amm: string | null
+	Created_At: string
 }
 
 playlists.get(
@@ -27,18 +33,40 @@ playlists.get(
 		cacheControl: 'public, max-age=30',
 	}),
 	async (c) => {
-		const { env } = c
+		const { env, req } = c
 		const playlistTitle = c.req.param('title')
+		const { limit, cursor } = parsePaginationParams(new URL(req.url))
 
-		const smolsD1Result = await env.SMOL_D1.prepare(`
-			SELECT s.Id, s.Title, s.Song_1, s.Address, s.Plays, s.Views, s.Mint_Token, s.Mint_Amm
-			FROM Smols s
-			INNER JOIN Playlists p ON s.Id = p.Id
-			WHERE p.Title = ?1 AND s.Public = 1
-			ORDER BY s.Created_At DESC
-			LIMIT 1000
-		`)
-			.bind(playlistTitle)
+		const whereClause = buildCursorWhereClause(cursor, 'p.Title = ? AND s.Public = 1', 's.')
+		const bindings: any[] = []
+
+		let query: string
+		if (whereClause.length > 1) {
+			// Has cursor bindings
+			query = `
+				SELECT s.Id, s.Title, s.Song_1, s.Address, s.Plays, s.Views, s.Mint_Token, s.Mint_Amm, s.Created_At
+				FROM Smols s
+				INNER JOIN Playlists p ON s.Id = p.Id
+				WHERE ${whereClause[0]}
+				ORDER BY s.Created_At DESC, s.Id DESC
+				LIMIT ?
+			`
+			bindings.push(playlistTitle, whereClause[1], whereClause[2], whereClause[3], limit)
+		} else {
+			// No cursor bindings
+			query = `
+				SELECT s.Id, s.Title, s.Song_1, s.Address, s.Plays, s.Views, s.Mint_Token, s.Mint_Amm, s.Created_At
+				FROM Smols s
+				INNER JOIN Playlists p ON s.Id = p.Id
+				WHERE ${whereClause[0]}
+				ORDER BY s.Created_At DESC, s.Id DESC
+				LIMIT ?
+			`
+			bindings.push(playlistTitle, limit)
+		}
+
+		const smolsD1Result = await env.SMOL_D1.prepare(query)
+			.bind(...bindings)
 			.all<Smol>()
 
 		const smolsFromDb = smolsD1Result.results || []
@@ -60,9 +88,20 @@ playlists.get(
 			}
 		}
 
+		const pagination = buildPaginationResponse(
+			smolsFromDb,
+			limit,
+			(item) => item.Created_At,
+			(item) => item.Id
+		)
+
+		// Remove Created_At from response items
+		const smols = smolsFromDb.map(({ Created_At, ...rest }) => rest)
+
 		return c.json({
-			smols: smolsFromDb,
+			smols,
 			users: users,
+			pagination,
 		})
 	}
 )
