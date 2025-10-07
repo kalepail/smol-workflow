@@ -217,11 +217,6 @@ smols.get(
 smols.get(
 	'/:id',
 	optionalAuth,
-	cache({
-		cacheName: 'smol-workflow',
-		cacheControl: 'public, max-age=30, stale-while-revalidate=60',
-		keyGenerator: userCacheKeyGenerator, // Vary by user sub - response includes user-specific 'liked' field
-	}),
 	async (c) => {
 		const { env, req, executionCtx } = c
 		const id = req.param('id')
@@ -259,6 +254,9 @@ smols.get(
 				liked,
 			})
 
+			// Only cache completed SMOLs (those in D1)
+			response.headers.set('Cache-Control', 'public, max-age=30, stale-while-revalidate=60')
+
 			// Add cache tags for individual smol
 			// Use user-specific tag if authenticated, so we only purge that user's cache entry
 			if (payload?.sub) {
@@ -271,7 +269,7 @@ smols.get(
 			return response
 		}
 
-		// Not yet in D1 → fetch from DO / workflow
+		// Not yet in D1 → fetch from DO / workflow (in-progress SMOL)
 		const doid = env.DURABLE_OBJECT.idFromString(id)
 		const stub = env.DURABLE_OBJECT.get(doid)
 		const instance = await new Promise<WorkflowInstance | null>(async (resolve) => {
@@ -282,11 +280,16 @@ smols.get(
 			}
 		})
 
-		return c.json({
-			kv_do: stub.getSteps(),
+		const response = c.json({
+			kv_do: await stub.getSteps(),
 			wf: instance && (await instance.status()),
 			liked,
 		})
+
+		// Don't cache in-progress SMOLs
+		response.headers.set('Cache-Control', 'no-store')
+
+		return response
 	}
 )
 
