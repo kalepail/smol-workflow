@@ -39,9 +39,9 @@ mixtapes.post('/', parseAuth, async (c) => {
 		.bind(body.title, body.desc, smolsString, payload.sub)
 		.first<{ Id: string }>()
 
-	// Purge mixtapes cache
+	// Purge global mixtapes cache so user sees their new mixtape immediately
 	c.executionCtx.waitUntil(
-		purgeMixtapesCache(env.CF_API_TOKEN, env.CF_ZONE_ID)
+		purgeMixtapesCache()
 	)
 
 	return c.json({ id: result!.Id }, 201)

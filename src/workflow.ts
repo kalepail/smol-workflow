@@ -4,6 +4,7 @@ import { imageDescribe } from './ai/cf';
 import { generateLyrics, generateSongs, getSongs } from './ai/aisonggenerator';
 import { checkNSFW } from './ai/nsfw';
 import { NonRetryableError } from 'cloudflare:workflows';
+import { purgePlaylistCache, purgeUserCreatedCache, purgePublicSmolsCache } from './utils/cache';
 
 // ensure gen can be paid for
 // [maybe pay to proxy?]
@@ -260,7 +261,16 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 
 			if (playlist) {
 				await this.env.SMOL_D1.prepare(`INSERT INTO Playlists (Id, Title) VALUES (?1, ?2)`).bind(event.instanceId, playlist).run()
+				// Purge playlist cache so the smol appears immediately in the playlist
+				await purgePlaylistCache(playlist)
 			}
+
+			// Purge caches now that the smol is created
+			// User needs to see their new smol in their created list and the public list
+			await Promise.all([
+				purgeUserCreatedCache(address),
+				purgePublicSmolsCache(),
+			]);
 		});
 
 		return [

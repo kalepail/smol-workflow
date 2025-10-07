@@ -2,25 +2,16 @@
  * Cache purge utilities for invalidating Cloudflare cache via API
  */
 
+import { env } from 'cloudflare:workers'
 import type { Context } from 'hono'
 import type { HonoEnv } from '../types'
-
-export interface CachePurgeOptions {
-	apiToken: string
-	zoneId: string
-	tags: string[]
-}
 
 /**
  * Purge cache by tags using Cloudflare API
  * This performs a global cache purge across all data centers
  */
-export async function purgeCacheByTags(
-	options: CachePurgeOptions
-): Promise<boolean> {
-	const { apiToken, zoneId, tags } = options
-
-	if (!apiToken || !zoneId) {
+export async function purgeCacheByTags(tags: string[]): Promise<boolean> {
+	if (!env.CF_API_TOKEN || !env.CF_ZONE_ID) {
 		console.warn('Cache purge skipped: CF_API_TOKEN or CF_ZONE_ID not configured')
 		return false
 	}
@@ -32,11 +23,11 @@ export async function purgeCacheByTags(
 
 	try {
 		const response = await fetch(
-			`https://api.cloudflare.com/client/v4/zones/${zoneId}/purge_cache`,
+			`https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/purge_cache`,
 			{
 				method: 'POST',
 				headers: {
-					'Authorization': `Bearer ${apiToken}`,
+					'Authorization': `Bearer ${env.CF_API_TOKEN}`,
 					'Content-Type': 'application/json',
 				},
 				body: JSON.stringify({ tags }),
@@ -61,16 +52,8 @@ export async function purgeCacheByTags(
 /**
  * Helper to purge cache for a specific user's created smols
  */
-export function purgeUserCreatedCache(
-	apiToken: string,
-	zoneId: string,
-	userId: string
-): Promise<boolean> {
-	return purgeCacheByTags({
-		apiToken,
-		zoneId,
-		tags: [`user:${userId}:created`],
-	})
+export function purgeUserCreatedCache(userId: string): Promise<boolean> {
+	return purgeCacheByTags([`user:${userId}:created`])
 }
 
 /**
@@ -78,8 +61,6 @@ export function purgeUserCreatedCache(
  * Purges both the /liked list and /likes array
  */
 export function purgeUserLikedCache(
-	apiToken: string,
-	zoneId: string,
 	userId: string,
 	smolId?: string
 ): Promise<boolean> {
@@ -92,39 +73,28 @@ export function purgeUserLikedCache(
 		tags.push(`user:${userId}:smol:${smolId}`)
 	}
 
-	return purgeCacheByTags({
-		apiToken,
-		zoneId,
-		tags,
-	})
+	return purgeCacheByTags(tags)
 }
 
 /**
  * Helper to purge cache for mixtapes
  */
-export function purgeMixtapesCache(
-	apiToken: string,
-	zoneId: string
-): Promise<boolean> {
-	return purgeCacheByTags({
-		apiToken,
-		zoneId,
-		tags: ['mixtapes'],
-	})
+export function purgeMixtapesCache(): Promise<boolean> {
+	return purgeCacheByTags(['mixtapes'])
 }
 
 /**
  * Helper to purge cache for public smols list
  */
-export function purgePublicSmolsCache(
-	apiToken: string,
-	zoneId: string
-): Promise<boolean> {
-	return purgeCacheByTags({
-		apiToken,
-		zoneId,
-		tags: ['public-smols'],
-	})
+export function purgePublicSmolsCache(): Promise<boolean> {
+	return purgeCacheByTags(['public-smols'])
+}
+
+/**
+ * Helper to purge cache for a specific playlist
+ */
+export function purgePlaylistCache(playlistTitle: string): Promise<boolean> {
+	return purgeCacheByTags([`playlist:${playlistTitle}`])
 }
 
 /**

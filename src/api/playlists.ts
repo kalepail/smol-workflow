@@ -95,14 +95,16 @@ playlists.get(
 			(item) => item.Id
 		)
 
-		// Remove Created_At from response items
-		const smols = smolsFromDb.map(({ Created_At, ...rest }) => rest)
-
-		return c.json({
-			smols,
+		const response = c.json({
+			smols: smolsFromDb,
 			users: users,
 			pagination,
 		})
+
+		// Add cache tag for playlist
+		response.headers.append('Cache-Tag', `playlist:${playlistTitle}`)
+
+		return response
 	}
 )
 

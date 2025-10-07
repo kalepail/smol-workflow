@@ -1,7 +1,8 @@
-import { Address, hash, Keypair, scValToNative, StrKey, xdr } from "@stellar/stellar-sdk/minimal";
+import { Keypair, scValToNative, xdr } from "@stellar/stellar-sdk/minimal";
 import { basicNodeSigner } from "@stellar/stellar-sdk/minimal/contract";
 import { env, WorkflowEntrypoint, WorkflowEvent, WorkflowStep, WorkflowStepConfig } from "cloudflare:workers";
 import { Client as SmolClient } from "smol-sdk";
+import { purgeCacheByTags } from "./utils/cache";
 
 // const keypair = Keypair.fromRawEd25519Seed(hash(Buffer.from('kalepail')));
 // const publicKey = keypair.publicKey();
@@ -73,10 +74,16 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
                 `)
                     .bind(tokenSACAddress, cometAMMAddress, event.payload.entropy)
                     .run();
+
+                // Purge user's individual smol page
+                await purgeCacheByTags([`user:${event.payload.sub}:smol:${event.payload.entropy}`]);
             });
         } else if (event.payload.type === 'batch-mint') {
             await step.do('persist batch mint metadata', config, async () => {
                 const results = scValToNative(xdr.ScVal.fromXDR(res.returnValue, 'base64')) as [string, string][];
+
+                // Collect smol IDs for cache purging
+                const smolCacheTags: string[] = [];
 
                 for (let i = 0; i < results.length; i++) {
                     const [tokenSACAddress, cometAMMAddress] = results[i];
@@ -89,6 +96,14 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
                     `)
                         .bind(tokenSACAddress, cometAMMAddress, id)
                         .run();
+
+                    // Collect cache tags for user's individual smol pages
+                    smolCacheTags.push(`user:${event.payload.sub}:smol:${id}`);
+                }
+
+                // Purge user's individual smol pages
+                if (smolCacheTags.length > 0) {
+                    await purgeCacheByTags(smolCacheTags);
                 }
             });
         }

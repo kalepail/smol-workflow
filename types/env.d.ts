@@ -50,4 +50,5 @@ type WorkflowTxParams = {
 	entropy: string
 	xdr: string
 	ids?: string[]
+	sub: string // JWT sub of the user who initiated the mint
 }

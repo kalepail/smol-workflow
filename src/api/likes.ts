@@ -58,7 +58,7 @@ likes.put('/:id', parseAuth, async (c) => {
 	// Purge cache for this user's liked and likes lists, plus the individual smol detail page
 	// This ensures the liked button updates immediately on the smol detail page
 	c.executionCtx.waitUntil(
-		purgeUserLikedCache(env.CF_API_TOKEN, env.CF_ZONE_ID, payload.sub, id)
+		purgeUserLikedCache(payload.sub, id)
 	)
 
 	return c.body(null, 204)

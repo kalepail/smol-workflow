@@ -9,8 +9,7 @@ import {
 	buildPaginationResponse,
 } from '../utils/pagination'
 import {
-	purgeUserCreatedCache,
-	purgePublicSmolsCache,
+	purgeCacheByTags,
 	userCacheKeyGenerator,
 } from '../utils/cache'
 
@@ -74,11 +73,8 @@ smols.get(
 			(item) => item.Id
 		)
 
-		// Remove Created_At from response items
-		const smols = results.map(({ Created_At, ...rest }) => rest)
-
 		const response = c.json({
-			smols,
+			smols: results,
 			pagination,
 		})
 
@@ -140,10 +136,8 @@ smols.get(
 			(item) => item.Id
 		)
 
-		const smols = results.map(({ Created_At, ...rest }) => rest)
-
 		const response = c.json({
-			smols,
+			smols: results,
 			pagination,
 		})
 
@@ -207,10 +201,8 @@ smols.get(
 			(item) => item.Id
 		)
 
-		const smols = results.map(({ Created_At, ...rest }) => rest)
-
 		const response = c.json({
-			smols,
+			smols: results,
 			pagination,
 		})
 
@@ -291,7 +283,7 @@ smols.get(
 		})
 
 		return c.json({
-			kv_do: await stub.getSteps(),
+			kv_do: stub.getSteps(),
 			wf: instance && (await instance.status()),
 			liked,
 		})
@@ -331,14 +323,7 @@ smols.post('/', async (c) => {
 
 	console.log('Workflow started', instanceId, await instance.status())
 
-	// Purge cache for this user's created list and public smols list
-	c.executionCtx.waitUntil(
-		Promise.all([
-			purgeUserCreatedCache(env.CF_API_TOKEN, env.CF_ZONE_ID, body.address),
-			body.public !== false ? purgePublicSmolsCache(env.CF_API_TOKEN, env.CF_ZONE_ID) : Promise.resolve(true),
-		])
-	)
-
+	// Cache will be purged when the workflow completes in workflow.ts
 	return c.text(instanceId)
 })
 
@@ -392,12 +377,9 @@ smols.put('/:id', parseAuth, async (c) => {
 		.bind(id, payload.sub)
 		.run()
 
-	// Purge cache for this user's created list and public smols list (toggling visibility affects both)
+	// Purge user's individual page
 	c.executionCtx.waitUntil(
-		Promise.all([
-			purgeUserCreatedCache(env.CF_API_TOKEN, env.CF_ZONE_ID, payload.sub),
-			purgePublicSmolsCache(env.CF_API_TOKEN, env.CF_ZONE_ID),
-		])
+		purgeCacheByTags([`user:${payload.sub}:smol:${id}`])
 	)
 
 	return c.body(null, 204)
@@ -424,6 +406,14 @@ smols.put('/:smol_id/:song_id', parseAuth, async (c) => {
 	if (result.meta.changes === 0) {
 		throw new HTTPException(404, { message: 'No record found or no update needed' })
 	}
+
+	// Purge individual pages
+	c.executionCtx.waitUntil(
+		purgeCacheByTags([
+			`user:${payload.sub}:smol:${smol_id}`,
+			`smol:${smol_id}:anonymous`,
+		])
+	)
 
 	return c.body(null, 204)
 })
@@ -457,11 +447,11 @@ smols.delete('/:id', parseAuth, async (c) => {
 		}
 	}
 
-	// Purge cache for this user's created list and public smols list
+	// Purge user's created list and individual page
 	c.executionCtx.waitUntil(
-		Promise.all([
-			purgeUserCreatedCache(env.CF_API_TOKEN, env.CF_ZONE_ID, payload.sub),
-			purgePublicSmolsCache(env.CF_API_TOKEN, env.CF_ZONE_ID),
+		purgeCacheByTags([
+			`user:${payload.sub}:created`,
+			`user:${payload.sub}:smol:${id}`,
 		])
 	)
 

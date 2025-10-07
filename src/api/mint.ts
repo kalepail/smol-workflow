@@ -7,6 +7,7 @@ const mint = new Hono<HonoEnv>()
 
 mint.post('/', parseAuth, async (c) => {
 	const { env, req } = c
+	const payload = c.get('jwtPayload')!
 	const body = await req.json() as { xdr?: string; ids?: string[] }
 
 	if (!body?.xdr || typeof body.xdr !== 'string') {
@@ -51,6 +52,7 @@ mint.post('/', parseAuth, async (c) => {
 			type: 'batch-mint',
 			xdr: body.xdr,
 			ids: body.ids,
+			sub: payload.sub,
 		},
 	})
 
@@ -59,6 +61,7 @@ mint.post('/', parseAuth, async (c) => {
 
 mint.post('/:id', parseAuth, async (c) => {
 	const { env, req } = c
+	const payload = c.get('jwtPayload')!
 	const id = req.param('id')
 	const body = await req.json() as { xdr?: string }
 
@@ -98,6 +101,7 @@ mint.post('/:id', parseAuth, async (c) => {
 			type: 'mint',
 			xdr: body.xdr,
 			entropy: id,
+			sub: payload.sub,
 		},
 	})
 
