@@ -8,7 +8,11 @@ import {
 	buildCursorWhereClause,
 	buildPaginationResponse,
 } from '../utils/pagination'
-import { purgeUserCreatedCache, purgePublicSmolsCache } from '../utils/cache'
+import {
+	purgeUserCreatedCache,
+	purgePublicSmolsCache,
+	userCacheKeyGenerator,
+} from '../utils/cache'
 
 const smols = new Hono<HonoEnv>()
 
@@ -27,7 +31,6 @@ smols.get(
 	cache({
 		cacheName: 'smol-workflow',
 		cacheControl: 'public, max-age=30, stale-while-revalidate=60',
-		vary: ['Cookie', 'Origin'],
 	}),
 	async (c) => {
 		const { env, req } = c
@@ -92,8 +95,8 @@ smols.get(
 	parseAuth,
 	cache({
 		cacheName: 'smol-workflow',
-		cacheControl: 'private, max-age=30, stale-while-revalidate=60',
-		vary: ['Cookie', 'Origin'],
+		cacheControl: 'public, max-age=30, stale-while-revalidate=60',
+		keyGenerator: userCacheKeyGenerator, // Each user gets separate cache via sub claim
 	}),
 	async (c) => {
 		const { env, req } = c
@@ -157,8 +160,8 @@ smols.get(
 	parseAuth,
 	cache({
 		cacheName: 'smol-workflow',
-		cacheControl: 'private, max-age=30, stale-while-revalidate=60',
-		vary: ['Cookie', 'Origin'],
+		cacheControl: 'public, max-age=30, stale-while-revalidate=60',
+		keyGenerator: userCacheKeyGenerator, // Each user gets separate cache via sub claim
 	}),
 	async (c) => {
 		const { env, req } = c
@@ -225,7 +228,7 @@ smols.get(
 	cache({
 		cacheName: 'smol-workflow',
 		cacheControl: 'public, max-age=30, stale-while-revalidate=60',
-		vary: ['Cookie', 'Origin'],
+		keyGenerator: userCacheKeyGenerator, // Vary by user sub - response includes user-specific 'liked' field
 	}),
 	async (c) => {
 		const { env, req, executionCtx } = c

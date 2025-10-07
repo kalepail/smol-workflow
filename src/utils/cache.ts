@@ -2,6 +2,9 @@
  * Cache purge utilities for invalidating Cloudflare cache via API
  */
 
+import type { Context } from 'hono'
+import type { HonoEnv } from '../types'
+
 export interface CachePurgeOptions {
 	apiToken: string
 	zoneId: string
@@ -122,4 +125,18 @@ export function purgePublicSmolsCache(
 		zoneId,
 		tags: ['public-smols'],
 	})
+}
+
+/**
+ * Cache key generator that varies by user's sub claim (contract/wallet address)
+ * instead of the raw Cookie header. This ensures cache hits even when the JWT
+ * token changes (e.g., after logout/login).
+ */
+export function userCacheKeyGenerator(c: Context<HonoEnv>): string {
+	const payload = c.get('jwtPayload')
+	const userSub = payload?.sub || 'anonymous'
+	const url = new URL(c.req.url)
+
+	// Include URL pathname and query params in the cache key
+	return `${url.pathname}${url.search}:user:${userSub}`
 }

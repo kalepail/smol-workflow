@@ -2,7 +2,7 @@ import { Hono } from 'hono'
 import { cache } from 'hono/cache'
 import type { HonoEnv } from '../types'
 import { parseAuth } from '../middleware/auth'
-import { purgeUserLikedCache } from '../utils/cache'
+import { purgeUserLikedCache, userCacheKeyGenerator } from '../utils/cache'
 
 const likes = new Hono<HonoEnv>()
 
@@ -12,8 +12,8 @@ likes.get(
 	parseAuth,
 	cache({
 		cacheName: 'smol-workflow',
-		cacheControl: 'private, max-age=20, stale-while-revalidate=40',
-		vary: ['Cookie', 'Origin'],
+		cacheControl: 'public, max-age=20, stale-while-revalidate=40',
+		keyGenerator: userCacheKeyGenerator, // Each user gets separate cache via sub claim
 	}),
 	async (c) => {
 		const { env } = c

@@ -26,12 +26,10 @@ app.use(
 	})
 )
 
-// Global ETag middleware for list endpoints
-app.use('/mixtapes/*', etag())
-app.use('/playlist/*', etag())
-app.use('/created', etag())
-app.use('/liked', etag())
-app.use('/likes', etag())
+// Note: ETag middleware removed for cached endpoints
+// The cache() middleware already handles caching efficiently
+// ETags would be redundant since cache hits return the stored response
+// without recalculating hashes or checking If-None-Match headers
 
 // Mount route modules
 app.route('/', auth)
