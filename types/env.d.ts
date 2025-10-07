@@ -1,3 +1,7 @@
+// Custom types for the project
+// Note: The Bindings type in src/types.ts references the auto-generated Env type
+// from worker-configuration.d.ts, so wrangler types must be run to keep types in sync
+
 interface AiSongGeneratorLyrics {
     title: string
     style: string[]

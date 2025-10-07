@@ -5,7 +5,7 @@
 		"start": "wrangler dev --test-scheduled",
 		"start:remote": "wrangler dev --remote --env dev",
 		"deploy": "wrangler deploy",
-		"cf-typegen": "wrangler types",
+		"cf-typegen": "wrangler types --strict-vars=false",
 		"typecheck": "tsc --noEmit"
 	},
 	"devDependencies": {

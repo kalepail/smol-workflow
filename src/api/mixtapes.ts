@@ -3,6 +3,7 @@ import { HTTPException } from 'hono/http-exception'
 import { cache } from 'hono/cache'
 import type { HonoEnv } from '../types'
 import { parseAuth } from '../middleware/auth'
+import { purgeMixtapesCache } from '../utils/cache'
 
 const mixtapes = new Hono<HonoEnv>()
 
@@ -38,6 +39,11 @@ mixtapes.post('/', parseAuth, async (c) => {
 		.bind(body.title, body.desc, smolsString, payload.sub)
 		.first<{ Id: string }>()
 
+	// Purge mixtapes cache
+	c.executionCtx.waitUntil(
+		purgeMixtapesCache(env.CF_API_TOKEN, env.CF_ZONE_ID)
+	)
+
 	return c.json({ id: result!.Id }, 201)
 })
 
@@ -71,7 +77,12 @@ mixtapes.get(
 			Smols: mixtape.Smols.split(','),
 		}))
 
-		return c.json(mixtapes)
+		const response = c.json(mixtapes)
+
+		// Add cache tag for mixtapes list
+		response.headers.append('Cache-Tag', 'mixtapes')
+
+		return response
 	}
 )
 
@@ -106,10 +117,16 @@ mixtapes.get(
 			throw new HTTPException(404, { message: 'Mixtape not found' })
 		}
 
-		return c.json({
+		const response = c.json({
 			...mixtape,
 			Smols: mixtape.Smols.split(','),
 		})
+
+		// Add cache tag for individual mixtape
+		response.headers.append('Cache-Tag', 'mixtapes')
+		response.headers.append('Cache-Tag', `mixtape:${id}`)
+
+		return response
 	}
 )
 

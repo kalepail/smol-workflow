@@ -8,6 +8,7 @@ import {
 	buildCursorWhereClause,
 	buildPaginationResponse,
 } from '../utils/pagination'
+import { purgeUserCreatedCache, purgePublicSmolsCache } from '../utils/cache'
 
 const smols = new Hono<HonoEnv>()
 
@@ -73,10 +74,15 @@ smols.get(
 		// Remove Created_At from response items
 		const smols = results.map(({ Created_At, ...rest }) => rest)
 
-		return c.json({
+		const response = c.json({
 			smols,
 			pagination,
 		})
+
+		// Add cache tag for public smols list
+		response.headers.append('Cache-Tag', 'public-smols')
+
+		return response
 	}
 )
 
@@ -133,10 +139,15 @@ smols.get(
 
 		const smols = results.map(({ Created_At, ...rest }) => rest)
 
-		return c.json({
+		const response = c.json({
 			smols,
 			pagination,
 		})
+
+		// Add cache tag for user-specific created list
+		response.headers.append('Cache-Tag', `user:${payload.sub}:created`)
+
+		return response
 	}
 )
 
@@ -195,10 +206,15 @@ smols.get(
 
 		const smols = results.map(({ Created_At, ...rest }) => rest)
 
-		return c.json({
+		const response = c.json({
 			smols,
 			pagination,
 		})
+
+		// Add cache tag for user-specific liked list
+		response.headers.append('Cache-Tag', `user:${payload.sub}:liked`)
+
+		return response
 	}
 )
 
@@ -242,11 +258,22 @@ smols.get(
 					.run()
 			)
 
-			return c.json({
+			const response = c.json({
 				kv_do: smol_kv,
 				d1: smol_d1,
 				liked,
 			})
+
+			// Add cache tags for individual smol
+			// Use user-specific tag if authenticated, so we only purge that user's cache entry
+			if (payload?.sub) {
+				response.headers.append('Cache-Tag', `user:${payload.sub}:smol:${id}`)
+			} else {
+				// Unauthenticated views share a cache entry
+				response.headers.append('Cache-Tag', `smol:${id}:anonymous`)
+			}
+
+			return response
 		}
 
 		// Not yet in D1 → fetch from DO / workflow
@@ -301,6 +328,14 @@ smols.post('/', async (c) => {
 
 	console.log('Workflow started', instanceId, await instance.status())
 
+	// Purge cache for this user's created list and public smols list
+	c.executionCtx.waitUntil(
+		Promise.all([
+			purgeUserCreatedCache(env.CF_API_TOKEN, env.CF_ZONE_ID, body.address),
+			body.public !== false ? purgePublicSmolsCache(env.CF_API_TOKEN, env.CF_ZONE_ID) : Promise.resolve(true),
+		])
+	)
+
 	return c.text(instanceId)
 })
 
@@ -354,6 +389,14 @@ smols.put('/:id', parseAuth, async (c) => {
 		.bind(id, payload.sub)
 		.run()
 
+	// Purge cache for this user's created list and public smols list (toggling visibility affects both)
+	c.executionCtx.waitUntil(
+		Promise.all([
+			purgeUserCreatedCache(env.CF_API_TOKEN, env.CF_ZONE_ID, payload.sub),
+			purgePublicSmolsCache(env.CF_API_TOKEN, env.CF_ZONE_ID),
+		])
+	)
+
 	return c.body(null, 204)
 })
 
@@ -394,6 +437,8 @@ smols.delete('/:id', parseAuth, async (c) => {
 		await stub.setToFlush()
 	} catch {}
 
+	const payload = c.get('jwtPayload')!
+
 	await env.SMOL_KV.delete(id)
 	await env.SMOL_D1.prepare(`
 		DELETE FROM Smols
@@ -408,6 +453,14 @@ smols.delete('/:id', parseAuth, async (c) => {
 			await env.SMOL_BUCKET.delete(`${song.music_id}.mp3`)
 		}
 	}
+
+	// Purge cache for this user's created list and public smols list
+	c.executionCtx.waitUntil(
+		Promise.all([
+			purgeUserCreatedCache(env.CF_API_TOKEN, env.CF_ZONE_ID, payload.sub),
+			purgePublicSmolsCache(env.CF_API_TOKEN, env.CF_ZONE_ID),
+		])
+	)
 
 	return c.body(null, 204)
 })
