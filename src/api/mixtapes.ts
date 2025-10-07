@@ -53,7 +53,7 @@ mixtapes.get(
 	cache({
 		cacheName: 'smol-workflow',
 		cacheControl: 'public, max-age=60, stale-while-revalidate=120',
-		vary: ['Cookie'],
+		vary: ['Cookie', 'Origin'],
 	}),
 	async (c) => {
 		const { env } = c
@@ -92,7 +92,7 @@ mixtapes.get(
 	cache({
 		cacheName: 'smol-workflow',
 		cacheControl: 'public, max-age=60, stale-while-revalidate=120',
-		vary: ['Cookie'],
+		vary: ['Cookie', 'Origin'],
 	}),
 	async (c) => {
 		const { env } = c

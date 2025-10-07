@@ -27,7 +27,7 @@ smols.get(
 	cache({
 		cacheName: 'smol-workflow',
 		cacheControl: 'public, max-age=30, stale-while-revalidate=60',
-		vary: ['Cookie'],
+		vary: ['Cookie', 'Origin'],
 	}),
 	async (c) => {
 		const { env, req } = c
@@ -92,8 +92,8 @@ smols.get(
 	parseAuth,
 	cache({
 		cacheName: 'smol-workflow',
-		cacheControl: 'private, max-age=30',
-		vary: ['Cookie'],
+		cacheControl: 'private, max-age=30, stale-while-revalidate=60',
+		vary: ['Cookie', 'Origin'],
 	}),
 	async (c) => {
 		const { env, req } = c
@@ -157,8 +157,8 @@ smols.get(
 	parseAuth,
 	cache({
 		cacheName: 'smol-workflow',
-		cacheControl: 'private, max-age=30',
-		vary: ['Cookie'],
+		cacheControl: 'private, max-age=30, stale-while-revalidate=60',
+		vary: ['Cookie', 'Origin'],
 	}),
 	async (c) => {
 		const { env, req } = c
@@ -225,7 +225,7 @@ smols.get(
 	cache({
 		cacheName: 'smol-workflow',
 		cacheControl: 'public, max-age=30, stale-while-revalidate=60',
-		vary: ['Cookie'],
+		vary: ['Cookie', 'Origin'],
 	}),
 	async (c) => {
 		const { env, req, executionCtx } = c

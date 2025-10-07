@@ -31,7 +31,7 @@ playlists.get(
 	cache({
 		cacheName: 'smol-workflow',
 		cacheControl: 'public, max-age=30, stale-while-revalidate=60',
-		vary: ['Cookie'],
+		vary: ['Cookie', 'Origin'],
 	}),
 	async (c) => {
 		const { env, req } = c

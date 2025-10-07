@@ -1,7 +1,7 @@
 import { SmolDurableObject } from './do'
 
-// Use the generated Env type from wrangler types
-// This ensures all bindings are properly typed
+// Use the generated Env type which is augmented in types/env.d.ts
+// The augmentation adds secrets not in wrangler.jsonc
 export type Bindings = Env
 
 export type Variables = {

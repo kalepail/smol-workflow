@@ -87,11 +87,6 @@
         "RPC_URL": "https://rpc.lightsail.network/",
         "NETWORK_PASSPHRASE": "Public Global Stellar Network ; September 2015",
         "SMOL_CONTRACT_ID": "CBRNUVLGFM5OYWAGZVGU7CTMP2UJLKZCLFY2ANUCK5UGKND6BBAA5PLA",
-        "SECRET": "",
-        "LAUNCHTUBE_TOKEN": "",
-        "SK": "",
-        "CF_API_TOKEN": "",
-        "CF_ZONE_ID": ""
     },
     /**
    * Note: Use secrets to store sensitive data.

@@ -1,6 +1,15 @@
-// Custom types for the project
-// Note: The Bindings type in src/types.ts references the auto-generated Env type
-// from worker-configuration.d.ts, so wrangler types must be run to keep types in sync
+// Augment the Cloudflare.Env interface with secrets not in wrangler.jsonc
+// This ensures the global `env` from cloudflare:workers has the right types
+// These secrets are managed via `wrangler secret put` or `.dev.vars`
+declare namespace Cloudflare {
+	interface Env {
+		SECRET: string
+		LAUNCHTUBE_TOKEN: string
+		SK: string
+		CF_API_TOKEN: string
+		CF_ZONE_ID: string
+	}
+}
 
 interface AiSongGeneratorLyrics {
     title: string

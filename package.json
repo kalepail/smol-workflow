@@ -5,21 +5,21 @@
 		"start": "wrangler dev --test-scheduled",
 		"start:remote": "wrangler dev --remote --env dev",
 		"deploy": "wrangler deploy",
-		"cf-typegen": "wrangler types --strict-vars=false",
+		"typegen": "wrangler types --strict-vars=false",
 		"typecheck": "tsc --noEmit"
 	},
 	"devDependencies": {
-		"@cloudflare/workers-types": "^4.20251003.0",
-		"@types/node": "^24.6.2",
+		"@cloudflare/workers-types": "^4.20251004.0",
+		"@types/node": "^24.7.0",
 		"itty-fetcher": "^1.0.10",
 		"typescript": "^5.9.3",
 		"wrangler": "^4.42.0"
 	},
 	"dependencies": {
-		"@simplewebauthn/server": "^13.2.1",
+		"@simplewebauthn/server": "^13.2.2",
 		"@stellar/stellar-sdk": "^14.2.0",
 		"base64url": "^3.0.1",
-		"hono": "^4.9.9",
+		"hono": "^4.9.10",
 		"jimp": "^1.6.0",
 		"smol-sdk": "file:./ext/smol-sdk"
 	}

@@ -12,8 +12,8 @@ likes.get(
 	parseAuth,
 	cache({
 		cacheName: 'smol-workflow',
-		cacheControl: 'private, max-age=20',
-		vary: ['Cookie'],
+		cacheControl: 'private, max-age=20, stale-while-revalidate=40',
+		vary: ['Cookie', 'Origin'],
 	}),
 	async (c) => {
 		const { env } = c
