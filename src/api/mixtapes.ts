@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { HTTPException } from 'hono/http-exception'
 import { cache } from 'hono/cache'
-import type { HonoEnv } from '../types'
+import type { HonoEnv, SmolKVData } from '../types'
 import { parseAuth } from '../middleware/auth'
 import { purgeMixtapesCache } from '../utils/cache'
 
@@ -96,29 +96,76 @@ mixtapes.get(
 		const { env } = c
 		const id = c.req.param('id')
 
-		const mixtape = await env.SMOL_D1.prepare(`
-			SELECT Id, Title, Desc, Smols, "Address", Created_At
-			FROM Mixtapes
-			WHERE Id = ?1
+		const { results } = await env.SMOL_D1.prepare(`
+			SELECT
+				m.Id,
+				m.Title,
+				m.Desc,
+				m."Address",
+				m.Created_At,
+				s.Id as Smol_Id,
+				s.Title as Smol_Title,
+				s."Address" as Smol_Address,
+				s.Mint_Token,
+				s.Mint_Amm,
+				s.Song_1
+			FROM Mixtapes m
+			CROSS JOIN json_each('["' || replace(m.Smols, ',', '","') || '"]') as smol_ids
+			LEFT JOIN Smols s ON s.Id = smol_ids.value
+			WHERE m.Id = ?1
 		`)
 			.bind(id)
-			.first<{
+			.all<{
 				Id: string
 				Title: string
 				Desc: string
-				Smols: string
 				Address: string
 				Created_At: string
+				Smol_Id: string | null
+				Smol_Title: string | null
+				Smol_Address: string | null
+				Mint_Token: string | null
+				Mint_Amm: string | null
+				Song_1: string | null
 			}>()
 
-		if (!mixtape) {
+		if (results.length === 0) {
 			throw new HTTPException(404, { message: 'Mixtape not found' })
 		}
 
-		const response = c.json({
-			...mixtape,
-			Smols: mixtape.Smols.split(','),
-		})
+		// Fetch KV data in bulk (up to 100 keys at once)
+		const smolIds = results
+			.filter((row) => row.Smol_Id !== null)
+			.map((row) => row.Smol_Id!)
+
+		const kvData = await env.SMOL_KV.get<SmolKVData>(smolIds, 'json')
+
+		const smolsWithKV = results
+			.filter((row) => row.Smol_Id !== null)
+			.map((row) => {
+				const kv = kvData.get(row.Smol_Id!)
+				return {
+					Id: row.Smol_Id!,
+					Title: row.Smol_Title!,
+					Address: row.Smol_Address!,
+					Mint_Token: row.Mint_Token,
+					Mint_Amm: row.Mint_Amm,
+					Song_1: row.Song_1!,
+					Tags: kv?.lyrics?.style || [],
+				}
+			})
+
+		// Take mixtape data from first row
+		const mixtape = {
+			Id: results[0].Id,
+			Title: results[0].Title,
+			Desc: results[0].Desc,
+			Address: results[0].Address,
+			Created_At: results[0].Created_At,
+			Smols: smolsWithKV,
+		}
+
+		const response = c.json(mixtape)
 
 		// Add cache tag for individual mixtape
 		response.headers.append('Cache-Tag', 'mixtapes')

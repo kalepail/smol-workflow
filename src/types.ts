@@ -19,3 +19,9 @@ export type HonoEnv = {
 	Bindings: Bindings
 	Variables: Variables
 }
+
+export type SmolKVData = {
+	lyrics?: {
+		style?: string[]
+	}
+}
