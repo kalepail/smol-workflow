@@ -1,25 +1,35 @@
 import { Hono } from 'hono'
+import { cache } from 'hono/cache'
 import type { HonoEnv } from '../types'
 import { parseAuth } from '../middleware/auth'
 
 const likes = new Hono<HonoEnv>()
 
 // Get user's likes
-likes.get('/', parseAuth, async (c) => {
-	const { env } = c
-	const payload = c.get('jwtPayload')!
+likes.get(
+	'/',
+	parseAuth,
+	cache({
+		cacheName: 'smol-workflow',
+		cacheControl: 'private, max-age=20',
+		vary: ['Cookie'],
+	}),
+	async (c) => {
+		const { env } = c
+		const payload = c.get('jwtPayload')!
 
-	const { results } = await env.SMOL_D1.prepare(`
-		SELECT Id FROM Likes
-		WHERE "Address" = ?1
-	`)
-		.bind(payload.sub)
-		.all()
+		const { results } = await env.SMOL_D1.prepare(`
+			SELECT Id FROM Likes
+			WHERE "Address" = ?1
+		`)
+			.bind(payload.sub)
+			.all()
 
-	const likeIds = results.map((like: any) => like.Id)
+		const likeIds = results.map((like: any) => like.Id)
 
-	return c.json(likeIds)
-})
+		return c.json(likeIds)
+	}
+)
 
 // Toggle like
 likes.put('/:id', parseAuth, async (c) => {

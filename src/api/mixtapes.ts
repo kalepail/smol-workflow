@@ -1,5 +1,6 @@
 import { Hono } from 'hono'
 import { HTTPException } from 'hono/http-exception'
+import { cache } from 'hono/cache'
 import type { HonoEnv } from '../types'
 import { parseAuth } from '../middleware/auth'
 
@@ -41,43 +42,22 @@ mixtapes.post('/', parseAuth, async (c) => {
 })
 
 // Get all mixtapes
-mixtapes.get('/', async (c) => {
-	const { env } = c
+mixtapes.get(
+	'/',
+	cache({
+		cacheName: 'smol-workflow',
+		cacheControl: 'public, max-age=60, stale-while-revalidate=120',
+		vary: ['Cookie'],
+	}),
+	async (c) => {
+		const { env } = c
 
-	const { results } = await env.SMOL_D1.prepare(`
-		SELECT Id, Title, Desc, Smols, "Address", Created_At
-		FROM Mixtapes
-		ORDER BY Created_At DESC
-		LIMIT 100
-	`).all<{
-		Id: string
-		Title: string
-		Desc: string
-		Smols: string
-		Address: string
-		Created_At: string
-	}>()
-
-	const mixtapes = results.map((mixtape) => ({
-		...mixtape,
-		Smols: mixtape.Smols.split(','),
-	}))
-
-	return c.json(mixtapes)
-})
-
-// Get single mixtape by ID
-mixtapes.get('/:id', async (c) => {
-	const { env } = c
-	const id = c.req.param('id')
-
-	const mixtape = await env.SMOL_D1.prepare(`
-		SELECT Id, Title, Desc, Smols, "Address", Created_At
-		FROM Mixtapes
-		WHERE Id = ?1
-	`)
-		.bind(id)
-		.first<{
+		const { results } = await env.SMOL_D1.prepare(`
+			SELECT Id, Title, Desc, Smols, "Address", Created_At
+			FROM Mixtapes
+			ORDER BY Created_At DESC
+			LIMIT 100
+		`).all<{
 			Id: string
 			Title: string
 			Desc: string
@@ -86,14 +66,51 @@ mixtapes.get('/:id', async (c) => {
 			Created_At: string
 		}>()
 
-	if (!mixtape) {
-		throw new HTTPException(404, { message: 'Mixtape not found' })
-	}
+		const mixtapes = results.map((mixtape) => ({
+			...mixtape,
+			Smols: mixtape.Smols.split(','),
+		}))
 
-	return c.json({
-		...mixtape,
-		Smols: mixtape.Smols.split(','),
-	})
-})
+		return c.json(mixtapes)
+	}
+)
+
+// Get single mixtape by ID
+mixtapes.get(
+	'/:id',
+	cache({
+		cacheName: 'smol-workflow',
+		cacheControl: 'public, max-age=60, stale-while-revalidate=120',
+		vary: ['Cookie'],
+	}),
+	async (c) => {
+		const { env } = c
+		const id = c.req.param('id')
+
+		const mixtape = await env.SMOL_D1.prepare(`
+			SELECT Id, Title, Desc, Smols, "Address", Created_At
+			FROM Mixtapes
+			WHERE Id = ?1
+		`)
+			.bind(id)
+			.first<{
+				Id: string
+				Title: string
+				Desc: string
+				Smols: string
+				Address: string
+				Created_At: string
+			}>()
+
+		if (!mixtape) {
+			throw new HTTPException(404, { message: 'Mixtape not found' })
+		}
+
+		return c.json({
+			...mixtape,
+			Smols: mixtape.Smols.split(','),
+		})
+	}
+)
 
 export default mixtapes

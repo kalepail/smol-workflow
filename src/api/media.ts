@@ -77,6 +77,7 @@ media.get(
 	cache({
 		cacheName: 'smol-workflow',
 		cacheControl: 'public, max-age=31536000, immutable',
+		vary: ['Cookie'],
 	}),
 	async (c) => {
 		const { env, req } = c

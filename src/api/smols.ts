@@ -25,7 +25,8 @@ smols.get(
 	'/',
 	cache({
 		cacheName: 'smol-workflow',
-		cacheControl: 'public, max-age=30',
+		cacheControl: 'public, max-age=30, stale-while-revalidate=60',
+		vary: ['Cookie'],
 	}),
 	async (c) => {
 		const { env, req } = c
@@ -80,10 +81,18 @@ smols.get(
 )
 
 // Get smols created by authenticated user
-smols.get('/created', parseAuth, async (c) => {
-	const { env, req } = c
-	const payload = c.get('jwtPayload')!
-	const { limit, cursor } = parsePaginationParams(new URL(req.url))
+smols.get(
+	'/created',
+	parseAuth,
+	cache({
+		cacheName: 'smol-workflow',
+		cacheControl: 'private, max-age=30',
+		vary: ['Cookie'],
+	}),
+	async (c) => {
+		const { env, req } = c
+		const payload = c.get('jwtPayload')!
+		const { limit, cursor } = parsePaginationParams(new URL(req.url))
 
 	const whereClause = buildCursorWhereClause(cursor, 'Address = ?')
 	const bindings: any[] = []
@@ -111,30 +120,39 @@ smols.get('/created', parseAuth, async (c) => {
 		bindings.push(payload.sub, limit)
 	}
 
-	const { results } = await env.SMOL_D1.prepare(query)
-		.bind(...bindings)
-		.all<SmolListItem>()
+		const { results } = await env.SMOL_D1.prepare(query)
+			.bind(...bindings)
+			.all<SmolListItem>()
 
-	const pagination = buildPaginationResponse(
-		results,
-		limit,
-		(item) => item.Created_At,
-		(item) => item.Id
-	)
+		const pagination = buildPaginationResponse(
+			results,
+			limit,
+			(item) => item.Created_At,
+			(item) => item.Id
+		)
 
-	const smols = results.map(({ Created_At, ...rest }) => rest)
+		const smols = results.map(({ Created_At, ...rest }) => rest)
 
-	return c.json({
-		smols,
-		pagination,
-	})
-})
+		return c.json({
+			smols,
+			pagination,
+		})
+	}
+)
 
 // Get smols liked by authenticated user
-smols.get('/liked', parseAuth, async (c) => {
-	const { env, req } = c
-	const payload = c.get('jwtPayload')!
-	const { limit, cursor } = parsePaginationParams(new URL(req.url))
+smols.get(
+	'/liked',
+	parseAuth,
+	cache({
+		cacheName: 'smol-workflow',
+		cacheControl: 'private, max-age=30',
+		vary: ['Cookie'],
+	}),
+	async (c) => {
+		const { env, req } = c
+		const payload = c.get('jwtPayload')!
+		const { limit, cursor } = parsePaginationParams(new URL(req.url))
 
 	const whereClause = buildCursorWhereClause(cursor, 'l."Address" = ?', 's.')
 	const bindings: any[] = []
@@ -168,77 +186,87 @@ smols.get('/liked', parseAuth, async (c) => {
 		.bind(...bindings)
 		.all<SmolListItem>()
 
-	const pagination = buildPaginationResponse(
-		results,
-		limit,
-		(item) => item.Created_At,
-		(item) => item.Id
-	)
-
-	const smols = results.map(({ Created_At, ...rest }) => rest)
-
-	return c.json({
-		smols,
-		pagination,
-	})
-})
-
-// Get specific smol by ID
-smols.get('/:id', optionalAuth, async (c) => {
-	const { env, req, executionCtx } = c
-	const id = req.param('id')
-
-	// Determine if requester has liked the smol (if authenticated)
-	const payload = c.get('jwtPayload')
-	let liked = false
-	if (payload?.sub) {
-		const likedRow = await env.SMOL_D1.prepare(
-			`SELECT 1 FROM Likes WHERE Id = ?1 AND "Address" = ?2`
+		const pagination = buildPaginationResponse(
+			results,
+			limit,
+			(item) => item.Created_At,
+			(item) => item.Id
 		)
-			.bind(id, payload.sub)
-			.first()
 
-		liked = !!likedRow
-	}
-
-	const smol_d1 = await env.SMOL_D1.prepare(`SELECT * FROM Smols WHERE Id = ?1`)
-		.bind(id)
-		.first()
-
-	if (smol_d1) {
-		const smol_kv = await env.SMOL_KV.get(id, 'json')
-
-		// Increment views non-blockingly
-		executionCtx.waitUntil(
-			env.SMOL_D1.prepare('UPDATE Smols SET Views = Views + 1 WHERE Id = ?')
-				.bind(id)
-				.run()
-		)
+		const smols = results.map(({ Created_At, ...rest }) => rest)
 
 		return c.json({
-			kv_do: smol_kv,
-			d1: smol_d1,
+			smols,
+			pagination,
+		})
+	}
+)
+
+// Get specific smol by ID
+smols.get(
+	'/:id',
+	optionalAuth,
+	cache({
+		cacheName: 'smol-workflow',
+		cacheControl: 'public, max-age=30, stale-while-revalidate=60',
+		vary: ['Cookie'],
+	}),
+	async (c) => {
+		const { env, req, executionCtx } = c
+		const id = req.param('id')
+
+		// Determine if requester has liked the smol (if authenticated)
+		const payload = c.get('jwtPayload')
+		let liked = false
+		if (payload?.sub) {
+			const likedRow = await env.SMOL_D1.prepare(
+				`SELECT 1 FROM Likes WHERE Id = ?1 AND "Address" = ?2`
+			)
+				.bind(id, payload.sub)
+				.first()
+
+			liked = !!likedRow
+		}
+
+		const smol_d1 = await env.SMOL_D1.prepare(`SELECT * FROM Smols WHERE Id = ?1`)
+			.bind(id)
+			.first()
+
+		if (smol_d1) {
+			const smol_kv = await env.SMOL_KV.get(id, 'json')
+
+			// Increment views non-blockingly
+			executionCtx.waitUntil(
+				env.SMOL_D1.prepare('UPDATE Smols SET Views = Views + 1 WHERE Id = ?')
+					.bind(id)
+					.run()
+			)
+
+			return c.json({
+				kv_do: smol_kv,
+				d1: smol_d1,
+				liked,
+			})
+		}
+
+		// Not yet in D1 → fetch from DO / workflow
+		const doid = env.DURABLE_OBJECT.idFromString(id)
+		const stub = env.DURABLE_OBJECT.get(doid)
+		const instance = await new Promise<WorkflowInstance | null>(async (resolve) => {
+			try {
+				resolve(await env.WORKFLOW.get(id))
+			} catch {
+				resolve(null)
+			}
+		})
+
+		return c.json({
+			kv_do: await stub.getSteps(),
+			wf: instance && (await instance.status()),
 			liked,
 		})
 	}
-
-	// Not yet in D1 → fetch from DO / workflow
-	const doid = env.DURABLE_OBJECT.idFromString(id)
-	const stub = env.DURABLE_OBJECT.get(doid)
-	const instance = await new Promise<WorkflowInstance | null>(async (resolve) => {
-		try {
-			resolve(await env.WORKFLOW.get(id))
-		} catch {
-			resolve(null)
-		}
-	})
-
-	return c.json({
-		kv_do: await stub.getSteps(),
-		wf: instance && (await instance.status()),
-		liked,
-	})
-})
+)
 
 // Create new smol
 smols.post('/', async (c) => {

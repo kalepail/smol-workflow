@@ -1,5 +1,6 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
+import { etag } from 'hono/etag'
 import { SmolDurableObject, SmolState } from './do'
 import { Workflow } from './workflow'
 import { TxWorkflow } from './tx-workflow'
@@ -24,6 +25,13 @@ app.use(
 		credentials: true,
 	})
 )
+
+// Global ETag middleware for list endpoints
+app.use('/mixtapes/*', etag())
+app.use('/playlist/*', etag())
+app.use('/created', etag())
+app.use('/liked', etag())
+app.use('/likes', etag())
 
 // Mount route modules
 app.route('/', auth)

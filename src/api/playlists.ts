@@ -30,7 +30,8 @@ playlists.get(
 	'/:title',
 	cache({
 		cacheName: 'smol-workflow',
-		cacheControl: 'public, max-age=30',
+		cacheControl: 'public, max-age=30, stale-while-revalidate=60',
+		vary: ['Cookie'],
 	}),
 	async (c) => {
 		const { env, req } = c
