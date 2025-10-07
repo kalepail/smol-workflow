@@ -53,24 +53,6 @@ likes.put('/:id', parseAuth, async (c) => {
 		await env.SMOL_D1.prepare(`INSERT INTO Likes (Id, "Address") VALUES (?1, ?2)`)
 			.bind(id, payload.sub)
 			.run()
-
-		// buy token
-		// await env.TX_WORKFLOW.create({
-		// 	params: {
-		// 		type: 'buy',
-		// 		owner: payload.sub,
-		// 		entropy: id,
-		// 	}
-		// });
-	} else {
-		// sell token
-		// await env.TX_WORKFLOW.create({
-		// 	params: {
-		// 		type: 'sell',
-		// 		xdr: body.xdr,
-		// 		entropy: id,
-		// 	}
-		// });
 	}
 
 	// Purge cache for this user's liked and likes lists, plus the individual smol detail page

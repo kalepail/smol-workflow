@@ -137,6 +137,9 @@ export function userCacheKeyGenerator(c: Context<HonoEnv>): string {
 	const userSub = payload?.sub || 'anonymous'
 	const url = new URL(c.req.url)
 
-	// Include URL pathname and query params in the cache key
-	return `${url.pathname}${url.search}:user:${userSub}`
+	// Create a unique URL by adding user identifier as a query param
+	// This keeps it a valid URL while varying by user
+	url.searchParams.set('__cache_user', userSub)
+
+	return url.toString()
 }
