@@ -47,12 +47,72 @@ mixtapes.post('/', parseAuth, async (c) => {
 	return c.json({ id: result!.Id }, 201)
 })
 
+// Update existing mixtape (owner only)
+mixtapes.put('/:id', parseAuth, async (c) => {
+	const { env, req } = c
+	const payload = c.get('jwtPayload')!
+	const id = req.param('id')
+	const body = await req.json<{
+		title?: string
+		desc?: string
+		smols?: string[]
+	}>()
+
+	// Verify ownership
+	const existing = await env.SMOL_D1.prepare(`
+		SELECT "Address" FROM Mixtapes WHERE Id = ?1
+	`).bind(id).first<{ Address: string }>()
+
+	if (!existing) {
+		throw new HTTPException(404, { message: 'Mixtape not found' })
+	}
+
+	if (existing.Address !== payload.sub) {
+		throw new HTTPException(403, { message: 'Not authorized to edit this mixtape' })
+	}
+
+	// Build dynamic UPDATE query
+	const updates: string[] = []
+	const bindings: string[] = []
+	let bindIndex = 1
+
+	if (body.title && typeof body.title === 'string') {
+		updates.push(`Title = ?${bindIndex++}`)
+		bindings.push(body.title)
+	}
+	if (body.desc && typeof body.desc === 'string') {
+		updates.push(`Desc = ?${bindIndex++}`)
+		bindings.push(body.desc)
+	}
+	if (body.smols && Array.isArray(body.smols) && body.smols.length > 0) {
+		updates.push(`Smols = ?${bindIndex++}`)
+		bindings.push(body.smols.join(','))
+	}
+
+	if (updates.length === 0) {
+		throw new HTTPException(400, { message: 'No valid fields to update' })
+	}
+
+	bindings.push(id) // For WHERE clause
+
+	await env.SMOL_D1.prepare(`
+		UPDATE Mixtapes SET ${updates.join(', ')} WHERE Id = ?${bindIndex}
+	`).bind(...bindings).run()
+
+	// Purge caches so changes are visible immediately
+	c.executionCtx.waitUntil(
+		purgeMixtapesCache()
+	)
+
+	return c.json({ success: true })
+})
+
 // Get all mixtapes
 mixtapes.get(
 	'/',
 	cache({
-		cacheName: 'smol-workflow',
-		cacheControl: 'public, max-age=60, stale-while-revalidate=120',
+		cacheName: 'mixtapes',
+		cacheControl: 'max-age=60, stale-while-revalidate=120',
 	}),
 	async (c) => {
 		const { env } = c
@@ -71,33 +131,33 @@ mixtapes.get(
 			Created_At: string
 		}>()
 
-		const mixtapes = results.map((mixtape) => ({
-			...mixtape,
-			Smols: mixtape.Smols.split(','),
+		const mixtapes = results.map((row) => ({
+			...row,
+			Smols: row.Smols.split(','),
 		}))
 
 		const response = c.json(mixtapes)
 
-		// Add cache tag for mixtapes list
+		// Add cache tag
 		response.headers.append('Cache-Tag', 'mixtapes')
 
 		return response
 	}
 )
 
-// Get single mixtape by ID
+// Get single mixtape with expanded smol data
 mixtapes.get(
 	'/:id',
 	cache({
-		cacheName: 'smol-workflow',
-		cacheControl: 'public, max-age=60, stale-while-revalidate=120',
+		cacheName: 'mixtapes',
+		cacheControl: 'max-age=60, stale-while-revalidate=120',
 	}),
 	async (c) => {
-		const { env } = c
-		const id = c.req.param('id')
+		const { env, req } = c
+		const id = req.param('id')
 
 		const { results } = await env.SMOL_D1.prepare(`
-			SELECT
+			SELECT 
 				m.Id,
 				m.Title,
 				m.Desc,
@@ -110,8 +170,8 @@ mixtapes.get(
 				s.Mint_Amm,
 				s.Song_1
 			FROM Mixtapes m
-			CROSS JOIN json_each('["' || replace(m.Smols, ',', '","') || '"]') as smol_ids
-			LEFT JOIN Smols s ON s.Id = smol_ids.value
+			CROSS JOIN json_each('[' || REPLACE('"' || REPLACE(m.Smols, ',', '","') || '"', '""', '') || ']') as j
+			LEFT JOIN Smols s ON s.Id = TRIM(j.value, '"')
 			WHERE m.Id = ?1
 		`)
 			.bind(id)
