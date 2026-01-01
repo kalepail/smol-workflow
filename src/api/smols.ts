@@ -99,31 +99,31 @@ smols.get(
 		const payload = c.get('jwtPayload')!
 		const { limit, cursor } = parsePaginationParams(new URL(req.url))
 
-	const whereClause = buildCursorWhereClause(cursor, 'Address = ?')
-	const bindings: any[] = []
+		const whereClause = buildCursorWhereClause(cursor, 'Address = ?')
+		const bindings: any[] = []
 
-	let query: string
-	if (whereClause.length > 1) {
-		// Has cursor bindings
-		query = `
+		let query: string
+		if (whereClause.length > 1) {
+			// Has cursor bindings
+			query = `
 			SELECT Id, Title, Song_1, Mint_Token, Mint_Amm, Created_At
 			FROM Smols
 			WHERE ${whereClause[0]}
 			ORDER BY Created_At DESC, Id DESC
 			LIMIT ?
 		`
-		bindings.push(payload.sub, whereClause[1], whereClause[2], whereClause[3], limit)
-	} else {
-		// No cursor bindings
-		query = `
+			bindings.push(payload.sub, whereClause[1], whereClause[2], whereClause[3], limit)
+		} else {
+			// No cursor bindings
+			query = `
 			SELECT Id, Title, Song_1, Mint_Token, Mint_Amm, Created_At
 			FROM Smols
 			WHERE ${whereClause[0]}
 			ORDER BY Created_At DESC, Id DESC
 			LIMIT ?
 		`
-		bindings.push(payload.sub, limit)
-	}
+			bindings.push(payload.sub, limit)
+		}
 
 		const { results } = await env.SMOL_D1.prepare(query)
 			.bind(...bindings)
@@ -162,13 +162,13 @@ smols.get(
 		const payload = c.get('jwtPayload')!
 		const { limit, cursor } = parsePaginationParams(new URL(req.url))
 
-	const whereClause = buildCursorWhereClause(cursor, 'l."Address" = ?', 's.')
-	const bindings: any[] = []
+		const whereClause = buildCursorWhereClause(cursor, 'l."Address" = ?', 's.')
+		const bindings: any[] = []
 
-	let query: string
-	if (whereClause.length > 1) {
-		// Has cursor bindings
-		query = `
+		let query: string
+		if (whereClause.length > 1) {
+			// Has cursor bindings
+			query = `
 			SELECT s.Id, s.Title, s.Song_1, s.Mint_Token, s.Mint_Amm, s.Created_At
 			FROM Smols s
 			INNER JOIN Likes l ON s.Id = l.Id
@@ -176,10 +176,10 @@ smols.get(
 			ORDER BY s.Created_At DESC, s.Id DESC
 			LIMIT ?
 		`
-		bindings.push(payload.sub, whereClause[1], whereClause[2], whereClause[3], limit)
-	} else {
-		// No cursor bindings
-		query = `
+			bindings.push(payload.sub, whereClause[1], whereClause[2], whereClause[3], limit)
+		} else {
+			// No cursor bindings
+			query = `
 			SELECT s.Id, s.Title, s.Song_1, s.Mint_Token, s.Mint_Amm, s.Created_At
 			FROM Smols s
 			INNER JOIN Likes l ON s.Id = l.Id
@@ -187,12 +187,12 @@ smols.get(
 			ORDER BY s.Created_At DESC, s.Id DESC
 			LIMIT ?
 		`
-		bindings.push(payload.sub, limit)
-	}
+			bindings.push(payload.sub, limit)
+		}
 
-	const { results } = await env.SMOL_D1.prepare(query)
-		.bind(...bindings)
-		.all<SmolListItem>()
+		const { results } = await env.SMOL_D1.prepare(query)
+			.bind(...bindings)
+			.all<SmolListItem>()
 
 		const pagination = buildPaginationResponse(
 			results,
@@ -208,6 +208,131 @@ smols.get(
 
 		// Add cache tag for user-specific liked list
 		response.headers.append('Cache-Tag', `user:${payload.sub}:liked`)
+
+		return response
+	}
+)
+
+// Get trending smols (by plays + views)
+smols.get(
+	'/trending',
+	cache({
+		cacheName: 'smol-workflow',
+		cacheControl: 'public, max-age=300, stale-while-revalidate=600', // Cache for 5 mins
+	}),
+	async (c) => {
+		const { env, req } = c
+		const url = new URL(req.url)
+
+		// Optional time window: 'day', 'week', 'month', 'all' (default: week)
+		const period = url.searchParams.get('period') || 'week'
+		const limit = Math.min(parseInt(url.searchParams.get('limit') || '20'), 100)
+
+		// Calculate date filter based on period
+		let dateFilter = ''
+		switch (period) {
+			case 'day':
+				dateFilter = "AND Created_At > datetime('now', '-1 day')"
+				break
+			case 'week':
+				dateFilter = "AND Created_At > datetime('now', '-7 days')"
+				break
+			case 'month':
+				dateFilter = "AND Created_At > datetime('now', '-30 days')"
+				break
+			case 'all':
+			default:
+				dateFilter = ''
+		}
+
+		const { results } = await env.SMOL_D1.prepare(`
+			SELECT s.Id, s.Title, s.Song_1, s.Mint_Token, s.Mint_Amm, s.Created_At, 
+				   s.Plays, s.Views,
+				   COUNT(l.Id) as Likes,
+				   (s.Plays + s.Views + COUNT(l.Id) * 10) as Score
+			FROM Smols s
+			LEFT JOIN Likes l ON s.Id = l.Id
+			WHERE s.Public = 1 ${dateFilter}
+			GROUP BY s.Id
+			ORDER BY Score DESC, s.Created_At DESC
+			LIMIT ?
+		`)
+			.bind(limit)
+			.all<SmolListItem & { Plays: number; Views: number; Likes: number; Score: number }>()
+
+		const response = c.json({
+			smols: results,
+			period,
+		})
+
+		// Add cache tag for trending
+		response.headers.append('Cache-Tag', 'trending')
+
+		return response
+	}
+)
+
+// Get platform stats
+smols.get(
+	'/stats',
+	cache({
+		cacheName: 'smol-workflow',
+		cacheControl: 'public, max-age=300, stale-while-revalidate=600', // Cache for 5 mins
+	}),
+	async (c) => {
+		const { env } = c
+
+		// Get total counts
+		const totals = await env.SMOL_D1.prepare(`
+			SELECT 
+				COUNT(*) as total_smols,
+				SUM(Plays) as total_plays,
+				SUM(Views) as total_views,
+				COUNT(CASE WHEN Mint_Token IS NOT NULL THEN 1 END) as total_minted
+			FROM Smols
+			WHERE Public = 1
+		`).first<{
+			total_smols: number
+			total_plays: number
+			total_views: number
+			total_minted: number
+		}>()
+
+		// Get total likes
+		const likesCount = await env.SMOL_D1.prepare(`
+			SELECT COUNT(*) as total_likes FROM Likes
+		`).first<{ total_likes: number }>()
+
+		// Get total unique artists
+		const artistsCount = await env.SMOL_D1.prepare(`
+			SELECT COUNT(DISTINCT "Address") as total_artists FROM Smols WHERE Public = 1
+		`).first<{ total_artists: number }>()
+
+		// Get counts for last 24h and 7 days
+		const recentStats = await env.SMOL_D1.prepare(`
+			SELECT 
+				COUNT(CASE WHEN Created_At > datetime('now', '-1 day') THEN 1 END) as smols_24h,
+				COUNT(CASE WHEN Created_At > datetime('now', '-7 days') THEN 1 END) as smols_7d
+			FROM Smols
+			WHERE Public = 1
+		`).first<{ smols_24h: number; smols_7d: number }>()
+
+		const response = c.json({
+			totals: {
+				smols: totals?.total_smols || 0,
+				plays: totals?.total_plays || 0,
+				views: totals?.total_views || 0,
+				likes: likesCount?.total_likes || 0,
+				minted: totals?.total_minted || 0,
+				artists: artistsCount?.total_artists || 0,
+			},
+			recent: {
+				smols_24h: recentStats?.smols_24h || 0,
+				smols_7d: recentStats?.smols_7d || 0,
+			},
+		})
+
+		response.headers.append('Cache-Tag', 'stats')
 
 		return response
 	}
@@ -431,7 +556,7 @@ smols.delete('/:id', parseAuth, async (c) => {
 		const doid = env.DURABLE_OBJECT.idFromString(id)
 		const stub = env.DURABLE_OBJECT.get(doid)
 		await stub.setToFlush()
-	} catch {}
+	} catch { }
 
 	const payload = c.get('jwtPayload')!
 

@@ -107,6 +107,38 @@ mixtapes.put('/:id', parseAuth, async (c) => {
 	return c.json({ success: true })
 })
 
+// Delete mixtape (owner only)
+mixtapes.delete('/:id', parseAuth, async (c) => {
+	const { env, req } = c
+	const payload = c.get('jwtPayload')!
+	const id = req.param('id')
+
+	// Verify ownership
+	const existing = await env.SMOL_D1.prepare(`
+		SELECT "Address" FROM Mixtapes WHERE Id = ?1
+	`).bind(id).first<{ Address: string }>()
+
+	if (!existing) {
+		throw new HTTPException(404, { message: 'Mixtape not found' })
+	}
+
+	if (existing.Address !== payload.sub) {
+		throw new HTTPException(403, { message: 'Not authorized to delete this mixtape' })
+	}
+
+	// Delete the mixtape
+	await env.SMOL_D1.prepare(`
+		DELETE FROM Mixtapes WHERE Id = ?1
+	`).bind(id).run()
+
+	// Purge caches
+	c.executionCtx.waitUntil(
+		purgeMixtapesCache()
+	)
+
+	return c.body(null, 204)
+})
+
 // Get all mixtapes
 mixtapes.get(
 	'/',
