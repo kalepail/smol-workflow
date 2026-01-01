@@ -14,6 +14,7 @@ import playlists from './api/playlists'
 import mixtapes from './api/mixtapes'
 import mint from './api/mint'
 import media from './api/media'
+import artists from './api/artists'
 
 export const app = new Hono<HonoEnv>()
 
@@ -39,6 +40,7 @@ app.route('/mixtapes', mixtapes)
 app.route('/mint', mint)
 app.route('/song', media)
 app.route('/image', media)
+app.route('/artists', artists)
 app.route('/', smols)
 
 // 404 handler
