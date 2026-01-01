@@ -225,8 +225,10 @@ smols.get(
 		const url = new URL(req.url)
 
 		// Optional time window: 'day', 'week', 'month', 'all' (default: week)
-		const period = url.searchParams.get('period') || 'week'
-		const limit = Math.min(parseInt(url.searchParams.get('limit') || '20'), 100)
+		const periodParam = url.searchParams.get('period') || 'week'
+		const period = ['day', 'week', 'month', 'all'].includes(periodParam) ? periodParam : 'week'
+		const limitParam = parseInt(url.searchParams.get('limit') || '20')
+		const limit = Math.min(Math.max(isNaN(limitParam) ? 20 : limitParam, 1), 100)
 
 		// Calculate date filter based on period
 		let dateFilter = ''
