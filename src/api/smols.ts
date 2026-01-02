@@ -33,38 +33,57 @@ smols.get(
 	}),
 	async (c) => {
 		const { env, req } = c
-		const { limit, cursor } = parsePaginationParams(new URL(req.url))
+		const url = new URL(req.url)
+		const { limit, cursor } = parsePaginationParams(url)
+		const address = url.searchParams.get('address')
 
-		const whereClause = buildCursorWhereClause(cursor, 'Public = 1')
-		const bindings: any[] = []
-
-		// Build query based on whether we have cursor bindings
-		let query: string
-		if (whereClause.length > 1) {
-			// Has cursor bindings
-			query = `
-				SELECT Id, Title, Song_1, Mint_Token, Mint_Amm, Created_At
-				FROM Smols
-				WHERE ${whereClause[0]}
-				ORDER BY Created_At DESC, Id DESC
-				LIMIT ?
-			`
-			bindings.push(whereClause[1], whereClause[2], whereClause[3], limit)
-		} else {
-			// No cursor bindings
-			query = `
-				SELECT Id, Title, Song_1, Mint_Token, Mint_Amm, Created_At
-				FROM Smols
-				WHERE ${whereClause[0]}
-				ORDER BY Created_At DESC, Id DESC
-				LIMIT ?
-			`
-			bindings.push(limit)
+		// Manual query construction for this specific endpoint to ensure correctness
+		const sqlBindings: any[] = []
+		let baseWhere = 'Public = 1'
+		if (address) {
+			baseWhere += ' AND Address = ?'
+			sqlBindings.push(address)
 		}
 
+		let query: string
+		if (cursor) {
+			// Cursor logic: Created_At < cursor.createdAt OR (Created_At = cursor.createdAt AND Id < cursor.id)
+			const decodedCursor = JSON.parse(atob(cursor))
+			const cursorClause = `(${baseWhere}) AND (Created_At < ? OR (Created_At = ? AND Id < ?))`
+			query = `
+				SELECT Id, Title, Song_1, Mint_Token, Mint_Amm, Created_At, Address, Tags
+				FROM Smols
+				WHERE ${cursorClause}
+				ORDER BY Created_At DESC, Id DESC
+				LIMIT ?
+			`
+			sqlBindings.push(decodedCursor.created_at, decodedCursor.created_at, decodedCursor.id)
+		} else {
+			query = `
+				SELECT Id, Title, Song_1, Mint_Token, Mint_Amm, Created_At, Address, Tags
+				FROM Smols
+				WHERE ${baseWhere}
+				ORDER BY Created_At DESC, Id DESC
+				LIMIT ?
+			`
+		}
+		sqlBindings.push(limit)
+
+
 		const { results } = await env.SMOL_D1.prepare(query)
-			.bind(...bindings)
-			.all<SmolListItem>()
+			.bind(...sqlBindings)
+			.all<SmolListItem & { Tags: string | string[] }>()
+
+		// Parse Tags if they are strings ( D1 returns TEXT for JSON columns)
+		results.forEach((r) => {
+			if (typeof r.Tags === 'string') {
+				try {
+					r.Tags = JSON.parse(r.Tags)
+				} catch (e) {
+					r.Tags = []
+				}
+			}
+		})
 
 		const pagination = buildPaginationResponse(
 			results,
@@ -260,10 +279,16 @@ smols.get(
 			LIMIT ?
 		`)
 			.bind(limit)
-			.all<SmolListItem & { Plays: number; Views: number; Likes: number; Score: number }>()
+			.all<SmolListItem & { Score: number }>()
+
+		// Anti-Cheat: Hide raw metrics, only return score
+		const sanitizedResults = results.map(r => {
+			const { Plays, Views, Likes, ...safe } = r as any;
+			return safe;
+		});
 
 		const response = c.json({
-			smols: results,
+			smols: sanitizedResults,
 			period,
 		})
 

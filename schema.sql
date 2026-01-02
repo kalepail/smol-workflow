@@ -43,3 +43,9 @@ CREATE TABLE IF NOT EXISTS Mixtapes (
     "Address" TEXT NOT NULL,
     Created_At DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Indexes for Performance
+CREATE INDEX IF NOT EXISTS idx_smols_address ON Smols(Address);
+CREATE INDEX IF NOT EXISTS idx_smols_public_created ON Smols(Public, Created_At DESC);
+CREATE INDEX IF NOT EXISTS idx_likes_id ON Likes(Id);
+CREATE INDEX IF NOT EXISTS idx_mixtapes_address ON Mixtapes(Address);

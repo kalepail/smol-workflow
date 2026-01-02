@@ -29,7 +29,8 @@ mixtapes.post('/', parseAuth, async (c) => {
 		throw new HTTPException(400, { message: 'Missing or invalid smols array' })
 	}
 
-	const smolsString = body.smols.join(',')
+	// Store as JSON string for better type safety than CSV
+	const smolsString = JSON.stringify(body.smols)
 
 	const result = await env.SMOL_D1.prepare(`
 		INSERT INTO Mixtapes (Title, Desc, Smols, "Address")
@@ -86,7 +87,7 @@ mixtapes.put('/:id', parseAuth, async (c) => {
 	}
 	if (body.smols && Array.isArray(body.smols) && body.smols.length > 0) {
 		updates.push(`Smols = ?${bindIndex++}`)
-		bindings.push(body.smols.join(','))
+		bindings.push(JSON.stringify(body.smols))
 	}
 
 	if (updates.length === 0) {
@@ -163,10 +164,20 @@ mixtapes.get(
 			Created_At: string
 		}>()
 
-		const mixtapes = results.map((row) => ({
-			...row,
-			Smols: row.Smols.split(','),
-		}))
+		const mixtapes = results.map((row) => {
+			let parsedSmols: string[] = []
+			try {
+				// Try JSON parse first (new format)
+				parsedSmols = JSON.parse(row.Smols)
+			} catch {
+				// Fallback to split (old format)
+				parsedSmols = row.Smols.split(',')
+			}
+			return {
+				...row,
+				Smols: parsedSmols,
+			}
+		})
 
 		const response = c.json(mixtapes)
 
@@ -188,76 +199,88 @@ mixtapes.get(
 		const { env, req } = c
 		const id = req.param('id')
 
-		const { results } = await env.SMOL_D1.prepare(`
-			SELECT 
-				m.Id,
-				m.Title,
-				m.Desc,
-				m."Address",
-				m.Created_At,
-				s.Id as Smol_Id,
-				s.Title as Smol_Title,
-				s."Address" as Smol_Address,
-				s.Mint_Token,
-				s.Mint_Amm,
-				s.Song_1
-			FROM Mixtapes m
-			CROSS JOIN json_each('[' || REPLACE('"' || REPLACE(m.Smols, ',', '","') || '"', '""', '') || ']') as j
-			LEFT JOIN Smols s ON s.Id = TRIM(j.value, '"')
-			WHERE m.Id = ?1
-		`)
-			.bind(id)
-			.all<{
-				Id: string
-				Title: string
-				Desc: string
-				Address: string
-				Created_At: string
-				Smol_Id: string | null
-				Smol_Title: string | null
-				Smol_Address: string | null
-				Mint_Token: string | null
-				Mint_Amm: string | null
-				Song_1: string | null
-			}>()
+		// 1. Fetch Mixtape details
+		const mixtape = await env.SMOL_D1.prepare(`
+			SELECT Id, Title, Desc, "Address", Created_At, Smols
+			FROM Mixtapes
+			WHERE Id = ?1
+		`).bind(id).first<{
+			Id: string
+			Title: string
+			Desc: string
+			Address: string
+			Created_At: string
+			Smols: string
+		}>()
 
-		if (results.length === 0) {
+		if (!mixtape) {
 			throw new HTTPException(404, { message: 'Mixtape not found' })
 		}
 
-		// Fetch KV data in bulk (up to 100 keys at once)
-		const smolIds = results
-			.filter((row) => row.Smol_Id !== null)
-			.map((row) => row.Smol_Id!)
-
-		const kvData = await env.SMOL_KV.get<SmolKVData>(smolIds, 'json')
-
-		const smolsWithKV = results
-			.filter((row) => row.Smol_Id !== null)
-			.map((row) => {
-				const kv = kvData.get(row.Smol_Id!)
-				return {
-					Id: row.Smol_Id!,
-					Title: row.Smol_Title!,
-					Address: row.Smol_Address!,
-					Mint_Token: row.Mint_Token,
-					Mint_Amm: row.Mint_Amm,
-					Song_1: row.Song_1!,
-					Tags: kv?.lyrics?.style || [],
-				}
-			})
-
-		// Take mixtape data from first row
-		const mixtape = {
-			Id: results[0].Id,
-			Title: results[0].Title,
-			Desc: results[0].Desc,
-			Address: results[0].Address,
-			Created_At: results[0].Created_At,
-			Smols: smolsWithKV,
+		// 2. Parse Smols IDs (handle both JSON and CSV for backward compat)
+		let smolIds: string[] = []
+		try {
+			smolIds = JSON.parse(mixtape.Smols)
+		} catch {
+			smolIds = mixtape.Smols.split(',')
 		}
 
-		const response = c.json(mixtape)
+		if (smolIds.length === 0) {
+			return c.json({
+				...mixtape,
+				Smols: []
+			})
+		}
+
+		// 3. Fetch details for these Smols
+		// Dynamically build placeholders for IN clause
+		const placeholders = smolIds.map((_, i) => `?${i + 1}`).join(',')
+		const smolDetails = await env.SMOL_D1.prepare(`
+			SELECT 
+				Id, Title, "Address", Mint_Token, Mint_Amm, Song_1
+			FROM Smols
+			WHERE Id IN (${placeholders})
+		`)
+			.bind(...smolIds)
+			.all<{
+				Id: string
+				Title: string
+				Address: string
+				Mint_Token: string | null
+				Mint_Amm: string | null
+				Song_1: string
+			}>()
+
+		const foundSmols = smolDetails.results;
+
+		// 4. Fetch KV data for styles/tags
+		const kvData = await env.SMOL_KV.get<SmolKVData>(smolIds, 'json')
+
+		// 5. Combine data, preserving order of IDs in the mixtape
+		const smolsCombined = smolIds.map(id => {
+			const details = foundSmols.find(s => s.Id === id)
+			if (!details) return null // access control or deleted?
+
+			const kv = kvData.get(id)
+			return {
+				Id: details.Id,
+				Title: details.Title,
+				Address: details.Address,
+				Mint_Token: details.Mint_Token,
+				Mint_Amm: details.Mint_Amm,
+				Song_1: details.Song_1,
+				Tags: kv?.lyrics?.style || [],
+			}
+		}).filter(s => s !== null)
+
+		const response = c.json({
+			Id: mixtape.Id,
+			Title: mixtape.Title,
+			Desc: mixtape.Desc,
+			Address: mixtape.Address,
+			Created_At: mixtape.Created_At,
+			Smols: smolsCombined,
+		})
 
 		// Add cache tag for individual mixtape
 		response.headers.append('Cache-Tag', 'mixtapes')

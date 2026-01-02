@@ -29,26 +29,46 @@ artists.get(
         const limit = Math.min(Math.max(isNaN(limitParam) ? 100 : limitParam, 1), 200)
 
         // Query aggregates artists by Address, ordered by internal score
-        // NOTE: We calculate score but DO NOT return it (hidden metrics)
+        // Optimized with CTEs to avoid correlated subqueries (O(n) instead of O(n^2))
         const { results } = await env.SMOL_D1.prepare(`
+			WITH RankedSmols AS (
+				SELECT 
+					Address, Id, Title, Created_At,
+					ROW_NUMBER() OVER (PARTITION BY Address ORDER BY Created_At DESC) as rn
+				FROM Smols
+				WHERE Public = 1
+			),
+			Aggregates AS (
+				SELECT
+					Address,
+					COUNT(*) as songCount,
+					SUM(Plays) as totalPlays,
+					SUM(Views) as totalViews
+				FROM Smols
+				WHERE Public = 1
+				GROUP BY Address
+			),
+			LikesCount AS (
+				SELECT s.Address, COUNT(l.Id) as totalLikes
+				FROM Smols s
+				JOIN Likes l ON s.Id = l.Id
+				WHERE s.Public = 1
+				GROUP BY s.Address
+			)
 			SELECT 
-				s.Address,
+				agg.Address,
 				u.Username,
-				COUNT(*) as songCount,
-				-- Get latest smol for cover art
-				(SELECT Id FROM Smols WHERE Address = s.Address AND Public = 1 ORDER BY Created_At DESC LIMIT 1) as latestSmolId,
-				(SELECT Title FROM Smols WHERE Address = s.Address AND Public = 1 ORDER BY Created_At DESC LIMIT 1) as latestSmolTitle,
-				MAX(s.Created_At) as latestCreatedAt
-			FROM Smols s
-			LEFT JOIN Users u ON s.Address = u.Address
-			WHERE s.Public = 1
-			GROUP BY s.Address
+				agg.songCount,
+				latest.Id as latestSmolId,
+				latest.Title as latestSmolTitle,
+				latest.Created_At as latestCreatedAt
+			FROM Aggregates agg
+			JOIN RankedSmols latest ON agg.Address = latest.Address AND latest.rn = 1
+			LEFT JOIN LikesCount lc ON agg.Address = lc.Address
+			LEFT JOIN Users u ON agg.Address = u.Address
 			ORDER BY 
-				-- Hidden score: engagement-weighted but not exposed
-				(SUM(s.Plays) + SUM(s.Views) * 0.5 + 
-				 (SELECT COUNT(*) FROM Likes l WHERE l.Id IN (SELECT Id FROM Smols WHERE Address = s.Address)) * 10
-				) DESC,
-				MAX(s.Created_At) DESC
+				(agg.totalPlays + agg.totalViews * 0.5 + IFNULL(lc.totalLikes, 0) * 10) DESC,
+				latest.Created_At DESC
 			LIMIT ?
 		`)
             .bind(limit)
