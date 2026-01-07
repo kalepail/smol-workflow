@@ -166,7 +166,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 
 			await step.do('save song ids', config, () => stub.saveStep('song_ids', song_ids));
 
-			await step.sleep('wait for songs to generate', '30 seconds');
+			await step.sleep('wait for songs to generate', '2 minutes');
 
 			songs = await step.do(
 				'get songs',
