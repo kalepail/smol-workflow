@@ -91,11 +91,18 @@ media.get(
 		let scaled_image: Buffer | null = null
 
 		if (scale) {
+			const scaleValue = parseInt(scale)
+
+			// Prevent DoS via excessive scaling - cap at 32x (64px base * 32 = 2048px)
+			if (isNaN(scaleValue) || scaleValue < 1 || scaleValue > 32) {
+				throw new HTTPException(400, { message: 'Scale must be between 1 and 32' })
+			}
+
 			const jimp_image = await Jimp.fromBuffer(await image.arrayBuffer())
 
 			jimp_image.resize({
-				w: jimp_image.width * parseInt(scale),
-				h: jimp_image.height * parseInt(scale),
+				w: jimp_image.width * scaleValue,
+				h: jimp_image.height * scaleValue,
 				mode: ResizeStrategy.NEAREST_NEIGHBOR,
 			})
 

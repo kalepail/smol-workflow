@@ -294,19 +294,15 @@ smols.get(
 )
 
 // Create new smol
-smols.post('/', async (c) => {
+smols.post('/', parseAuth, async (c) => {
 	const { env, req } = c
+	const payload = c.get('jwtPayload')!
 	const body: {
-		address: string
 		prompt: string
 		public?: boolean
 		instrumental?: boolean
 		playlist?: string
 	} = await req.json()
-
-	if (!body.address) {
-		throw new HTTPException(400, { message: 'Missing address' })
-	}
 
 	if (!body.prompt) {
 		throw new HTTPException(400, { message: 'Missing prompt' })
@@ -316,7 +312,7 @@ smols.post('/', async (c) => {
 	const instance = await env.WORKFLOW.create({
 		id: instanceId,
 		params: {
-			address: body.address,
+			address: payload.sub,
 			prompt: body.prompt,
 			public: body.public ?? true,
 			instrumental: body.instrumental ?? false,
@@ -331,15 +327,8 @@ smols.post('/', async (c) => {
 })
 
 // Retry smol creation
-smols.post('/retry/:id', async (c) => {
+smols.post('/retry/:id', parseAuth, async (c) => {
 	const { env, req } = c
-	const body: {
-		address: string
-	} = await req.json()
-
-	if (!body.address) {
-		throw new HTTPException(400, { message: 'Missing address' })
-	}
 
 	const id = req.param('id')
 	const instanceId = env.DURABLE_OBJECT.newUniqueId().toString()
@@ -347,7 +336,6 @@ smols.post('/retry/:id', async (c) => {
 		id: instanceId,
 		params: {
 			retry_id: id,
-			address: body.address,
 		},
 	})
 
@@ -425,6 +413,20 @@ smols.put('/:smol_id/:song_id', parseAuth, async (c) => {
 smols.delete('/:id', parseAuth, async (c) => {
 	const { env, req } = c
 	const id = req.param('id')
+	const payload = c.get('jwtPayload')!
+
+	// Check ownership and delete in one query
+	const result = await env.SMOL_D1.prepare(`
+		DELETE FROM Smols
+		WHERE Id = ?1 AND "Address" = ?2
+	`)
+		.bind(id, payload.sub)
+		.run()
+
+	if (result.meta.changes === 0) {
+		throw new HTTPException(404, { message: 'Smol not found or not owned by you' })
+	}
+
 	const smol: any = await env.SMOL_KV.get(id, 'json')
 
 	try {
@@ -433,15 +435,7 @@ smols.delete('/:id', parseAuth, async (c) => {
 		await stub.setToFlush()
 	} catch {}
 
-	const payload = c.get('jwtPayload')!
-
 	await env.SMOL_KV.delete(id)
-	await env.SMOL_D1.prepare(`
-		DELETE FROM Smols
-		WHERE Id = ?1
-	`)
-		.bind(id)
-		.run()
 	await env.SMOL_BUCKET.delete(`${id}.png`)
 
 	if (smol) {
