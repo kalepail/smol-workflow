@@ -131,12 +131,25 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 
 		await step.do('save nsfw check', config, () => stub.saveStep('nsfw', nsfw))
 
-		// TODO likely need to save this to the DO so we can retry with the same source if needed
-		let source: string;
-		// if retrying and all songs gens were successful, use the existing song ids
-		let song_ids: number[] | string[] | undefined = retry_steps?.song_ids && !retry_steps?.songs?.some((song) => song.status < 0) ? retry_steps.song_ids : undefined;
+		// Check if we have complete songs from a previous run we can reuse
+		const hasCompleteSongs = retry_steps?.songs?.length === 2
+			&& retry_steps.songs.every(s => s.status >= 4 && s.audio);
 
-		if (!song_ids) {
+		let songs: AiSongGeneratorSong[];
+		let song_ids: number[] | string[];
+		let source: 'aisonggenerator' | 'diffrhythm';
+
+		if (hasCompleteSongs) {
+			// Reuse complete songs from previous run - no need to regenerate or poll
+			songs = retry_steps!.songs!;
+			song_ids = retry_steps!.song_ids!;
+			source = 'aisonggenerator'; // Doesn't matter since we won't poll
+
+			// Still save to new DO for consistency
+			await step.do('save song ids', config, () => stub.saveStep('song_ids', song_ids));
+			await step.do('save songs', config, () => stub.saveStep('songs', songs));
+		} else {
+			// Generate new songs
 			try {
 				song_ids = await step.do('generate songs (aisonggenerator)', config, async () => {
 					let song_ids = await generateSongs(this.env, prompt, description, lyrics, is_public, is_instrumental, 'aisonggenerator');
@@ -150,59 +163,59 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 				})
 				source = 'diffrhythm';
 			}
-		}
 
-		await step.do('save song ids', config, () => stub.saveStep('song_ids', song_ids));
+			await step.do('save song ids', config, () => stub.saveStep('song_ids', song_ids));
 
-		await step.sleep('wait for songs to generate', '30 seconds');
+			await step.sleep('wait for songs to generate', '30 seconds');
 
-		let songs = await step.do(
-			'get songs',
-			{
-				...config,
-				retries: {
-					...config.retries,
-					limit: 10,
-				},
-			} as WorkflowStepConfig,
-			async () => {
-				let songs = await getSongs(this.env, song_ids, source);
-				let has_audio = false;
-				let is_streaming = false;
+			songs = await step.do(
+				'get songs',
+				{
+					...config,
+					retries: {
+						...config.retries,
+						limit: 10,
+					},
+				} as WorkflowStepConfig,
+				async () => {
+					let songs = await getSongs(this.env, song_ids, source);
+					let has_audio = false;
+					let is_streaming = false;
 
-				for (let song of songs) {
-					if (song.status < 0) {
-						// TODO maybe if we hit this we should retry with `diffrhythm`
+					for (let song of songs) {
+						if (song.status < 0) {
+							// TODO maybe if we hit this we should retry with `diffrhythm`
+							await stub.saveStep('songs', songs)
+							throw new NonRetryableError(`Song ${song.music_id || 'unknown'} has negative status: ${song.status}`);
+						}
+
+						if (song.audio) {
+							has_audio = true;
+						}
+
+						if (song.status < 4) {
+							is_streaming = true;
+						}
+					}
+
+					// No audio yet (status 0/1) - still in queue or waiting for generation
+					if (!has_audio) {
 						await stub.saveStep('songs', songs)
-						throw new NonRetryableError(`Song ${song.music_id || 'unknown'} has negative status: ${song.status}`);
+						throw new Error(`Songs missing audio`);
 					}
 
-					if (song.audio) {
-						has_audio = true;
+					// Has audio but still streaming (status 2/3) - partial audio, not complete
+					if (is_streaming) {
+						await stub.saveStep('songs', songs)
+						throw new Error('Songs still streaming');
 					}
 
-					if (song.status < 4) {
-						is_streaming = true;
-					}
+					return songs;
 				}
+			);
 
-				// No audio yet (status 0/1) - still in queue or waiting for generation
-				if (!has_audio) {
-					await stub.saveStep('songs', songs)
-					throw new Error(`Songs missing audio`);
-				}
-
-				// Has audio but still streaming (status 2/3) - partial audio, not complete
-				if (is_streaming) {
-					await stub.saveStep('songs', songs)
-					throw new Error('Songs still streaming');
-				}
-
-				return songs;
-			}
-		);
-
-		await step.do('save songs', config, () => stub.saveStep('songs', songs));
+			await step.do('save songs', config, () => stub.saveStep('songs', songs));
+		}
 
 		// mint smol on Stellar
 		// await step.do('mint smol', config, async () => {
