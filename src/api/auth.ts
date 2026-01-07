@@ -3,6 +3,7 @@ import { HTTPException } from 'hono/http-exception'
 import { sign } from 'hono/jwt'
 import { setCookie } from 'hono/cookie'
 import type { HonoEnv } from '../types'
+import { verifyRegistration, verifyAuthentication } from '../passkey'
 
 const auth = new Hono<HonoEnv>()
 
@@ -10,7 +11,7 @@ auth.post('/login', async (c) => {
 	const { env, req } = c
 	const body = await req.json()
 	const host = req.header('origin') ?? req.header('referer')
-	const { type, response, keyId, contractId } = body
+	const { type, keyId, contractId, response } = body
 
 	let { username } = body
 
@@ -20,13 +21,13 @@ auth.post('/login', async (c) => {
 
 	switch (type) {
 		case 'create':
-			// await verifyRegistration(host, response)
+			await verifyRegistration(host, response)
 			await env.SMOL_D1.prepare(`INSERT INTO Users ("Address", Username) VALUES (?1, ?2)`)
 				.bind(contractId, username)
 				.run()
 			break
 		case 'connect':
-			// await verifyAuthentication(host, keyId, contractId, response)
+			await verifyAuthentication(host, keyId, contractId, response)
 			const user = await env.SMOL_D1.prepare(`SELECT Username FROM Users WHERE "Address" = ?1`)
 				.bind(contractId)
 				.first()
