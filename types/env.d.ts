@@ -47,8 +47,8 @@ type WorkflowParams = {
 
 type WorkflowTxParams = {
 	type: 'mint' | 'batch-mint'
-	entropy: string
+	entropy?: string  // Required for 'mint', not used for 'batch-mint'
 	xdr: string
-	ids?: string[]
-	sub: string // JWT sub of the user who initiated the mint
+	ids?: string[]    // Required for 'batch-mint', not used for 'mint'
+	sub: string       // JWT sub of the user who initiated the mint
 }
