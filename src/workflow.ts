@@ -186,11 +186,13 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 					}
 				}
 
+				// No audio yet (status 0/1) - still in queue or waiting for generation
 				if (!has_audio) {
 					await stub.saveStep('songs', songs)
 					throw new Error(`Songs missing audio`);
 				}
 
+				// Has audio but still streaming (status 2/3) - partial audio, not complete
 				if (is_streaming) {
 					await stub.saveStep('songs', songs)
 					throw new Error('Songs still streaming');
