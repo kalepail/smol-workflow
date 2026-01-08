@@ -32,8 +32,16 @@ interface WorkflowSteps {
 		safe?: boolean
 		categories?: string[]
 	} | undefined
-	song_ids: number[] | undefined
+	song_ids: number[] | string[] | undefined
 	songs: AiSongGeneratorSong[] | undefined
+	streaming_fingerprints?: Record<string, {
+		hash: string
+		byteLength: number
+		audioUrl: string
+		duration?: number
+		bitrate?: number
+		sampleRate?: number
+	}>
 }
 
 type WorkflowParams = {

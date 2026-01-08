@@ -239,7 +239,7 @@ smols.get(
 			.first()
 
 		if (smol_d1) {
-			const smol_kv = await env.SMOL_KV.get(id, 'json')
+			const smol_kv: any = await env.SMOL_KV.get(id, 'json')
 
 			// Increment views non-blockingly
 			executionCtx.waitUntil(
@@ -248,8 +248,11 @@ smols.get(
 					.run()
 			)
 
+			// Strip image_base64 from public response
+			const { image_base64: _, ...kv_do } = smol_kv || {}
+
 			const response = c.json({
-				kv_do: smol_kv,
+				kv_do,
 				d1: smol_d1,
 				liked,
 			})
@@ -280,8 +283,11 @@ smols.get(
 			}
 		})
 
+		// Strip image_base64 from public response
+		const { image_base64: _, ...kv_do } = (await stub.getSteps()) as any || {}
+
 		const response = c.json({
-			kv_do: await stub.getSteps(),
+			kv_do,
 			wf: instance && (await instance.status()),
 			liked,
 		})

@@ -5,6 +5,7 @@ import { generateLyrics, generateSongs, getSongs } from './ai/aisonggenerator';
 import { checkNSFW } from './ai/nsfw';
 import { NonRetryableError } from 'cloudflare:workflows';
 import { purgePlaylistCache, purgeUserCreatedCache, purgePublicSmolsCache } from './utils/cache';
+import { extractFingerprint, matchSongsByFingerprint, type AudioFingerprint } from './utils/audio-fingerprint';
 
 // ensure gen can be paid for
 // [maybe pay to proxy?]
@@ -133,6 +134,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 
 		// Check if we have complete songs from a previous run we can reuse
 		const hasCompleteSongs = retry_steps?.songs?.length === 2
+			&& retry_steps?.song_ids?.length === 2
 			&& retry_steps.songs.every(s => s.status >= 4 && s.audio);
 
 		let songs: AiSongGeneratorSong[];
@@ -166,8 +168,88 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 
 			await step.do('save song ids', config, () => stub.saveStep('song_ids', song_ids));
 
-			await step.sleep('wait for songs to generate', '2 minutes');
+			// Helper to poll songs with different success criteria
+			const pollSongs = async (mode: 'streaming' | 'complete'): Promise<AiSongGeneratorSong[]> => {
+				const songs = await getSongs(this.env, song_ids, source);
 
+				let has_audio = false;
+				let is_complete = true;
+
+				for (const song of songs) {
+					if (song.status < 0) {
+						await stub.saveStep('songs', songs);
+						throw new NonRetryableError(`Song ${song.music_id || 'unknown'} has negative status: ${song.status}`);
+					}
+
+					if (song.audio) {
+						has_audio = true;
+					}
+
+					if (song.status < 4) {
+						is_complete = false;
+					}
+				}
+
+				// Always save progress
+				await stub.saveStep('songs', songs);
+
+				// No audio yet - waiting for generation to start
+				if (!has_audio) {
+					throw new Error('Songs missing audio');
+				}
+
+				// For streaming mode, having any audio is enough
+				if (mode === 'streaming') {
+					return songs;
+				}
+
+				// For complete mode, need all songs to be status >= 4
+				if (!is_complete) {
+					throw new Error('Songs still streaming');
+				}
+
+				return songs;
+			};
+
+			await step.sleep('wait for songs to start streaming', '30 seconds');
+
+			// Poll until we have streaming audio - 5 retries
+			await step.do(
+				'wait for streaming',
+				{
+					...config,
+					retries: {
+						...config.retries,
+						limit: 5,
+					},
+				} as WorkflowStepConfig,
+				() => pollSongs('streaming')
+			);
+
+			// Capture streaming fingerprints for aisonggenerator to detect audio swaps
+			let streamingFingerprints: Record<string, AudioFingerprint> | undefined;
+
+			if (source === 'aisonggenerator') {
+				streamingFingerprints = await step.do('capture streaming fingerprints', config, async () => {
+					const currentSteps = await stub.getSteps() as WorkflowSteps;
+					const currentSongs = currentSteps.songs as AiSongGeneratorSong[];
+					const fingerprints: Record<string, AudioFingerprint> = {};
+
+					for (const song of currentSongs || []) {
+						if (song.audio) {
+							const fp = await extractFingerprint(song.audio);
+							if (fp) fingerprints[song.music_id] = fp;
+						}
+					}
+					return fingerprints;
+				});
+
+				await step.do('save streaming fingerprints', config, () => stub.saveStep('streaming_fingerprints', streamingFingerprints));
+			}
+
+			await step.sleep('wait for songs to complete', '90 seconds');
+
+			// Poll until songs are complete - 10 retries
 			songs = await step.do(
 				'get songs',
 				{
@@ -177,44 +259,23 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 						limit: 10,
 					},
 				} as WorkflowStepConfig,
-				async () => {
-					let songs = await getSongs(this.env, song_ids, source);
-					let has_audio = false;
-					let is_streaming = false;
-
-					for (let song of songs) {
-						if (song.status < 0) {
-							// TODO maybe if we hit this we should retry with `diffrhythm`
-							await stub.saveStep('songs', songs)
-							throw new NonRetryableError(`Song ${song.music_id || 'unknown'} has negative status: ${song.status}`);
-						}
-
-						if (song.audio) {
-							has_audio = true;
-						}
-
-						if (song.status < 4) {
-							is_streaming = true;
-						}
-					}
-
-					// No audio yet (status 0/1) - still in queue or waiting for generation
-					if (!has_audio) {
-						await stub.saveStep('songs', songs)
-						throw new Error(`Songs missing audio`);
-					}
-
-					// Has audio but still streaming (status 2/3) - partial audio, not complete
-					if (is_streaming) {
-						await stub.saveStep('songs', songs)
-						throw new Error('Songs still streaming');
-					}
-
-					return songs;
-				}
+				() => pollSongs('complete')
 			);
 
-			await step.do('save songs', config, () => stub.saveStep('songs', songs));
+			// Match fingerprints to detect and correct audio swaps (aisonggenerator only)
+			if (source === 'aisonggenerator' && streamingFingerprints && Object.keys(streamingFingerprints).length === 2) {
+				const matched = await step.do('match song fingerprints', config, async () => {
+					return matchSongsByFingerprint(streamingFingerprints!, songs);
+				});
+
+				if (matched.swapped) {
+					console.log('Reordering songs based on fingerprint matching');
+				}
+				songs = matched.songs;
+
+				// Save the corrected songs order
+				await step.do('save matched songs', config, () => stub.saveStep('songs', songs));
+			}
 		}
 
 		// mint smol on Stellar
@@ -272,6 +333,18 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 
 				await this.env.SMOL_D1.prepare(`DELETE FROM Smols WHERE Id = ?1`).bind(retry_id).run();
 				await this.env.SMOL_KV.delete(retry_id);
+
+				// Clean up orphaned R2 files from retry
+				await this.env.SMOL_BUCKET.delete(`${retry_id}.png`);
+
+				// Clean up old song mp3s if we regenerated (not reusing hasCompleteSongs)
+				if (!hasCompleteSongs && retry_steps?.songs) {
+					for (const song of retry_steps.songs) {
+						if (song.status >= 4 && song.music_id) {
+							await this.env.SMOL_BUCKET.delete(`${song.music_id}.mp3`);
+						}
+					}
+				}
 			}
 
 			if (playlist) {
