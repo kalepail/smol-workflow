@@ -88,7 +88,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 				...config,
 				retries: {
 					...config.retries,
-					limit: 10,
+					limit: 6,  // ~10 min with exponential backoff
 				},
 			} as WorkflowStepConfig,
 			async () => {
@@ -173,6 +173,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 				const songs = await getSongs(this.env, song_ids, source);
 
 				let has_audio = false;
+				let all_have_audio = true;
 				let is_complete = true;
 
 				for (const song of songs) {
@@ -183,6 +184,8 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 
 					if (song.audio) {
 						has_audio = true;
+					} else {
+						all_have_audio = false;
 					}
 
 					if (song.status < 4) {
@@ -198,14 +201,19 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 					throw new Error('Songs missing audio');
 				}
 
-				// For streaming mode, having any audio is enough
+				// For streaming mode, need ALL songs to have audio for fingerprinting
 				if (mode === 'streaming') {
+					if (!all_have_audio) {
+						const missingSongs = songs.filter(s => !s.audio).map(s => `${s.music_id}: status=${s.status}`);
+						throw new Error(`Songs still waiting for audio: ${missingSongs.join('; ')}`);
+					}
 					return songs;
 				}
 
 				// For complete mode, need all songs to be status >= 4
 				if (!is_complete) {
-					throw new Error('Songs still streaming');
+					const incomplete = songs.filter(s => s.status < 4).map(s => `${s.music_id}: status=${s.status}, audio=${!!s.audio}`);
+					throw new Error(`Songs still streaming: ${incomplete.join('; ')}`);
 				}
 
 				return songs;
@@ -238,9 +246,20 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 					for (const song of currentSongs || []) {
 						if (song.audio) {
 							const fp = await extractFingerprint(song.audio);
-							if (fp) fingerprints[song.music_id] = fp;
+							if (fp) {
+								fingerprints[song.music_id] = fp;
+							} else {
+								console.warn(`Failed to extract fingerprint for song ${song.music_id} (audio: ${song.audio})`);
+							}
 						}
 					}
+
+					const songCount = currentSongs?.length ?? 0;
+					const fpCount = Object.keys(fingerprints).length;
+					if (fpCount < songCount) {
+						console.warn(`Only captured ${fpCount}/${songCount} fingerprints`);
+					}
+
 					return fingerprints;
 				});
 
@@ -249,21 +268,23 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 
 			await step.sleep('wait for songs to complete', '90 seconds');
 
-			// Poll until songs are complete - 10 retries
+			// Poll until songs are complete - 6 retries (~10 min with exponential backoff)
 			songs = await step.do(
 				'get songs',
 				{
 					...config,
 					retries: {
 						...config.retries,
-						limit: 10,
+						limit: 6,
 					},
 				} as WorkflowStepConfig,
 				() => pollSongs('complete')
 			);
 
 			// Match fingerprints to detect and correct audio swaps (aisonggenerator only)
-			if (source === 'aisonggenerator' && streamingFingerprints && Object.keys(streamingFingerprints).length === 2) {
+			// Requires exactly 2 fingerprints - partial matching doesn't reliably detect swaps
+			const fingerprintCount = streamingFingerprints ? Object.keys(streamingFingerprints).length : 0;
+			if (source === 'aisonggenerator' && fingerprintCount === 2) {
 				const matched = await step.do('match song fingerprints', config, async () => {
 					return matchSongsByFingerprint(streamingFingerprints!, songs);
 				});
@@ -275,6 +296,8 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 
 				// Save the corrected songs order
 				await step.do('save matched songs', config, () => stub.saveStep('songs', songs));
+			} else if (source === 'aisonggenerator') {
+				console.warn(`Skipping swap detection: only ${fingerprintCount}/2 fingerprints captured`);
 			}
 		}
 
