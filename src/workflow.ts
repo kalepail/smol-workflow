@@ -222,7 +222,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 			await step.sleep('wait for songs to start streaming', '30 seconds');
 
 			// Poll until we have streaming audio - 5 retries
-			await step.do(
+			const streamingSongs = await step.do(
 				'wait for streaming',
 				{
 					...config,
@@ -234,70 +234,79 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 				() => pollSongs('streaming')
 			);
 
-			// Capture streaming fingerprints for aisonggenerator to detect audio swaps
-			let streamingFingerprints: Record<string, AudioFingerprint> | undefined;
+			// Check if songs are already complete (fast generation)
+			const alreadyComplete = streamingSongs.every(s => s.status >= 4);
 
-			if (source === 'aisonggenerator') {
-				streamingFingerprints = await step.do('capture streaming fingerprints', config, async () => {
-					const currentSteps = await stub.getSteps() as WorkflowSteps;
-					const currentSongs = currentSteps.songs as AiSongGeneratorSong[];
-					const fingerprints: Record<string, AudioFingerprint> = {};
+			if (alreadyComplete) {
+				// Songs completed quickly - no need to wait or poll again
+				console.log('Songs already complete during streaming poll, skipping wait');
+				songs = streamingSongs;
+			} else {
+				// Normal flow: capture streaming fingerprints, wait, then poll for complete
+				let streamingFingerprints: Record<string, AudioFingerprint> | undefined;
 
-					for (const song of currentSongs || []) {
-						if (song.audio) {
-							const fp = await extractFingerprint(song.audio);
-							if (fp) {
-								fingerprints[song.music_id] = fp;
-							} else {
-								console.warn(`Failed to extract fingerprint for song ${song.music_id} (audio: ${song.audio})`);
+				if (source === 'aisonggenerator') {
+					streamingFingerprints = await step.do('capture streaming fingerprints', config, async () => {
+						const currentSteps = await stub.getSteps() as WorkflowSteps;
+						const currentSongs = currentSteps.songs as AiSongGeneratorSong[];
+						const fingerprints: Record<string, AudioFingerprint> = {};
+
+						for (const song of currentSongs || []) {
+							if (song.audio) {
+								const fp = await extractFingerprint(song.audio);
+								if (fp) {
+									fingerprints[song.music_id] = fp;
+								} else {
+									console.warn(`Failed to extract fingerprint for song ${song.music_id} (audio: ${song.audio})`);
+								}
 							}
 						}
-					}
 
-					const songCount = currentSongs?.length ?? 0;
-					const fpCount = Object.keys(fingerprints).length;
-					if (fpCount < songCount) {
-						console.warn(`Only captured ${fpCount}/${songCount} fingerprints`);
-					}
+						const songCount = currentSongs?.length ?? 0;
+						const fpCount = Object.keys(fingerprints).length;
+						if (fpCount < songCount) {
+							console.warn(`Only captured ${fpCount}/${songCount} fingerprints`);
+						}
 
-					return fingerprints;
-				});
+						return fingerprints;
+					});
 
-				await step.do('save streaming fingerprints', config, () => stub.saveStep('streaming_fingerprints', streamingFingerprints));
-			}
-
-			await step.sleep('wait for songs to complete', '90 seconds');
-
-			// Poll until songs are complete - 6 retries (~10 min with exponential backoff)
-			songs = await step.do(
-				'get songs',
-				{
-					...config,
-					retries: {
-						...config.retries,
-						limit: 6,
-					},
-				} as WorkflowStepConfig,
-				() => pollSongs('complete')
-			);
-
-			// Match fingerprints to detect and correct audio swaps (aisonggenerator only)
-			// Requires exactly 2 fingerprints - partial matching doesn't reliably detect swaps
-			const fingerprintCount = streamingFingerprints ? Object.keys(streamingFingerprints).length : 0;
-			if (source === 'aisonggenerator' && fingerprintCount === 2) {
-				const matched = await step.do('match song fingerprints', config, async () => {
-					return matchSongsByFingerprint(streamingFingerprints!, songs);
-				});
-
-				if (matched.swapped) {
-					console.log('Reordering songs based on fingerprint matching');
+					await step.do('save streaming fingerprints', config, () => stub.saveStep('streaming_fingerprints', streamingFingerprints));
 				}
-				songs = matched.songs;
 
-				// Save the corrected songs order
-				await step.do('save matched songs', config, () => stub.saveStep('songs', songs));
-			} else if (source === 'aisonggenerator') {
-				console.warn(`Skipping swap detection: only ${fingerprintCount}/2 fingerprints captured`);
+				await step.sleep('wait for songs to complete', '90 seconds');
+
+				// Poll until songs are complete - 6 retries (~10 min with exponential backoff)
+				songs = await step.do(
+					'get songs',
+					{
+						...config,
+						retries: {
+							...config.retries,
+							limit: 6,
+						},
+					} as WorkflowStepConfig,
+					() => pollSongs('complete')
+				);
+
+				// Match fingerprints to detect and correct audio swaps (aisonggenerator only)
+				// Requires exactly 2 fingerprints - partial matching doesn't reliably detect swaps
+				const fingerprintCount = streamingFingerprints ? Object.keys(streamingFingerprints).length : 0;
+				if (source === 'aisonggenerator' && fingerprintCount === 2) {
+					const matched = await step.do('match song fingerprints', config, async () => {
+						return matchSongsByFingerprint(streamingFingerprints!, songs);
+					});
+
+					if (matched.swapped) {
+						console.log('Reordering songs based on fingerprint matching');
+					}
+					songs = matched.songs;
+
+					// Save the corrected songs order
+					await step.do('save matched songs', config, () => stub.saveStep('songs', songs));
+				} else if (source === 'aisonggenerator') {
+					console.warn(`Skipping swap detection: only ${fingerprintCount}/2 fingerprints captured`);
+				}
 			}
 		}
 
