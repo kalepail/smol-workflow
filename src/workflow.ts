@@ -137,9 +137,16 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 			&& retry_steps?.song_ids?.length === 2
 			&& retry_steps.songs.every(s => s.status >= 4 && s.audio);
 
-		let songs: AiSongGeneratorSong[];
+		// Check if retry has song_ids that might have completed since (retry-only: retry_steps is null for fresh workflows)
+		const hasPendingSongIds = !hasCompleteSongs
+			&& retry_steps?.song_ids?.length === 2
+			&& retry_steps?.songs?.length === 2
+			&& retry_steps.songs.every(s => s.status >= 0); // Not already in error state
+
+		let songs!: AiSongGeneratorSong[]; // Assigned in all code paths (directly or via polling)
 		let song_ids: number[] | string[];
 		let source: 'aisonggenerator' | 'diffrhythm';
+		let needsPolling = false;
 
 		if (hasCompleteSongs) {
 			// Reuse complete songs from previous run - no need to regenerate or poll
@@ -150,6 +157,63 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 			// Still save to new DO for consistency
 			await step.do('save song ids', config, () => stub.saveStep('song_ids', song_ids));
 			await step.do('save songs', config, () => stub.saveStep('songs', songs));
+		} else if (hasPendingSongIds) {
+			// Previous run had song_ids but songs weren't complete
+			// Quick check if they've completed since - ONE poll, no retries, no waiting
+			song_ids = retry_steps!.song_ids!;
+			// Default to aisonggenerator - if it was diffrhythm and failed, we'll regenerate anyway
+			source = 'aisonggenerator';
+
+			const quickCheck = await step.do('quick check retry songs', {
+				...config,
+				retries: { limit: 0, delay: '1 second' }, // No retries - either ready now or we regenerate
+			}, async () => {
+				try {
+					const currentSongs = await getSongs(this.env, song_ids, source);
+					// Success = ALL songs have status >= 4 (complete) AND have audio URL
+					const allComplete = currentSongs.every(s => s.status >= 4 && s.audio);
+					const anyError = currentSongs.some(s => s.status < 0);
+
+					if (anyError) {
+						return { success: false, reason: 'error', songs: currentSongs };
+					}
+					if (allComplete) {
+						return { success: true, reason: 'complete', songs: currentSongs };
+					}
+					// Status 0-3 without completion = still processing or stuck, regenerate
+					return { success: false, reason: 'incomplete', songs: currentSongs };
+				} catch (err) {
+					// API error (network, invalid source, etc.) - treat as failure and regenerate
+					console.warn('Quick check failed with error, will regenerate:', err);
+					return { success: false, reason: 'error', songs: [] };
+				}
+			});
+
+			if (quickCheck.success) {
+				// Songs completed since the retry was created - use them
+				console.log('Retry songs completed, reusing');
+				songs = quickCheck.songs;
+				await step.do('save song ids', config, () => stub.saveStep('song_ids', song_ids));
+				await step.do('save songs', config, () => stub.saveStep('songs', songs));
+			} else {
+				// Songs stuck or errored - regenerate from scratch
+				console.log(`Retry songs not ready (${quickCheck.reason}), regenerating`);
+				try {
+					song_ids = await step.do('generate songs (aisonggenerator)', config, async () => {
+						let song_ids = await generateSongs(this.env, prompt, description, lyrics, is_public, is_instrumental, 'aisonggenerator');
+						return song_ids;
+					})
+					source = 'aisonggenerator';
+				} catch {
+					song_ids = await step.do('generate songs (diffrhythm)', config, async () => {
+						let song_ids = await generateSongs(this.env, prompt, description, lyrics, is_public, is_instrumental, 'diffrhythm');
+						return song_ids;
+					})
+					source = 'diffrhythm';
+				}
+				await step.do('save song ids', config, () => stub.saveStep('song_ids', song_ids));
+				needsPolling = true;
+			}
 		} else {
 			// Generate new songs
 			try {
@@ -167,6 +231,10 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 			}
 
 			await step.do('save song ids', config, () => stub.saveStep('song_ids', song_ids));
+			needsPolling = true;
+		}
+
+		if (needsPolling) {
 
 			// Helper to poll songs with different success criteria
 			const pollSongs = async (mode: 'streaming' | 'complete'): Promise<AiSongGeneratorSong[]> => {
