@@ -248,8 +248,9 @@ smols.get(
 					.run()
 			)
 
-			// Strip image_base64 from public response
-			const { image_base64: _, ...kv_do } = smol_kv || {}
+			// Replace image_base64 with boolean marker (interfaces use this to know when image is ready)
+			const { image_base64, ...rest } = smol_kv || {}
+			const kv_do = { ...rest, image: !!image_base64 }
 
 			const response = c.json({
 				kv_do,
@@ -283,8 +284,9 @@ smols.get(
 			}
 		})
 
-		// Strip image_base64 from public response
-		const { image_base64: _, ...kv_do } = (await stub.getSteps()) as any || {}
+		// Replace image_base64 with boolean marker (interfaces use this to know when image is ready)
+		const { image_base64, ...rest } = (await stub.getSteps()) as any || {}
+		const kv_do = { ...rest, image: !!image_base64 }
 
 		const response = c.json({
 			kv_do,
