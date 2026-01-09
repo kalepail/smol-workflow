@@ -22,6 +22,8 @@
  */
 
 import { NonRetryableError } from 'cloudflare:workflows';
+import type { WorkflowStep, WorkflowStepConfig } from 'cloudflare:workers';
+import type { SmolDurableObject } from '../do';
 import { generateSongs, getSongs } from '../ai/aisonggenerator';
 import { extractFingerprint, matchSongsByFingerprint, type AudioFingerprint } from './audio-fingerprint';
 
@@ -50,9 +52,9 @@ export type SongsDecisionResult =
  */
 export async function decideSongsStrategy(params: {
 	env: Env;
-	stub: DurableObjectStub<import('../do').SmolDurableObject>;
-	step: import('cloudflare:workers').WorkflowStep;
-	config: import('cloudflare:workers').WorkflowStepConfig;
+	stub: DurableObjectStub<SmolDurableObject>;
+	step: WorkflowStep;
+	config: WorkflowStepConfig;
 	retry_steps: WorkflowSteps | undefined;
 	prompt: string;
 	description: string;
@@ -168,8 +170,8 @@ export async function decideSongsStrategy(params: {
  */
 async function generateNewSongs(params: {
 	env: Env;
-	step: import('cloudflare:workers').WorkflowStep;
-	config: import('cloudflare:workers').WorkflowStepConfig;
+	step: WorkflowStep;
+	config: WorkflowStepConfig;
 	prompt: string;
 	description: string;
 	lyrics: AiSongGeneratorLyrics;
@@ -206,7 +208,7 @@ async function generateNewSongs(params: {
  */
 export function createPollSongsFunction(params: {
 	env: Env;
-	stub: DurableObjectStub<import('../do').SmolDurableObject>;
+	stub: DurableObjectStub<SmolDurableObject>;
 	song_ids: number[] | string[];
 	source: 'aisonggenerator' | 'diffrhythm';
 }) {
@@ -285,7 +287,7 @@ export function createPollSongsFunction(params: {
  * @returns Songs array, potentially reordered if swap was detected
  */
 async function detectAndCorrectSwaps(
-	stub: DurableObjectStub<import('../do').SmolDurableObject>,
+	stub: DurableObjectStub<SmolDurableObject>,
 	songs: AiSongGeneratorSong[]
 ): Promise<AiSongGeneratorSong[]> {
 	// Load persisted state from DO
@@ -368,9 +370,9 @@ async function detectAndCorrectSwaps(
  */
 export async function pollUntilComplete(params: {
 	env: Env;
-	stub: DurableObjectStub<import('../do').SmolDurableObject>;
-	step: import('cloudflare:workers').WorkflowStep;
-	config: import('cloudflare:workers').WorkflowStepConfig;
+	stub: DurableObjectStub<SmolDurableObject>;
+	step: WorkflowStep;
+	config: WorkflowStepConfig;
 	song_ids: number[] | string[];
 	source: 'aisonggenerator' | 'diffrhythm';
 }): Promise<AiSongGeneratorSong[]> {
@@ -378,7 +380,7 @@ export async function pollUntilComplete(params: {
 
 	const pollSongs = createPollSongsFunction({ env, stub, song_ids, source });
 
-	await step.sleep('wait for songs to start streaming', '30 seconds');
+	await step.sleep('wait for songs to start streaming', '45 seconds');
 
 	// Poll until ALL songs have streaming audio - 5 retries
 	// (snapshots are saved as soon as ANY audio appears, with swap detection)
@@ -390,7 +392,7 @@ export async function pollUntilComplete(params: {
 				...config.retries,
 				limit: 5,
 			},
-		} as import('cloudflare:workers').WorkflowStepConfig,
+		} as WorkflowStepConfig,
 		() => pollSongs('streaming')
 	);
 
@@ -402,7 +404,7 @@ export async function pollUntilComplete(params: {
 		return streamingSongs;
 	}
 
-	await step.sleep('wait for songs to complete', '90 seconds');
+	await step.sleep('wait for songs to complete', '60 seconds');
 
 	// Poll until songs are complete - 6 retries (~10 min with exponential backoff)
 	// Swap detection happens on every poll via pollSongs
@@ -414,7 +416,7 @@ export async function pollUntilComplete(params: {
 				...config.retries,
 				limit: 6,
 			},
-		} as import('cloudflare:workers').WorkflowStepConfig,
+		} as WorkflowStepConfig,
 		() => pollSongs('complete')
 	);
 
