@@ -42,6 +42,17 @@ interface WorkflowSteps {
 		bitrate?: number
 		sampleRate?: number
 	}>
+	// Fingerprints captured when we first see audio for each song (keyed by music_id)
+	original_fingerprints?: Record<string, {
+		hash: string
+		byteLength: number
+		audioUrl: string
+		duration?: number
+		bitrate?: number
+		sampleRate?: number
+	}>
+	// Last known audio URLs for each song (keyed by music_id) - used to detect URL changes
+	last_known_urls?: Record<string, string>
 }
 
 type WorkflowParams = {
