@@ -83,11 +83,11 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 		const { address, prompt, public: is_public = true, instrumental: is_instrumental = false } = payload;
 
 		if (!address) {
-			throw new NonRetryableError("event.payload missing address");
+			throw new NonRetryableError("Missing address: unable to start workflow without user authentication");
 		}
 
 		if (!prompt) {
-			throw new NonRetryableError("event.payload missing prompt");
+			throw new NonRetryableError("Missing prompt: please provide a description for your smol");
 		}
 
 		const doid = this.env.DURABLE_OBJECT.idFromString(event.instanceId);
@@ -134,10 +134,12 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 				|| !lyrics.lyrics
 				|| (lyrics.style?.length ?? 0) < 2
 			) {
-				throw JSON.stringify({
-					message: 'Generated incomplete lyrics',
-					lyrics
-				}, null, 2);
+				const missing = [
+					!lyrics.title && 'title',
+					!lyrics.lyrics && 'lyrics',
+					(lyrics.style?.length ?? 0) < 2 && 'style'
+				].filter(Boolean).join(', ');
+				throw new Error(`Lyrics generation incomplete (missing: ${missing}). Try a different prompt.`);
 			}
 
 			return lyrics;

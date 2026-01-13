@@ -232,7 +232,13 @@ export function createPollSongsFunction(params: {
 			// Negative status = generation failed, non-retryable
 			if (song.status < 0) {
 				await stub.saveStep('songs', songs);
-				throw new NonRetryableError(`Song ${song.music_id || 'unknown'} has negative status: ${song.status}`);
+				const statusReasons: Record<number, string> = {
+					[-1]: 'content policy violation',
+					[-2]: 'generation timeout',
+					[-3]: 'service temporarily unavailable',
+				};
+				const reason = statusReasons[song.status] ?? `error code ${song.status}`;
+				throw new NonRetryableError(`Song generation failed: ${reason} (song: ${song.music_id || 'unknown'})`);
 			}
 
 			if (song.audio) {
@@ -248,7 +254,8 @@ export function createPollSongsFunction(params: {
 
 		// No audio yet - waiting for generation to start
 		if (!has_audio) {
-			throw new Error('Songs missing audio');
+			const songIds = songs.map(s => s.music_id || 'unknown').join(', ');
+			throw new Error(`Waiting for audio generation to start (songs: ${songIds})`);
 		}
 
 		// For aisonggenerator: detect and correct swaps BEFORE saving snapshot
@@ -264,16 +271,18 @@ export function createPollSongsFunction(params: {
 		// For streaming mode, wait for ALL songs to have audio before proceeding
 		if (mode === 'streaming') {
 			if (!all_have_audio) {
-				const missingSongs = songs.filter(s => !s.audio).map(s => `${s.music_id}: status=${s.status}`);
-				throw new Error(`Songs still waiting for audio: ${missingSongs.join('; ')}`);
+				const pending = songs.filter(s => !s.audio);
+				const ready = songs.filter(s => s.audio);
+				throw new Error(`Waiting for ${pending.length}/${songs.length} songs to start streaming (ready: ${ready.length})`);
 			}
 			return songs;
 		}
 
 		// For complete mode, need all songs to be status >= 4
 		if (!is_complete) {
-			const incomplete = songs.filter(s => s.status < 4).map(s => `${s.music_id}: status=${s.status}, audio=${!!s.audio}`);
-			throw new Error(`Songs still streaming: ${incomplete.join('; ')}`);
+			const streaming = songs.filter(s => s.status < 4);
+			const complete = songs.filter(s => s.status >= 4);
+			throw new Error(`Finalizing ${streaming.length}/${songs.length} songs (complete: ${complete.length})`);
 		}
 
 		return songs;
