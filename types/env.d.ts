@@ -53,6 +53,10 @@ interface WorkflowSteps {
 	}>
 	// Last known audio URLs for each song (keyed by music_id) - used to detect URL changes
 	last_known_urls?: Record<string, string>
+	// Track fingerprint attempts per song (keyed by music_id).
+	// Incremented when a song doesn't have enough buffered data for fingerprinting.
+	// After 5 attempts, we accept partial data to handle short songs.
+	fingerprint_attempts?: Record<string, number>
 }
 
 type WorkflowParams = {

@@ -25,7 +25,14 @@ import { NonRetryableError } from 'cloudflare:workflows';
 import type { WorkflowStep, WorkflowStepConfig } from 'cloudflare:workers';
 import type { SmolDurableObject } from '../do';
 import { generateSongs, getSongs } from '../ai/aisonggenerator';
-import { extractFingerprint, matchSongsByFingerprint, type AudioFingerprint } from './audio-fingerprint';
+import { extractFingerprint, matchSongsByFingerprint, InsufficientAudioDataError, type AudioFingerprint } from './audio-fingerprint';
+
+// Max attempts to fingerprint a song before accepting partial data.
+// With exponential backoff on the workflow step (~10s, 20s, 40s, 80s, 160s),
+// this gives the song ~5 minutes to buffer enough data.
+// On the final attempt, we accept whatever data is available (minBytes: 0)
+// to handle very short songs that may never reach the 32KB threshold.
+const MAX_FINGERPRINT_ATTEMPTS = 5;
 
 // Re-export for convenience
 export { matchSongsByFingerprint, type AudioFingerprint };
@@ -284,6 +291,17 @@ export function createPollSongsFunction(params: {
  * 5. If swapped, reorder songs to match original fingerprints
  * 6. Persist updated state
  *
+ * Error handling for fingerprinting:
+ * - InsufficientAudioDataError (attempts 1-4): Throw to trigger workflow retry.
+ *   The song is likely still streaming and needs more time to buffer data.
+ * - InsufficientAudioDataError (attempt 5): Accept partial data (minBytes: 0).
+ *   Either the song is very short, or we've waited long enough.
+ * - Network/timeout errors: Always propagate to trigger workflow retry.
+ *
+ * The fingerprint's byteLength field tracks how many audio bytes (after ID3 header)
+ * were actually hashed. This ensures fair comparison when matching complete songs
+ * against streaming fingerprints - we hash the same number of bytes from each.
+ *
  * @returns Songs array, potentially reordered if swap was detected
  */
 async function detectAndCorrectSwaps(
@@ -294,6 +312,7 @@ async function detectAndCorrectSwaps(
 	const currentSteps = await stub.getSteps() as WorkflowSteps;
 	let originalFingerprints: Record<string, AudioFingerprint> = currentSteps.original_fingerprints || {};
 	let lastKnownUrls: Record<string, string> = currentSteps.last_known_urls || {};
+	let fingerprintAttempts: Record<string, number> = currentSteps.fingerprint_attempts || {};
 
 	let stateChanged = false;
 	let urlsChanged = false;
@@ -309,17 +328,46 @@ async function detectAndCorrectSwaps(
 			urlsChanged = true;
 			console.log(`Audio URL ${lastUrl ? 'changed' : 'appeared'} for song ${song.music_id}`);
 
-			// Capture fingerprint for this new URL
-			const fp = await extractFingerprint(song.audio);
-			if (fp) {
-				// Only store as "original" if this is the FIRST audio we've seen for this song
-				if (!originalFingerprints[song.music_id]) {
-					originalFingerprints[song.music_id] = fp;
-					console.log(`Captured original fingerprint for song ${song.music_id}`);
-					stateChanged = true;
+			// Capture fingerprint for this new URL.
+			// Track attempts so we can accept partial data on the final try.
+			try {
+				const attempts = fingerprintAttempts[song.music_id] || 0;
+				const isLastAttempt = attempts >= MAX_FINGERPRINT_ATTEMPTS - 1;
+
+				// On last attempt (5th try), accept whatever data we can get.
+				// This handles short songs that may never reach 32KB threshold.
+				// Earlier attempts use default minBytes to ensure reliable fingerprints.
+				const fp = await extractFingerprint(song.audio, undefined, isLastAttempt ? 0 : undefined);
+				if (fp) {
+					// Only store as "original" if this is the FIRST audio we've seen for this song.
+					// This is the fingerprint we'll compare against to detect swaps.
+					if (!originalFingerprints[song.music_id]) {
+						originalFingerprints[song.music_id] = fp;
+						console.log(`Captured original fingerprint for song ${song.music_id} (${fp.byteLength} bytes)`);
+						stateChanged = true;
+					}
+					// Success - clear attempt counter so future URL changes start fresh
+					if (fingerprintAttempts[song.music_id]) {
+						delete fingerprintAttempts[song.music_id];
+						stateChanged = true;
+					}
 				}
-			} else {
-				console.warn(`Failed to extract fingerprint for song ${song.music_id}`);
+			} catch (err) {
+				if (err instanceof InsufficientAudioDataError) {
+					// Song hasn't buffered enough data yet - increment attempt counter.
+					// This is persisted in DO so it survives workflow step retries.
+					// After MAX_FINGERPRINT_ATTEMPTS, we'll accept partial data above.
+					const attempts = (fingerprintAttempts[song.music_id] || 0) + 1;
+					fingerprintAttempts[song.music_id] = attempts;
+					await stub.saveStep('fingerprint_attempts', fingerprintAttempts);
+
+					console.log(`Fingerprint attempt ${attempts}/${MAX_FINGERPRINT_ATTEMPTS} for ${song.music_id}: ${err.message}`);
+					throw err; // Triggers workflow step retry with exponential backoff
+				} else {
+					// Network errors, timeouts (15s), etc - always propagate.
+					// These indicate infrastructure issues, not "song still streaming".
+					throw err;
+				}
 			}
 
 			lastKnownUrls[song.music_id] = song.audio;
@@ -349,6 +397,7 @@ async function detectAndCorrectSwaps(
 	if (stateChanged) {
 		await stub.saveStep('original_fingerprints', originalFingerprints);
 		await stub.saveStep('last_known_urls', lastKnownUrls);
+		await stub.saveStep('fingerprint_attempts', fingerprintAttempts);
 	}
 
 	return songs;
