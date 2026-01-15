@@ -4,7 +4,6 @@
 declare namespace Cloudflare {
 	interface Env {
 		SECRET: string
-		LAUNCHTUBE_TOKEN: string
 		SK: string
 		CF_API_TOKEN: string
 		CF_ZONE_ID: string

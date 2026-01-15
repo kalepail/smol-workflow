@@ -108,8 +108,8 @@
             "service": "aisonggenerator-worker"
         },
         {
-            "binding": "LAUNCHTUBE",
-            "service": "launchtube-prod"
+            "binding": "KALE_WORKER",
+            "service": "kale-worker"
         }
     ],
     "migrations": [

@@ -1,11 +1,9 @@
 import { Keypair, scValToNative, xdr } from "@stellar/stellar-sdk/minimal";
+import { rpc } from "@stellar/stellar-sdk";
 import { basicNodeSigner } from "@stellar/stellar-sdk/minimal/contract";
 import { env, WorkflowEntrypoint, WorkflowEvent, WorkflowStep, WorkflowStepConfig } from "cloudflare:workers";
 import { Client as SmolClient } from "smol-sdk";
 import { purgeCacheByTags } from "./utils/cache";
-
-// const keypair = Keypair.fromRawEd25519Seed(hash(Buffer.from('kalepail')));
-// const publicKey = keypair.publicKey();
 
 const KP = Keypair.fromSecret(env.SK)
 const PK = KP.publicKey()
@@ -19,14 +17,41 @@ const config: WorkflowStepConfig = {
     timeout: '5 minutes',
 }
 
+/**
+ * Poll Stellar RPC for transaction result and extract returnValue.
+ * Waits for the transaction to be confirmed on-chain.
+ */
+async function getTransactionResult(hash: string, rpcUrl: string): Promise<string> {
+    const rpcServer = new rpc.Server(rpcUrl);
+    const timeout = 30000;
+    const pollInterval = 1000;
+    const startTime = Date.now();
+
+    while (Date.now() - startTime < timeout) {
+        const result = await rpcServer.getTransaction(hash);
+
+        if (result.status === 'SUCCESS') {
+            if (!result.returnValue) {
+                throw new Error(`Transaction ${hash} succeeded but has no returnValue`);
+            }
+            return result.returnValue.toXDR('base64');
+        } else if (result.status === 'FAILED') {
+            throw new Error(`Transaction ${hash} failed on-chain`);
+        }
+
+        // NOT_FOUND - transaction not yet in ledger, keep polling
+        await new Promise(resolve => setTimeout(resolve, pollInterval));
+    }
+
+    throw new Error(`Timeout waiting for transaction ${hash} confirmation`);
+}
+
 export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
     async run(event: WorkflowEvent<WorkflowTxParams>, step: WorkflowStep) {
-        const body = new FormData();
-
         const res = await step.do(
             'submit transaction',
             config,
-            async (): Promise<any> => {
+            async (): Promise<{ hash: string; returnValue: string }> => {
                 let xdrEnvelope: string
 
                 switch (event.payload.type) {
@@ -40,24 +65,21 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
                         throw new Error('Invalid transaction type');
                 }
 
-                body.append('xdr', xdrEnvelope);
+                // Submit via kale-worker service binding (bypasses Turnstile auth)
+                const result = await this.env.KALE_WORKER.submitTransaction({ xdr: xdrEnvelope });
 
-                return this.env.LAUNCHTUBE.fetch('http://launchtube/', {
-                    method: 'POST',
-                    headers: {
-                        'Authorization': `Bearer ${this.env.LAUNCHTUBE_TOKEN}`,
-                    },
-                    body,
-                })
-                .then(async (res) => {
-                    if (!res.ok) {
-                        throw await res.text()
-                    }
+                if (result.error) {
+                    throw new Error(`Transaction failed: ${result.error} (${result.errorCode})`);
+                }
 
-                    // Response contains mint metadata we persist in a follow-up step
+                if (!result.hash) {
+                    throw new Error('Transaction submitted but no hash returned');
+                }
 
-                    return res.json()
-                })
+                // Fetch the returnValue from Stellar RPC using the transaction hash
+                const returnValue = await getTransactionResult(result.hash, this.env.RPC_URL);
+
+                return { hash: result.hash, returnValue };
             }
         );
 

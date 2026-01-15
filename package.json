@@ -9,18 +9,18 @@
 		"typecheck": "tsc --noEmit"
 	},
 	"devDependencies": {
-		"@cloudflare/workers-types": "^4.20260107.1",
-		"@types/node": "^25.0.3",
+		"@cloudflare/workers-types": "^4.20260115.0",
+		"@types/node": "^25.0.8",
 		"itty-fetcher": "^1.0.10",
 		"typescript": "^5.9.3",
-		"wrangler": "^4.57.0"
+		"wrangler": "^4.59.2"
 	},
 	"dependencies": {
 		"@simplewebauthn/server": "^13.2.2",
-		"music-metadata": "^10.6.4",
+		"music-metadata": "^11.10.6",
 		"@stellar/stellar-sdk": "^14.4.3",
 		"base64url": "^3.0.1",
-		"hono": "^4.11.3",
+		"hono": "^4.11.4",
 		"jimp": "^1.6.0",
 		"smol-sdk": "file:./ext/smol-sdk"
 	}

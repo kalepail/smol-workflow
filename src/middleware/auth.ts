@@ -17,7 +17,7 @@ export async function parseAuth(c: Context<HonoEnv>, next: Next) {
 		if (token === c.env.SECRET) {
 			// Admin token
 		} else if (token) {
-			c.set('jwtPayload', await verify(token, c.env.SECRET))
+			c.set('jwtPayload', await verify(token, c.env.SECRET, 'HS256'))
 		} else {
 			throw new HTTPException(401, { message: 'Invalid "Authorization" header' })
 		}
@@ -25,7 +25,7 @@ export async function parseAuth(c: Context<HonoEnv>, next: Next) {
 		const token = getCookie(c, 'smol_token')
 
 		if (token) {
-			c.set('jwtPayload', await verify(token, c.env.SECRET))
+			c.set('jwtPayload', await verify(token, c.env.SECRET, 'HS256'))
 		} else {
 			throw new HTTPException(401, { message: 'Invalid "Cookie" token' })
 		}
@@ -50,7 +50,7 @@ export async function optionalAuth(c: Context<HonoEnv>, next: Next) {
 
 	if (token) {
 		try {
-			c.set('jwtPayload', await verify(token, c.env.SECRET))
+			c.set('jwtPayload', await verify(token, c.env.SECRET, 'HS256'))
 		} catch {
 			/* ignore invalid */
 		}
