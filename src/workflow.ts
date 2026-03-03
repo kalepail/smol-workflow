@@ -6,6 +6,7 @@ import { checkNSFW } from './ai/nsfw';
 import { NonRetryableError } from 'cloudflare:workflows';
 import { purgePlaylistCache, purgeUserCreatedCache, purgePublicSmolsCache } from './utils/cache';
 import { decideSongsStrategy, pollUntilComplete } from './utils/songs';
+import { isDurableObjectId } from './utils/durable-object-id';
 
 /**
  * Smol Generation Workflow
@@ -54,31 +55,34 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 		// =====================================================================
 		// STEP 1: Load retry state (if this is a retry)
 		// =====================================================================
-		if (retry_id) {
-			await step.do(
-				'retry workflow',
-				config,
-				async () => {
-					try {
-						const retry_doid = this.env.DURABLE_OBJECT.idFromString(retry_id);
-						const retry_stub = this.env.DURABLE_OBJECT.get(retry_doid);
+			if (retry_id) {
+				await step.do(
+					'retry workflow',
+					config,
+					async () => {
+						if (isDurableObjectId(retry_id)) {
+							try {
+								const retry_doid = this.env.DURABLE_OBJECT.idFromString(retry_id);
+								const retry_stub = this.env.DURABLE_OBJECT.get(retry_doid);
 
-						retry_steps = await retry_stub.getSteps() as WorkflowSteps;
+								retry_steps = await retry_stub.getSteps() as WorkflowSteps;
+							} catch (err) {
+								console.warn('Retry DO lookup failed, falling back to KV', retry_id, err);
+							}
+						}
+
+						if (!retry_steps) {
+							// Fallback for legacy gens and invalid/non-DO IDs
+							retry_steps = await this.env.SMOL_KV.get(retry_id, 'json') as WorkflowSteps;
+						}
+
 						payload = {
 							...payload, // original payload
 							...retry_steps?.payload // previous payload (notably we keep the original address)
 						};
-					} catch (err) {
-						// Fallback for legacy gens
-						retry_steps = await this.env.SMOL_KV.get(retry_id, 'json') as WorkflowSteps;
-						payload = {
-							...payload,
-							...retry_steps?.payload
-						};
 					}
-				}
-			);
-		}
+				);
+			}
 
 		const { address, prompt, public: is_public = true, instrumental: is_instrumental = false } = payload;
 
@@ -90,8 +94,12 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 			throw new NonRetryableError("Missing prompt: please provide a description for your smol");
 		}
 
-		const doid = this.env.DURABLE_OBJECT.idFromString(event.instanceId);
-		const stub = this.env.DURABLE_OBJECT.get(doid);
+			if (!isDurableObjectId(event.instanceId)) {
+				throw new NonRetryableError(`Invalid workflow instance ID: ${event.instanceId}`);
+			}
+
+			const doid = this.env.DURABLE_OBJECT.idFromString(event.instanceId);
+			const stub = this.env.DURABLE_OBJECT.get(doid);
 
 		await step.do('save payload', config, async () => stub.saveStep('payload', payload));
 
@@ -234,16 +242,20 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 				songs,
 			}));
 
-			// Cleanup old retry data if this is a retry
-			if (retry_id) {
-				try {
-					const retry_doid = this.env.DURABLE_OBJECT.idFromString(retry_id);
-					const retry_stub = this.env.DURABLE_OBJECT.get(retry_doid);
-					await retry_stub.setToFlush();
-				} catch { }
+				// Cleanup old retry data if this is a retry
+				if (retry_id) {
+					if (isDurableObjectId(retry_id)) {
+						try {
+							const retry_doid = this.env.DURABLE_OBJECT.idFromString(retry_id);
+							const retry_stub = this.env.DURABLE_OBJECT.get(retry_doid);
+							await retry_stub.setToFlush();
+						} catch (err) {
+							console.warn('Retry DO cleanup failed, continuing', retry_id, err);
+						}
+					}
 
-				await this.env.SMOL_D1.prepare(`DELETE FROM Smols WHERE Id = ?1`).bind(retry_id).run();
-				await this.env.SMOL_KV.delete(retry_id);
+					await this.env.SMOL_D1.prepare(`DELETE FROM Smols WHERE Id = ?1`).bind(retry_id).run();
+					await this.env.SMOL_KV.delete(retry_id);
 
 				// Clean up orphaned R2 files from retry
 				await this.env.SMOL_BUCKET.delete(`${retry_id}.png`);

@@ -35,7 +35,10 @@ export async function verifyRegistration(host: string, response: RegistrationRes
             requireUserVerification: false,
         });
     } catch(err) {
-        console.error(err);
+        const message = err instanceof Error ? err.message : String(err);
+        if (message.includes('Unexpected RP ID hash')) {
+            throw new HTTPException(400, { message: 'Passkey origin does not match this domain' });
+        }
         throw new HTTPException(400, { message: 'Could not verify authentication' });
     }
 }
@@ -217,7 +220,10 @@ export async function verifyAuthentication(
             requireUserVerification: false,
         });
     } catch(err) {
-        console.error(err);
+        const message = err instanceof Error ? err.message : String(err);
+        if (message.includes('Unexpected RP ID hash')) {
+            throw new HTTPException(400, { message: 'Passkey origin does not match this domain' });
+        }
         throw new HTTPException(400, { message: 'Could not verify authentication' });
     }
 }

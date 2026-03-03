@@ -35,8 +35,12 @@ export async function purgeCacheByTags(tags: string[]): Promise<boolean> {
 		)
 
 		if (!response.ok) {
-			const error = await response.text()
-			console.error('Cache purge failed:', response.status, error)
+			const error = (await response.text()).slice(0, 300)
+			if (response.status === 401 || response.status === 403) {
+				console.warn('Cache purge skipped due auth error:', response.status)
+			} else {
+				console.error('Cache purge failed:', response.status, error)
+			}
 			return false
 		}
 
@@ -44,7 +48,7 @@ export async function purgeCacheByTags(tags: string[]): Promise<boolean> {
 		console.log('Cache purged successfully for tags:', tags)
 		return result.success
 	} catch (error) {
-		console.error('Cache purge error:', error)
+		console.warn('Cache purge error:', error)
 		return false
 	}
 }

@@ -8,6 +8,10 @@ import { verifyRegistration, verifyAuthentication, type Protocol } from '../pass
 
 const auth = new Hono<HonoEnv>()
 
+function isResponseLike(value: unknown): value is RegistrationResponseJSON | AuthenticationResponseJSON {
+	return typeof value === 'object' && value !== null
+}
+
 auth.post('/login', async (c) => {
 	const { env, req } = c
 	const body = await req.json()
@@ -29,12 +33,18 @@ auth.post('/login', async (c) => {
 
 	switch (type) {
 		case 'create':
+			if (!isResponseLike(response)) {
+				throw new HTTPException(400, { message: 'Missing or invalid passkey response' })
+			}
 			await verifyRegistration(host, response as RegistrationResponseJSON)
 			await env.SMOL_D1.prepare(`INSERT INTO Users ("Address", Username) VALUES (?1, ?2)`)
 				.bind(contractId, username)
 				.run()
 			break
 		case 'connect':
+			if (!keyId || !contractId || !isResponseLike(response)) {
+				throw new HTTPException(400, { message: 'Missing required login fields' })
+			}
 			const rpcUrl = network === 'testnet' ? env.RPC_URL_TESTNET : env.RPC_URL
 			await verifyAuthentication(host, keyId, contractId, response as AuthenticationResponseJSON, rpcUrl, protocol)
 			const user = await env.SMOL_D1.prepare(`SELECT Username FROM Users WHERE "Address" = ?1`)

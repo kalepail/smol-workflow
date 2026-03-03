@@ -12,6 +12,7 @@ import {
 	purgeCacheByTags,
 	userCacheKeyGenerator,
 } from '../utils/cache'
+import { isDurableObjectId } from '../utils/durable-object-id'
 
 const smols = new Hono<HonoEnv>()
 
@@ -271,12 +272,16 @@ smols.get(
 			}
 
 			return response
-		}
+			}
 
-		// Not yet in D1 → fetch from DO / workflow (in-progress SMOL)
-		const doid = env.DURABLE_OBJECT.idFromString(id)
-		const stub = env.DURABLE_OBJECT.get(doid)
-		const instance = await new Promise<WorkflowInstance | null>(async (resolve) => {
+			// Not yet in D1 → fetch from DO / workflow (in-progress SMOL)
+			if (!isDurableObjectId(id)) {
+				throw new HTTPException(404, { message: 'Smol not found' })
+			}
+
+			const doid = env.DURABLE_OBJECT.idFromString(id)
+			const stub = env.DURABLE_OBJECT.get(doid)
+			const instance = await new Promise<WorkflowInstance | null>(async (resolve) => {
 			try {
 				resolve(await env.WORKFLOW.get(id))
 			} catch {
@@ -438,9 +443,11 @@ smols.delete('/:id', parseAuth, async (c) => {
 	const smol: any = await env.SMOL_KV.get(id, 'json')
 
 	try {
-		const doid = env.DURABLE_OBJECT.idFromString(id)
-		const stub = env.DURABLE_OBJECT.get(doid)
-		await stub.setToFlush()
+		if (isDurableObjectId(id)) {
+			const doid = env.DURABLE_OBJECT.idFromString(id)
+			const stub = env.DURABLE_OBJECT.get(doid)
+			await stub.setToFlush()
+		}
 	} catch {}
 
 	await env.SMOL_KV.delete(id)
