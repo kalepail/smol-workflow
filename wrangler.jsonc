@@ -85,7 +85,7 @@
                 "queue": "smol-search-queue",
                 "max_batch_size": 10,
                 "max_batch_timeout": 5,
-                "max_retries": 8,
+                "max_retries": 12,
                 "dead_letter_queue": "smol-search-queue-dlq",
                 "retry_delay": 5
             },

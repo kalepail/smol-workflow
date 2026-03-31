@@ -10,7 +10,8 @@ const SEARCH_RRF_K = 60
 const SEARCH_MAX_LIMIT = 20
 const SEARCH_HYDRATION_BATCH = 40
 const SEARCH_FINALIZE_DELAY_SECONDS = 8
-const SEARCH_FINALIZE_MAX_ATTEMPTS = 8
+const SEARCH_FINALIZE_MAX_DELAY_SECONDS = 90
+const SEARCH_FINALIZE_MAX_ATTEMPTS = 12
 const SEARCH_BACKFILL_UPSERT_BATCH_SIZE = 12
 const MAX_LYRICS_CHARS = 5000
 const MAX_TAG_EXTRACTION_LYRICS_CHARS = 3000
@@ -451,13 +452,124 @@ export function normalizeMetadataPhrase(value: unknown, fallback: string): strin
 	return normalized || fallback
 }
 
-export function normalizeMetadataEnum<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
+function buildMetadataEnumAliasMap<T extends string>(aliases: Record<T, readonly string[]>): Map<string, T> {
+	const map = new Map<string, T>()
+	for (const [canonical, values] of Object.entries(aliases) as Array<[T, readonly string[]]>) {
+		map.set(canonical, canonical)
+		for (const value of values) {
+			map.set(value, canonical)
+		}
+	}
+	return map
+}
+
+function normalizeMetadataEnumToken(value: string): string {
+	return normalizeText(value)
+		.toLowerCase()
+		.replace(/[’']/g, '')
+		.replace(/&/g, 'and')
+		.replace(/[^a-z0-9]+/g, '-')
+		.replace(/^-+|-+$/g, '')
+}
+
+const LYRIC_PRESENCE_ALIASES = buildMetadataEnumAliasMap<SearchStoredMetadata['lyric_presence']>({
+	instrumental: ['no-lyrics', 'no-vocals', 'no-vocal', 'wordless', 'purely-instrumental'],
+	sparse: ['light-lyrics', 'minimal-lyrics', 'few-lyrics', 'some-lyrics', 'occasional-lyrics'],
+	'lyric-heavy': ['lyric-heavy', 'lyrics-heavy', 'lyric-dense', 'vocal-heavy', 'vocal-forward', 'full-lyrics'],
+})
+
+const BRIGHTNESS_LEVEL_ALIASES = buildMetadataEnumAliasMap<SearchStoredMetadata['brightness_level']>({
+	dark: ['dim', 'shadowy', 'moody'],
+	neutral: ['medium', 'balanced', 'moderate', 'mid', 'midtone'],
+	bright: ['vivid', 'sunny', 'glowing'],
+})
+
+const ENERGY_LEVEL_ALIASES = buildMetadataEnumAliasMap<SearchStoredMetadata['energy_level']>({
+	low: ['calm', 'gentle', 'soft', 'laid-back'],
+	mid: ['medium', 'moderate', 'balanced', 'steady'],
+	high: ['energetic', 'intense', 'driving', 'aggressive', 'hard-hitting'],
+})
+
+const MODALITY_GUESS_ALIASES = buildMetadataEnumAliasMap<SearchStoredMetadata['modality_guess']>({
+	minor: ['mostly-minor'],
+	major: ['mostly-major'],
+	mixed: ['ambiguous', 'both', 'major-minor', 'dual', 'bittersweet'],
+	unknown: ['unclear', 'undetermined', 'atonal', 'n-a'],
+})
+
+export function normalizeMetadataEnum<T extends string>(
+	value: unknown,
+	allowed: readonly T[],
+	fallback: T,
+	aliases?: ReadonlyMap<string, T>
+): T {
 	if (typeof value !== 'string') {
 		return fallback
 	}
 
-	const normalized = normalizeText(value).toLowerCase() as T
-	return allowed.includes(normalized) ? normalized : fallback
+	const normalized = normalizeMetadataEnumToken(value)
+	if (!normalized) {
+		return fallback
+	}
+
+	const canonical = aliases?.get(normalized) ?? normalized
+	return allowed.includes(canonical as T) ? canonical as T : fallback
+}
+
+function stripMarkdownCodeFence(value: string): string {
+	const trimmed = value.trim()
+	const match = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)
+	return match?.[1]?.trim() ?? trimmed
+}
+
+function extractJsonObjectSubstring(value: string): string | null {
+	const start = value.indexOf('{')
+	if (start < 0) {
+		return null
+	}
+
+	let depth = 0
+	let inString = false
+	let escaping = false
+
+	for (let index = start; index < value.length; index += 1) {
+		const character = value[index]
+		if (!character) {
+			continue
+		}
+
+		if (inString) {
+			if (escaping) {
+				escaping = false
+			} else if (character === '\\') {
+				escaping = true
+			} else if (character === '"') {
+				inString = false
+			}
+			continue
+		}
+
+		if (character === '"') {
+			inString = true
+			continue
+		}
+
+		if (character === '{') {
+			depth += 1
+			continue
+		}
+
+		if (character !== '}') {
+			continue
+		}
+
+		depth -= 1
+		if (depth === 0) {
+			return value.slice(start, index + 1)
+		}
+	}
+
+	return null
 }
 
 export function tryParseJsonObject(value: string | Record<string, unknown> | undefined): Record<string, unknown> | null {
@@ -466,14 +578,27 @@ export function tryParseJsonObject(value: string | Record<string, unknown> | und
 	}
 
 	if (typeof value === 'string') {
-		try {
-			const parsed = JSON.parse(value) as unknown
-			return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-				? parsed as Record<string, unknown>
-				: null
-		} catch {
-			return null
+		const trimmed = value.trim()
+		const unfenced = stripMarkdownCodeFence(trimmed)
+		const candidates = [...new Set([
+			trimmed,
+			unfenced,
+			extractJsonObjectSubstring(unfenced) ?? undefined,
+			extractJsonObjectSubstring(trimmed) ?? undefined,
+		].filter((candidate): candidate is string => Boolean(candidate)))]
+
+		for (const candidate of candidates) {
+			try {
+				const parsed = JSON.parse(candidate) as unknown
+				if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+					return parsed as Record<string, unknown>
+				}
+			} catch {
+				continue
+			}
 		}
+
+		return null
 	}
 
 	return Array.isArray(value) ? null : value
@@ -491,10 +616,30 @@ export function normalizeExtractedSearchMetadata(
 		style_primary: normalizeMetadataPhrase(value.style_primary, fallback.style_primary),
 		mood_primary: normalizeMetadataPhrase(value.mood_primary, fallback.mood_primary),
 		theme_primary: normalizeMetadataPhrase(value.theme_primary, fallback.theme_primary),
-		lyric_presence: normalizeMetadataEnum(value.lyric_presence, ['instrumental', 'sparse', 'lyric-heavy'], fallback.lyric_presence),
-		brightness_level: normalizeMetadataEnum(value.brightness_level, ['dark', 'neutral', 'bright'], fallback.brightness_level),
-		energy_level: normalizeMetadataEnum(value.energy_level, ['low', 'mid', 'high'], fallback.energy_level),
-		modality_guess: normalizeMetadataEnum(value.modality_guess, ['minor', 'major', 'mixed', 'unknown'], fallback.modality_guess),
+		lyric_presence: normalizeMetadataEnum(
+			value.lyric_presence,
+			['instrumental', 'sparse', 'lyric-heavy'],
+			fallback.lyric_presence,
+			LYRIC_PRESENCE_ALIASES
+		),
+		brightness_level: normalizeMetadataEnum(
+			value.brightness_level,
+			['dark', 'neutral', 'bright'],
+			fallback.brightness_level,
+			BRIGHTNESS_LEVEL_ALIASES
+		),
+		energy_level: normalizeMetadataEnum(
+			value.energy_level,
+			['low', 'mid', 'high'],
+			fallback.energy_level,
+			ENERGY_LEVEL_ALIASES
+		),
+		modality_guess: normalizeMetadataEnum(
+			value.modality_guess,
+			['minor', 'major', 'mixed', 'unknown'],
+			fallback.modality_guess,
+			MODALITY_GUESS_ALIASES
+		),
 	}
 }
 
@@ -1697,7 +1842,7 @@ async function handleQueueMessage(message: Message<SearchQueueMessage>, env: Env
 			return result.action === 'retry'
 				? {
 					action: 'retry',
-					delaySeconds: Math.min(60, result.delaySeconds * Math.max(1, message.attempts)),
+					delaySeconds: Math.min(SEARCH_FINALIZE_MAX_DELAY_SECONDS, result.delaySeconds * Math.max(1, message.attempts)),
 				}
 				: result
 		}

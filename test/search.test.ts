@@ -3,11 +3,13 @@ import { createHash } from 'node:crypto'
 import test from 'node:test'
 import {
 	isSearchQueryableState,
+	normalizeExtractedSearchMetadata,
 	processSearchQueue,
 	queueSearchIndexingBatchById,
 	queueSearchIndexingById,
 	reconcileSearchIndexingBatchById,
 	SEARCH_INDEX_VERSION,
+	tryParseJsonObject,
 } from '../src/utils/search'
 import { requireOwnedVisibilityToggle } from '../src/utils/search-visibility'
 
@@ -843,6 +845,56 @@ test('upsert reuses cached metadata when the source hash is unchanged', async ()
 	assert.equal(queued.acked, 1)
 	assert.equal(getAiCalls().metadata, 0)
 	assert.equal(getAiCalls().embedding, 1)
+})
+
+test('tryParseJsonObject extracts wrapped JSON objects from model output', () => {
+	const parsed = tryParseJsonObject(`Here is the JSON you requested:
+
+\`\`\`json
+{
+  "style_primary": "dream pop",
+  "mood_primary": "dreamy"
+}
+\`\`\`
+
+Use it directly.`)
+
+	assert.deepEqual(parsed, {
+		style_primary: 'dream pop',
+		mood_primary: 'dreamy',
+	})
+})
+
+test('normalizeExtractedSearchMetadata maps common enum aliases to the schema contract', () => {
+	const normalized = normalizeExtractedSearchMetadata({
+		style_primary: 'Progressive Metal',
+		mood_primary: 'Hard-Hitting',
+		theme_primary: 'Cosmic',
+		lyric_presence: 'full lyrics',
+		brightness_level: 'balanced',
+		energy_level: 'energetic',
+		modality_guess: 'ambiguous',
+	}, {
+		style_primary: 'fallback style',
+		mood_primary: 'fallback mood',
+		theme_primary: 'fallback theme',
+		lyric_presence: 'sparse',
+		brightness_level: 'neutral',
+		energy_level: 'mid',
+		modality_guess: 'unknown',
+		style_tags: [],
+		title: 'Fallback',
+	})
+
+	assert.deepEqual(normalized, {
+		style_primary: 'progressive metal',
+		mood_primary: 'hard-hitting',
+		theme_primary: 'cosmic',
+		lyric_presence: 'lyric-heavy',
+		brightness_level: 'neutral',
+		energy_level: 'high',
+		modality_guess: 'mixed',
+	})
 })
 
 test('reconcile marks failed records ready once the processed watermark has moved past them', async () => {
