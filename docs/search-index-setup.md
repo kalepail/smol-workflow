@@ -60,14 +60,19 @@ Vectorize watermark and runs reconcile between waves so it stops when Vectorize 
 instead of piling on more mutations:
 
 ```bash
-SMOL_ADMIN_SECRET=... npm run backfill:search -- --page-limit=20 --max-waves=10
+SMOL_ADMIN_SECRET=... npm run backfill:search -- --resume-from-state --max-waves=10
 ```
 
 This script requires:
 - local Wrangler auth, because it polls `wrangler vectorize info`
 - `SMOL_ADMIN_SECRET`, because it calls the admin backfill/reconcile routes
 
-If the script reports a stall, resume later with the cursor it prints.
+By default it now:
+- polls every 30 seconds
+- tolerates longer stalls before exiting
+- writes checkpoint state to `.wrangler/tmp/search-backfill-state.json`
+
+If the script reports a stall, resume later with `--resume-from-state` or the cursor it prints.
 
 ## Notes
 

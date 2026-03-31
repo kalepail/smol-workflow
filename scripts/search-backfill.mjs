@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
 import { execFile } from 'node:child_process'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import path from 'node:path'
 import process from 'node:process'
 import { promisify } from 'node:util'
 
@@ -13,10 +15,12 @@ function parseArgs(argv) {
 		indexName: process.env.SMOL_SEARCH_INDEX_NAME ?? 'smol-search-index',
 		pageLimit: 20,
 		maxWaves: Infinity,
-		pollIntervalSeconds: 20,
-		maxStallPolls: 6,
+		pollIntervalSeconds: 30,
+		maxStallPolls: 20,
 		cursor: undefined,
+		stateFile: path.join(process.cwd(), '.wrangler', 'tmp', 'search-backfill-state.json'),
 		force: false,
+		resumeFromState: false,
 		help: false,
 	}
 
@@ -28,6 +32,11 @@ function parseArgs(argv) {
 
 		if (arg === '--force') {
 			options.force = true
+			continue
+		}
+
+		if (arg === '--resume-from-state') {
+			options.resumeFromState = true
 			continue
 		}
 
@@ -59,6 +68,9 @@ function parseArgs(argv) {
 			case '--cursor':
 				options.cursor = value || undefined
 				break
+			case '--state-file':
+				options.stateFile = value || options.stateFile
+				break
 			default:
 				throw new Error(`Unknown argument: ${arg}`)
 		}
@@ -77,10 +89,12 @@ Options:
   --index=smol-search-index
   --page-limit=20
   --max-waves=10
-  --poll-interval=20
-  --max-stall-polls=6
+  --poll-interval=30
+  --max-stall-polls=20
   --cursor=CURSOR
+  --state-file=.wrangler/tmp/search-backfill-state.json
   --force
+  --resume-from-state
   --help
 `)
 }
@@ -136,6 +150,23 @@ async function fetchAdminJson(baseUrl, adminSecret, path, params = {}) {
 	return await response.json()
 }
 
+async function writeState(stateFile, payload) {
+	await mkdir(path.dirname(stateFile), { recursive: true })
+	await writeFile(stateFile, `${JSON.stringify({
+		updatedAt: new Date().toISOString(),
+		...payload,
+	}, null, 2)}\n`)
+}
+
+async function readState(stateFile) {
+	try {
+		const value = await readFile(stateFile, 'utf8')
+		return JSON.parse(value)
+	} catch {
+		return null
+	}
+}
+
 function formatInfo(info) {
 	return [
 		`vectorCount=${info.vectorCount}`,
@@ -164,6 +195,17 @@ async function waitForWave(options, wave) {
 		const advanced = info.processedUpToMutation !== lastMutation || (info.vectorCount ?? 0) > lastVectorCount
 		const pendingImproved = pending < lastPending
 		const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000)
+
+		await writeState(options.stateFile, {
+			status: 'waiting',
+			wave: wave.wave,
+			cursor: wave.cursor,
+			nextCursor: wave.nextCursor,
+			elapsedSeconds,
+			pending,
+			lastInfo: info,
+			lastReconcile: reconcile,
+		})
 
 		console.log(
 			`poll wave=${wave.wave} elapsed=${elapsedSeconds}s pending=${pending} ready=${reconcile.ready} requeued=${reconcile.requeued} ${formatInfo(info)}`
@@ -216,6 +258,13 @@ async function main() {
 	}
 
 	let cursor = options.cursor
+	if (!cursor && options.resumeFromState) {
+		const savedState = await readState(options.stateFile)
+		cursor = savedState?.resumeCursor ?? savedState?.cursor ?? savedState?.nextCursor ?? undefined
+		if (cursor) {
+			console.log(`resuming from state file cursor=${cursor}`)
+		}
+	}
 
 	for (let wave = 1; wave <= options.maxWaves; wave += 1) {
 		const before = await getVectorizeInfo(options.indexName)
@@ -231,17 +280,36 @@ async function main() {
 
 		const waveCursor = cursor
 		cursor = backfill.pagination?.nextCursor
+		await writeState(options.stateFile, {
+			status: 'wave-started',
+			wave,
+			cursor: waveCursor,
+			nextCursor: cursor,
+			lastInfo: before,
+			lastBackfill: backfill,
+			resumeCursor: waveCursor ?? cursor,
+		})
 
 		const shouldWait = backfill.queued > 0 || (backfill.queued === 0 && (backfill.skipped?.pending ?? 0) > 0)
 		if (shouldWait) {
 			const outcome = await waitForWave(options, {
 				wave,
 				cursor: waveCursor,
+				nextCursor: cursor,
 				before,
 				backfill,
 			})
 
 			if (outcome.status === 'stalled') {
+				await writeState(options.stateFile, {
+					status: 'stalled',
+					wave,
+					cursor: waveCursor,
+					nextCursor: cursor,
+					resumeCursor: waveCursor ?? cursor,
+					lastInfo: outcome.info,
+					lastReconcile: outcome.reconcile,
+				})
 				console.error(`stall detected after wave ${wave}. resume with --cursor=${waveCursor ?? ''}`)
 				process.exitCode = 2
 				return
@@ -249,11 +317,23 @@ async function main() {
 		}
 
 		if (!backfill.pagination?.hasMore) {
+			await writeState(options.stateFile, {
+				status: 'complete',
+				wave,
+				cursor: waveCursor,
+				nextCursor: cursor,
+				resumeCursor: cursor,
+			})
 			console.log('backfill complete for the current cursor range')
 			return
 		}
 	}
 
+	await writeState(options.stateFile, {
+		status: 'max-waves-reached',
+		nextCursor: cursor,
+		resumeCursor: cursor,
+	})
 	console.log(`stopped after max waves. resume with --cursor=${cursor ?? ''}`)
 }
 
