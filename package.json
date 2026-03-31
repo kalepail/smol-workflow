@@ -5,6 +5,7 @@
 		"start": "wrangler dev --test-scheduled",
 		"start:remote": "wrangler dev --remote --env dev",
 		"deploy": "wrangler deploy",
+		"backfill:search": "node scripts/search-backfill.mjs",
 		"typegen": "wrangler types --strict-vars=false",
 		"typecheck": "tsc --noEmit",
 		"test": "tsx --test test/**/*.test.ts"

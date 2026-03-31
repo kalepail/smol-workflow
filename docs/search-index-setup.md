@@ -55,6 +55,20 @@ curl -X POST \
 
 Repeat with the returned `pagination.nextCursor` until `hasMore` is `false`.
 
+For production, prefer the wave runner over manual curl loops. It paces backfill by the
+Vectorize watermark and runs reconcile between waves so it stops when Vectorize stalls
+instead of piling on more mutations:
+
+```bash
+SMOL_ADMIN_SECRET=... npm run backfill:search -- --page-limit=20 --max-waves=10
+```
+
+This script requires:
+- local Wrangler auth, because it polls `wrangler vectorize info`
+- `SMOL_ADMIN_SECRET`, because it calls the admin backfill/reconcile routes
+
+If the script reports a stall, resume later with the cursor it prints.
+
 ## Notes
 
 - Existing vectors inserted before metadata indexes were created must be re-upserted.
