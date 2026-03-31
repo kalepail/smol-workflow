@@ -114,6 +114,21 @@ export type BatchQueueResult = {
 	skipped: Record<BatchQueueSkipReason, number>
 }
 
+type ReconcileSkipReason = 'current' | 'hidden' | 'pending' | 'missing' | 'no_state'
+
+export type SearchReconcileResult = {
+	readyIds: string[]
+	requeuedIds: string[]
+	skipped: Record<ReconcileSkipReason, number>
+}
+
+type SearchIndexDescribeSnapshot = {
+	processedUpToMutation?: unknown
+	processedUpToDatetime?: unknown
+	vectorCount?: unknown
+	dimensions?: unknown
+}
+
 export type SearchMetadataExtraction = Pick<
 	SearchStoredMetadata,
 	| 'style_primary'
@@ -510,6 +525,14 @@ function normalizeMutationTimestamp(value: unknown): number | undefined {
 }
 
 async function getSearchMutationProgress(env: Env, search: SearchState | undefined): Promise<SearchMutationProgress> {
+	const info = await getSearchIndex(env).describe()
+	return getSearchMutationProgressFromInfo(search, info)
+}
+
+function getSearchMutationProgressFromInfo(
+	search: SearchState | undefined,
+	info: SearchIndexDescribeSnapshot
+): SearchMutationProgress {
 	const mutationId = normalizeMutationTrackerValue(search?.mutation_id)
 	if (!mutationId) {
 		return {
@@ -517,31 +540,30 @@ async function getSearchMutationProgress(env: Env, search: SearchState | undefin
 		}
 	}
 
-	const info = await getSearchIndex(env).describe()
 	const processedMutation = normalizeMutationTrackerValue(info.processedUpToMutation)
 	if (processedMutation === mutationId) {
 		return {
 			isProcessed: true,
-			mutationId,
-			processedMutation,
-			requestedAt: normalizeMutationTimestamp(search?.mutation_requested_at ?? search?.queued_at),
-			processedAt: normalizeMutationTimestamp(info.processedUpToDatetime),
-			vectorCount: info.vectorCount,
-			dimensions: info.dimensions,
+				mutationId,
+				processedMutation,
+				requestedAt: normalizeMutationTimestamp(search?.mutation_requested_at ?? search?.queued_at),
+				processedAt: normalizeMutationTimestamp(info.processedUpToDatetime),
+				vectorCount: typeof info.vectorCount === 'number' ? info.vectorCount : undefined,
+				dimensions: typeof info.dimensions === 'number' ? info.dimensions : undefined,
+			}
 		}
-	}
 
 	const processedAt = normalizeMutationTimestamp(info.processedUpToDatetime)
 	const requestedAt = normalizeMutationTimestamp(search?.mutation_requested_at ?? search?.queued_at)
 	return {
 		isProcessed: processedAt !== undefined && requestedAt !== undefined && processedAt >= requestedAt,
 		mutationId,
-		processedMutation,
-		requestedAt,
-		processedAt,
-		vectorCount: info.vectorCount,
-		dimensions: info.dimensions,
-	}
+			processedMutation,
+			requestedAt,
+			processedAt,
+			vectorCount: typeof info.vectorCount === 'number' ? info.vectorCount : undefined,
+			dimensions: typeof info.dimensions === 'number' ? info.dimensions : undefined,
+		}
 }
 
 async function extractSearchMetadata(env: Env, source: SmolIndexSource): Promise<SearchStoredMetadata> {
@@ -1454,6 +1476,89 @@ export async function queueSearchIndexingBatchById(
 		queuedIds,
 		skipped,
 	}
+}
+
+export async function reconcileSearchIndexingBatchById(env: Env, smolIds: string[]): Promise<SearchReconcileResult> {
+	const uniqueSmolIds = uniqueStrings(smolIds)
+	const result: SearchReconcileResult = {
+		readyIds: [],
+		requeuedIds: [],
+		skipped: {
+			current: 0,
+			hidden: 0,
+			pending: 0,
+			missing: 0,
+			no_state: 0,
+		},
+	}
+
+	if (!uniqueSmolIds.length) {
+		return result
+	}
+
+	const info = await getSearchIndex(env).describe()
+	const watermark = {
+		processedMutation: normalizeMutationTrackerValue(info.processedUpToMutation),
+		processedAt: normalizeMutationTimestamp(info.processedUpToDatetime),
+	}
+
+	for (const smolId of uniqueSmolIds) {
+		const record = await getStoredSmolRecord(env, smolId)
+		if (!record) {
+			result.skipped.missing += 1
+			continue
+		}
+
+		const search = record.search
+		if (!search || search.version !== SEARCH_INDEX_VERSION) {
+			result.skipped.no_state += 1
+			continue
+		}
+
+		if (search.status === 'hidden') {
+			result.skipped.hidden += 1
+			continue
+		}
+
+		if (isSearchQueryableState(search)) {
+			result.skipped.current += 1
+			continue
+		}
+
+		const progress = getSearchMutationProgressFromInfo(search, info)
+		if (progress.isProcessed) {
+			await setSearchState(env, smolId, (existing) => ({
+				...(existing ?? createQueuedSearchState()),
+				status: 'ready',
+				version: SEARCH_INDEX_VERSION,
+				queued_at: existing?.queued_at,
+				indexed_at: nowIso(),
+				source_hash: existing?.source_hash,
+				vector_ids: existing?.vector_ids,
+				metadata: existing?.metadata,
+				last_error: undefined,
+				mutation_id: existing?.mutation_id,
+				mutation_requested_at: existing?.mutation_requested_at,
+			}))
+			result.readyIds.push(smolId)
+			continue
+		}
+
+		if (isSearchMutationStillPending(search, watermark)) {
+			result.skipped.pending += 1
+			continue
+		}
+
+		const queued = await queueSearchIndexingById(env, smolId)
+		if (queued) {
+			result.requeuedIds.push(smolId)
+			continue
+		}
+
+		result.skipped.missing += 1
+	}
+
+	return result
 }
 
 export async function hideSmolFromSearch(env: Env, smolId: string): Promise<boolean> {

@@ -6,6 +6,7 @@ import {
 	processSearchQueue,
 	queueSearchIndexingBatchById,
 	queueSearchIndexingById,
+	reconcileSearchIndexingBatchById,
 	SEARCH_INDEX_VERSION,
 } from '../src/utils/search'
 import { requireOwnedVisibilityToggle } from '../src/utils/search-visibility'
@@ -539,6 +540,80 @@ function createReadyRequeueEnv() {
 	}
 }
 
+function createReconcileEnv() {
+	let records: Record<string, WorkflowSteps> = {
+		'smol-ready': {
+			payload: {},
+			image_base64: undefined,
+			description: 'Timed out but now processed',
+			lyrics: {
+				title: 'Recovered Song',
+				style: ['dream pop'],
+				lyrics: 'hello world',
+			},
+			nsfw: 'safe',
+			song_ids: undefined,
+			songs: undefined,
+			search: {
+				status: 'failed',
+				version: SEARCH_INDEX_VERSION,
+				queued_at: '2026-03-31T12:00:00.000Z',
+				mutation_id: 'mutation-ready',
+				mutation_requested_at: '2026-03-31T12:00:05.000Z',
+				vector_ids: ['smol-ready:style'],
+			},
+		},
+		'smol-requeue': {
+			payload: {},
+			image_base64: undefined,
+			description: 'Failed long ago',
+			lyrics: {
+				title: 'Retry Song',
+				style: ['folk'],
+				lyrics: 'hello world',
+			},
+			nsfw: 'safe',
+			song_ids: undefined,
+			songs: undefined,
+			search: {
+				status: 'failed',
+				version: SEARCH_INDEX_VERSION,
+				queued_at: '2026-03-31T11:00:00.000Z',
+			},
+		},
+	}
+
+	const queuedMessages: SearchQueueMessage[] = []
+
+	const env = {
+		SMOL_KV: {
+			get: async (key: string) => records[key] ?? null,
+			put: async (key: string, value: string) => {
+				records[key] = JSON.parse(value) as WorkflowSteps
+			},
+		},
+		SMOL_SEARCH_INDEX: {
+			describe: async () => ({
+				vectorCount: 10,
+				dimensions: 1024,
+				processedUpToMutation: 'mutation-other',
+				processedUpToDatetime: '2026-03-31T12:30:00.000Z',
+			}),
+		},
+		SEARCH_QUEUE: {
+			send: async (message: SearchQueueMessage) => {
+				queuedMessages.push(message)
+			},
+		},
+	} as unknown as Env
+
+	return {
+		env,
+		getRecords: () => records,
+		getQueuedMessages: () => queuedMessages,
+	}
+}
+
 test('visibility toggle requires an owned row before any search sync can run', () => {
 	assert.throws(
 		() => requireOwnedVisibilityToggle(null),
@@ -768,6 +843,30 @@ test('upsert reuses cached metadata when the source hash is unchanged', async ()
 	assert.equal(queued.acked, 1)
 	assert.equal(getAiCalls().metadata, 0)
 	assert.equal(getAiCalls().embedding, 1)
+})
+
+test('reconcile marks failed records ready once the processed watermark has moved past them', async () => {
+	const { env, getRecords, getQueuedMessages } = createReconcileEnv()
+
+	const result = await reconcileSearchIndexingBatchById(env, ['smol-ready'])
+
+	assert.deepEqual(result.readyIds, ['smol-ready'])
+	assert.deepEqual(result.requeuedIds, [])
+	assert.equal(getRecords()['smol-ready']?.search?.status, 'ready')
+	assert.ok(getRecords()['smol-ready']?.search?.indexed_at)
+	assert.equal(getQueuedMessages().length, 0)
+})
+
+test('reconcile requeues failed records whose old mutation is no longer pending', async () => {
+	const { env, getRecords, getQueuedMessages } = createReconcileEnv()
+
+	const result = await reconcileSearchIndexingBatchById(env, ['smol-requeue'])
+
+	assert.deepEqual(result.readyIds, [])
+	assert.deepEqual(result.requeuedIds, ['smol-requeue'])
+	assert.equal(getRecords()['smol-requeue']?.search?.status, 'queued')
+	assert.equal(getQueuedMessages().length, 1)
+	assert.equal(getQueuedMessages()[0]?.type, 'upsert')
 })
 
 test('search state remains queryable while a previously indexed smol is being refreshed', async () => {

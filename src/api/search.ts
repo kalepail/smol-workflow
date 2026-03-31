@@ -2,7 +2,7 @@ import { Context, Hono } from 'hono'
 import { HTTPException } from 'hono/http-exception'
 import type { HonoEnv } from '../types'
 import { buildCursorWhereClause, buildPaginationResponse, parsePaginationParams } from '../utils/pagination'
-import { queueSearchIndexingBatchById, queueSearchIndexingById, searchPublicSmols, searchSimilarSmols } from '../utils/search'
+import { queueSearchIndexingBatchById, queueSearchIndexingById, reconcileSearchIndexingBatchById, searchPublicSmols, searchSimilarSmols } from '../utils/search'
 import { optionalAuth } from '../middleware/auth'
 
 const search = new Hono<HonoEnv>()
@@ -106,6 +106,50 @@ search.post('/admin/backfill', async (c) => {
 	return c.json({
 		queued: batch.queuedIds.length,
 		skipped: batch.skipped,
+		pagination,
+	})
+})
+
+search.post('/admin/reconcile', async (c) => {
+	assertAdminSecret(c)
+
+	const url = new URL(c.req.url)
+	const { limit, cursor } = parsePaginationParams(url)
+	const effectiveLimit = Math.min(limit, 100)
+	const whereClause = buildCursorWhereClause(cursor, 'Public = 1')
+	const bindings: unknown[] = []
+
+	let query = `
+		SELECT Id, Created_At
+		FROM Smols
+		WHERE ${whereClause[0]}
+		ORDER BY Created_At DESC, Id DESC
+		LIMIT ?
+	`
+
+	if (whereClause.length > 1) {
+		bindings.push(whereClause[1], whereClause[2], whereClause[3])
+	}
+
+	bindings.push(effectiveLimit)
+
+	const { results } = await c.env.SMOL_D1.prepare(query)
+		.bind(...bindings)
+		.all<{ Id: string; Created_At: string }>()
+
+	const reconcile = await reconcileSearchIndexingBatchById(c.env, results.map(({ Id }) => Id))
+	const pagination = buildPaginationResponse(
+		results,
+		effectiveLimit,
+		(item) => item.Created_At,
+		(item) => item.Id
+	)
+
+	c.header('Cache-Control', 'no-store')
+	return c.json({
+		ready: reconcile.readyIds.length,
+		requeued: reconcile.requeuedIds.length,
+		skipped: reconcile.skipped,
 		pagination,
 	})
 })
