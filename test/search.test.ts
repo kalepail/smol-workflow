@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { processSearchQueue, SEARCH_INDEX_VERSION } from '../src/utils/search'
+import {
+	isSearchQueryableState,
+	processSearchQueue,
+	queueSearchIndexingBatchById,
+	queueSearchIndexingById,
+	SEARCH_INDEX_VERSION,
+} from '../src/utils/search'
 import { requireOwnedVisibilityToggle } from '../src/utils/search-visibility'
 
 type MockPreparedStatement = {
@@ -165,6 +171,8 @@ function createFinalizeReadyEnv() {
 }
 
 function createUpsertRetryEnv() {
+	const queuedMessages: Array<{ message: SearchQueueMessage; delaySeconds?: number }> = []
+
 	const env = {
 		SMOL_KV: {
 			get: async () => null,
@@ -205,11 +213,16 @@ function createUpsertRetryEnv() {
 			}),
 		},
 		SEARCH_QUEUE: {
-			send: async () => undefined,
+			send: async (message: SearchQueueMessage, options?: { delaySeconds?: number }) => {
+				queuedMessages.push({ message, delaySeconds: options?.delaySeconds })
+			},
 		},
 	} as unknown as Env
 
-	return env
+	return {
+		env,
+		getQueuedMessages: () => queuedMessages,
+	}
 }
 
 function createInstrumentalUpsertEnv() {
@@ -253,9 +266,7 @@ function createInstrumentalUpsertEnv() {
 				if (model === '@cf/baai/bge-m3') {
 					const texts = (payload as { text: string[] }).text
 					return {
-						data: texts.map((_text, index) => ({
-							embedding: [index + 1, index + 2, index + 3],
-						})),
+						data: texts.map((_text, index) => [index + 1, index + 2, index + 3]),
 					}
 				}
 
@@ -316,6 +327,214 @@ function createInstrumentalUpsertEnv() {
 	}
 }
 
+function createBatchUpsertEnv() {
+	let records: Record<string, WorkflowSteps> = {
+		'smol-a': {
+			payload: {
+				prompt: 'Warm dream pop',
+			},
+			image_base64: undefined,
+			description: 'A dreamy late-night pop song',
+			lyrics: {
+				title: 'Neon River',
+				style: ['dream pop'],
+				lyrics: 'city lights drift softly through the night',
+			},
+			nsfw: 'safe',
+			song_ids: undefined,
+			songs: undefined,
+			search: {
+				status: 'queued',
+				version: SEARCH_INDEX_VERSION,
+				queued_at: '2026-03-31T12:00:00.000Z',
+			},
+		},
+		'smol-b': {
+			payload: {
+				prompt: 'Dusty desert folk',
+			},
+			image_base64: undefined,
+			description: 'A desert folk ballad with slow percussion',
+			lyrics: {
+				title: 'Dust Prayer',
+				style: ['folk'],
+				lyrics: 'embers move slowly under the silver moon',
+			},
+			nsfw: 'safe',
+			song_ids: undefined,
+			songs: undefined,
+			search: {
+				status: 'queued',
+				version: SEARCH_INDEX_VERSION,
+				queued_at: '2026-03-31T12:00:00.000Z',
+			},
+		},
+	}
+
+	const finalizeMessages: SearchQueueMessage[] = []
+	const queuedMessages: SearchQueueMessage[] = []
+	const upserts: VectorizeVector[][] = []
+
+	const env = {
+		AI: {
+			run: async (model: string, payload: unknown) => {
+				if (model === '@cf/meta/llama-3.2-3b-instruct') {
+					const title = (payload as { messages: Array<{ content: string }> }).messages[1]?.content ?? ''
+					if (title.includes('Neon River')) {
+						return {
+							response: {
+								style_primary: 'dream pop',
+								mood_primary: 'dreamy',
+								theme_primary: 'nightlife',
+								lyric_presence: 'sparse',
+								brightness_level: 'bright',
+								energy_level: 'mid',
+								modality_guess: 'major',
+							},
+						}
+					}
+
+					return {
+						response: {
+							style_primary: 'folk',
+							mood_primary: 'melancholic',
+							theme_primary: 'desert',
+							lyric_presence: 'sparse',
+							brightness_level: 'neutral',
+							energy_level: 'low',
+							modality_guess: 'minor',
+						},
+					}
+				}
+
+				if (model === '@cf/baai/bge-m3') {
+					const texts = (payload as { text: string[] }).text
+					return {
+						data: texts.map((_text, index) => [index + 1, index + 2, index + 3]),
+					}
+				}
+
+				throw new Error(`Unexpected model: ${model}`)
+			},
+		},
+		SMOL_KV: {
+			get: async (key: string) => records[key] ?? null,
+			put: async (key: string, value: string) => {
+				records[key] = JSON.parse(value) as WorkflowSteps
+			},
+		},
+		SMOL_D1: {
+			prepare(sql: string): MockPreparedStatement {
+				return {
+					bind(id: string) {
+						return {
+							first: async <T>() => {
+								if (!records[id]) {
+									return null as T | null
+								}
+
+								if (sql.includes('SELECT Id, Title, Public, Instrumental')) {
+									return {
+										Id: id,
+										Title: records[id]?.lyrics?.title ?? 'Song',
+										Public: 1,
+										Instrumental: 0,
+									} as T
+								}
+
+								if (sql.includes('SELECT Id')) {
+									return { Id: id } as T
+								}
+
+								return null as T | null
+							},
+							run: async () => ({ success: true }),
+						}
+					},
+				}
+			},
+		},
+		SMOL_SEARCH_INDEX: {
+			upsert: async (vectors: VectorizeVector[]) => {
+				upserts.push(vectors)
+				return { mutationId: 'batch-1' }
+			},
+		},
+		SEARCH_QUEUE: {
+			send: async (message: SearchQueueMessage) => {
+				queuedMessages.push(message)
+				if (message.type === 'finalize') {
+					finalizeMessages.push(message)
+				}
+			},
+		},
+	} as unknown as Env
+
+	return {
+		env,
+		getRecords: () => records,
+		getFinalizeMessages: () => finalizeMessages,
+		getQueuedMessages: () => queuedMessages,
+		getUpserts: () => upserts,
+	}
+}
+
+function createReadyRequeueEnv() {
+	let record: WorkflowSteps = {
+		payload: {},
+		image_base64: undefined,
+		description: 'A searchable song',
+		lyrics: {
+			title: 'Song',
+			style: ['dream pop'],
+			lyrics: 'hello world',
+		},
+		nsfw: 'safe',
+		song_ids: undefined,
+		songs: undefined,
+		search: {
+			status: 'ready',
+			version: SEARCH_INDEX_VERSION,
+			queued_at: '2026-03-31T12:00:00.000Z',
+			indexed_at: '2026-03-31T12:05:00.000Z',
+			vector_ids: ['smol-ready:style', 'smol-ready:title', 'smol-ready:lyrics', 'smol-ready:description'],
+			metadata: {
+				style_primary: 'dream pop',
+				mood_primary: 'dreamy',
+				theme_primary: 'night',
+				lyric_presence: 'lyric-heavy',
+				brightness_level: 'neutral',
+				energy_level: 'mid',
+				modality_guess: 'mixed',
+				style_tags: ['dream pop'],
+				title: 'Song',
+			},
+		},
+	}
+
+	const queueMessages: SearchQueueMessage[] = []
+
+	const env = {
+		SMOL_KV: {
+			get: async () => record,
+			put: async (_key: string, value: string) => {
+				record = JSON.parse(value) as WorkflowSteps
+			},
+		},
+		SEARCH_QUEUE: {
+			send: async (message: SearchQueueMessage) => {
+				queueMessages.push(message)
+			},
+		},
+	} as unknown as Env
+
+	return {
+		env,
+		getRecord: () => record,
+		getQueueMessages: () => queueMessages,
+	}
+}
+
 test('visibility toggle requires an owned row before any search sync can run', () => {
 	assert.throws(
 		() => requireOwnedVisibilityToggle(null),
@@ -364,7 +583,7 @@ test('finalize queue message marks a smol ready once the Vectorize mutation is p
 })
 
 test('upsert queue message retries when D1 exists but KV payload is not yet visible', async () => {
-	const env = createUpsertRetryEnv()
+	const { env, getQueuedMessages } = createUpsertRetryEnv()
 	const queued = createQueueMessage({
 		type: 'upsert',
 		smolId: 'smol-2',
@@ -376,9 +595,11 @@ test('upsert queue message retries when D1 exists but KV payload is not yet visi
 		{} as ExecutionContext
 	)
 
-	assert.equal(queued.acked, 0)
-	assert.equal(queued.retried.length, 1)
-	assert.equal(queued.retried[0]?.delaySeconds, 5)
+	assert.equal(queued.acked, 1)
+	assert.equal(queued.retried.length, 0)
+	assert.equal(getQueuedMessages().length, 1)
+	assert.equal(getQueuedMessages()[0]?.message.type, 'upsert')
+	assert.equal(getQueuedMessages()[0]?.delaySeconds, 5)
 })
 
 test('upsert queue message indexes an instrumental smol even when lyrics are missing', async () => {
@@ -404,4 +625,68 @@ test('upsert queue message indexes an instrumental smol even when lyrics are mis
 	assert.equal(getRecord().search?.mutation_id, '202')
 	assert.equal(getFinalizeMessages().length, 1)
 	assert.equal(getFinalizeMessages()[0]?.type, 'finalize')
+})
+
+test('batch queue helper marks songs queued and sends a batched upsert message', async () => {
+	const { env, getRecords, getQueuedMessages } = createBatchUpsertEnv()
+
+	const queuedIds = await queueSearchIndexingBatchById(env, ['smol-a', 'smol-b'])
+
+	assert.deepEqual(queuedIds, ['smol-a', 'smol-b'])
+	assert.equal(getRecords()['smol-a']?.search?.status, 'queued')
+	assert.equal(getRecords()['smol-b']?.search?.status, 'queued')
+	assert.equal(getQueuedMessages().length, 1)
+	assert.equal(getQueuedMessages()[0]?.type, 'upsert_batch')
+	assert.deepEqual((getQueuedMessages()[0] as Extract<SearchQueueMessage, { type: 'upsert_batch' }>).smolIds, ['smol-a', 'smol-b'])
+})
+
+test('upsert_batch queue message indexes multiple smols in one Vectorize request', async () => {
+	const { env, getRecords, getFinalizeMessages, getUpserts } = createBatchUpsertEnv()
+	const queued = createQueueMessage({
+		type: 'upsert_batch',
+		smolIds: ['smol-a', 'smol-b'],
+	})
+
+	await processSearchQueue(
+		{ messages: [queued.message] } as unknown as MessageBatch<SearchQueueMessage>,
+		env,
+		{} as ExecutionContext
+	)
+
+	assert.equal(queued.acked, 1)
+	assert.equal(queued.retried.length, 0)
+	assert.equal(getUpserts().length, 1)
+	assert.equal(getUpserts()[0]?.length, 8)
+	assert.equal(getFinalizeMessages().length, 2)
+	assert.deepEqual(getFinalizeMessages().map((message) => message.smolId).sort(), ['smol-a', 'smol-b'])
+	assert.equal(getRecords()['smol-a']?.search?.status, 'processing')
+	assert.equal(getRecords()['smol-b']?.search?.status, 'processing')
+	assert.equal(getRecords()['smol-a']?.search?.mutation_id, 'batch-1')
+	assert.equal(getRecords()['smol-b']?.search?.mutation_id, 'batch-1')
+})
+
+test('search state remains queryable while a previously indexed smol is being refreshed', async () => {
+	const { env, getRecord, getQueueMessages } = createReadyRequeueEnv()
+
+	const queued = await queueSearchIndexingById(env, 'smol-ready')
+
+	assert.equal(queued, true)
+	assert.equal(getRecord().search?.status, 'queued')
+	assert.equal(getRecord().search?.indexed_at, '2026-03-31T12:05:00.000Z')
+	assert.equal(isSearchQueryableState(getRecord().search), true)
+	assert.equal(getQueueMessages().length, 1)
+	assert.equal(getQueueMessages()[0]?.type, 'upsert')
+})
+
+test('search state is not queryable before the first successful index', () => {
+	assert.equal(isSearchQueryableState(undefined), false)
+	assert.equal(isSearchQueryableState({
+		status: 'processing',
+		version: SEARCH_INDEX_VERSION,
+	}), false)
+	assert.equal(isSearchQueryableState({
+		status: 'hidden',
+		version: SEARCH_INDEX_VERSION,
+		indexed_at: '2026-03-31T12:05:00.000Z',
+	}), false)
 })

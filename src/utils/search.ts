@@ -10,6 +10,7 @@ const SEARCH_MAX_LIMIT = 20
 const SEARCH_HYDRATION_BATCH = 40
 const SEARCH_FINALIZE_DELAY_SECONDS = 8
 const SEARCH_FINALIZE_MAX_ATTEMPTS = 8
+const SEARCH_BACKFILL_UPSERT_BATCH_SIZE = 12
 const MAX_LYRICS_CHARS = 5000
 const MAX_TAG_EXTRACTION_LYRICS_CHARS = 3000
 
@@ -87,6 +88,23 @@ type SearchQueueDisposition =
 	| { action: 'ack' }
 	| { action: 'retry'; delaySeconds: number }
 
+type SearchMutationProgress = {
+	isProcessed: boolean
+	mutationId?: string
+	processedMutation?: string
+	requestedAt?: number
+	processedAt?: number
+	vectorCount?: number
+	dimensions?: number
+}
+
+type PreparedSearchUpsert = {
+	source: SmolIndexSource
+	metadata: SearchStoredMetadata
+	texts: SearchTextFields
+	vectorIds: string[]
+}
+
 export type SearchMetadataExtraction = Pick<
 	SearchStoredMetadata,
 	| 'style_primary'
@@ -134,6 +152,14 @@ export type SearchResponse = {
 
 const ACK_QUEUE_MESSAGE: SearchQueueDisposition = { action: 'ack' }
 
+function logSearchEvent(event: string, details: Record<string, unknown>): void {
+	console.log({
+		event,
+		search_version: SEARCH_INDEX_VERSION,
+		...details,
+	})
+}
+
 function nowIso(): string {
 	return new Date().toISOString()
 }
@@ -154,6 +180,18 @@ export function truncateText(input: string, maxChars: number): string {
 
 export function uniqueStrings(values: Array<string | undefined | null>): string[] {
 	return [...new Set(values.map((value) => normalizeText(value)).filter(Boolean))]
+}
+
+function chunkArray<T>(values: T[], size: number): T[][] {
+	if (size < 1) {
+		throw new Error('chunkArray size must be positive')
+	}
+
+	const chunks: T[][] = []
+	for (let index = 0; index < values.length; index += size) {
+		chunks.push(values.slice(index, index + size))
+	}
+	return chunks
 }
 
 export function clampSearchLimit(limit: number | undefined): number {
@@ -189,6 +227,17 @@ function getSearchIndex(env: Env): Vectorize {
 	// Wrangler 4.59 still emits the legacy VectorizeIndex binding type even though
 	// the runtime binding supports the V2 Vectorize methods used here.
 	return env.SMOL_SEARCH_INDEX as unknown as Vectorize
+}
+
+export function isSearchQueryableState(
+	search: SearchState | undefined
+): search is SearchState & { indexed_at: string } {
+	return Boolean(
+		search
+		&& search.version === SEARCH_INDEX_VERSION
+		&& search.status !== 'hidden'
+		&& search.indexed_at
+	)
 }
 
 function buildBaseSearchState(status: SearchStatus): SearchState {
@@ -435,21 +484,39 @@ function normalizeMutationTimestamp(value: unknown): number | undefined {
 	return undefined
 }
 
-async function isSearchMutationProcessed(env: Env, search: SearchState | undefined): Promise<boolean> {
+async function getSearchMutationProgress(env: Env, search: SearchState | undefined): Promise<SearchMutationProgress> {
 	const mutationId = normalizeMutationTrackerValue(search?.mutation_id)
 	if (!mutationId) {
-		return false
+		return {
+			isProcessed: false,
+		}
 	}
 
 	const info = await getSearchIndex(env).describe()
 	const processedMutation = normalizeMutationTrackerValue(info.processedUpToMutation)
 	if (processedMutation === mutationId) {
-		return true
+		return {
+			isProcessed: true,
+			mutationId,
+			processedMutation,
+			requestedAt: normalizeMutationTimestamp(search?.mutation_requested_at ?? search?.queued_at),
+			processedAt: normalizeMutationTimestamp(info.processedUpToDatetime),
+			vectorCount: info.vectorCount,
+			dimensions: info.dimensions,
+		}
 	}
 
 	const processedAt = normalizeMutationTimestamp(info.processedUpToDatetime)
 	const requestedAt = normalizeMutationTimestamp(search?.mutation_requested_at ?? search?.queued_at)
-	return processedAt !== undefined && requestedAt !== undefined && processedAt >= requestedAt
+	return {
+		isProcessed: processedAt !== undefined && requestedAt !== undefined && processedAt >= requestedAt,
+		mutationId,
+		processedMutation,
+		requestedAt,
+		processedAt,
+		vectorCount: info.vectorCount,
+		dimensions: info.dimensions,
+	}
 }
 
 async function extractSearchMetadata(env: Env, source: SmolIndexSource): Promise<SearchStoredMetadata> {
@@ -470,32 +537,21 @@ async function extractSearchMetadata(env: Env, source: SmolIndexSource): Promise
 		`Lyrics: ${truncateText(normalizeText(source.lyrics?.lyrics), MAX_TAG_EXTRACTION_LYRICS_CHARS) || 'n/a'}`,
 	].join('\n')
 
-	try {
-		const response = await env.AI.run(TAG_EXTRACTION_MODEL, {
-			messages: [
-				{
-					role: 'system',
-					content: 'You output only valid JSON matching the provided schema.',
-				},
-				{
-					role: 'user',
-					content,
-				},
-			],
-			response_format: {
-				type: 'json_schema',
-				json_schema: {
-					name: 'smol_search_metadata',
-					schema: SEARCH_METADATA_JSON_SCHEMA,
-				},
-			},
-			max_tokens: 250,
-			temperature: 0,
-		}) as AiTextGenerationOutput & AiJsonGenerationOutput
+	const messages = [
+		{
+			role: 'system' as const,
+			content: 'You output only valid JSON. No markdown, no prose, no code fences.',
+		},
+		{
+			role: 'user' as const,
+			content,
+		},
+	]
 
+	const parseMetadataResponse = (response: AiTextGenerationOutput & AiJsonGenerationOutput): SearchStoredMetadata | null => {
 		const parsed = normalizeExtractedSearchMetadata(tryParseJsonObject(response.response), fallback)
 		if (!parsed) {
-			return fallback
+			return null
 		}
 
 		return {
@@ -503,10 +559,55 @@ async function extractSearchMetadata(env: Env, source: SmolIndexSource): Promise
 			style_tags: fallback.style_tags,
 			title: fallback.title,
 		}
-	} catch (error) {
-		console.warn('Structured search metadata extraction failed, using fallback tags:', error)
-		return fallback
 	}
+
+	try {
+		const response = await env.AI.run(TAG_EXTRACTION_MODEL, {
+			messages,
+			response_format: {
+				type: 'json_object',
+			},
+			max_tokens: 250,
+			temperature: 0,
+		}) as AiTextGenerationOutput & AiJsonGenerationOutput
+
+		const parsed = parseMetadataResponse(response)
+		if (parsed) {
+			return parsed
+		}
+	} catch (error) {
+		logSearchEvent('search_metadata_json_mode_failed', {
+			title: source.title,
+			error: error instanceof Error ? error.message : String(error),
+		})
+	}
+
+	try {
+		const response = await env.AI.run(TAG_EXTRACTION_MODEL, {
+			messages,
+			max_tokens: 250,
+			temperature: 0,
+		}) as AiTextGenerationOutput & AiJsonGenerationOutput
+
+		const parsed = parseMetadataResponse(response)
+		if (parsed) {
+			return parsed
+		}
+
+		logSearchEvent('search_metadata_parse_failed', {
+			title: source.title,
+			responsePreview: typeof response.response === 'string'
+				? truncateText(response.response, 200)
+				: response.response,
+		})
+	} catch (error) {
+		logSearchEvent('search_metadata_generation_failed', {
+			title: source.title,
+			error: error instanceof Error ? error.message : String(error),
+		})
+	}
+
+	return fallback
 }
 
 function buildSearchTexts(source: SmolIndexSource, metadata: SearchStoredMetadata): SearchTextFields {
@@ -626,39 +727,62 @@ async function loadSmolIndexSource(env: Env, smolId: string): Promise<SmolIndexS
 	}
 }
 
-async function upsertSmolVectors(env: Env, smolId: string, attempts: number): Promise<SearchQueueDisposition> {
+async function handleMissingUpsertSource(env: Env, smolId: string, attempts: number): Promise<SearchQueueDisposition> {
+	const record = await getStoredSmolRecord(env, smolId)
+	const d1Record = await env.SMOL_D1.prepare(`
+		SELECT Id
+		FROM Smols
+		WHERE Id = ?1
+	`)
+		.bind(smolId)
+		.first<{ Id: string }>()
+
+	if (!record && !d1Record) {
+		return ACK_QUEUE_MESSAGE
+	}
+
+	logSearchEvent('search_upsert_source_missing', {
+		smolId,
+		attempts,
+		hasKvRecord: Boolean(record),
+		hasD1Record: Boolean(d1Record),
+	})
+
+	if (attempts >= SEARCH_FINALIZE_MAX_ATTEMPTS) {
+		await setSearchState(env, smolId, (existing) => ({
+			...(existing ?? createQueuedSearchState()),
+			status: 'failed',
+			version: SEARCH_INDEX_VERSION,
+			indexed_at: existing?.indexed_at,
+			last_error: 'Source data missing for search indexing',
+			mutation_id: undefined,
+			mutation_requested_at: undefined,
+		}))
+		return ACK_QUEUE_MESSAGE
+	}
+
+	return {
+		action: 'retry',
+		delaySeconds: Math.min(30, Math.max(5, attempts * 5)),
+	}
+}
+
+async function prepareSearchUpsert(env: Env, smolId: string, attempts: number): Promise<PreparedSearchUpsert | null> {
 	const source = await loadSmolIndexSource(env, smolId)
 	if (!source) {
-		const record = await getStoredSmolRecord(env, smolId)
-		const d1Record = await env.SMOL_D1.prepare(`
-			SELECT Id
-			FROM Smols
-			WHERE Id = ?1
-		`)
-			.bind(smolId)
-			.first<{ Id: string }>()
-
-		if (!record && !d1Record) {
-			return ACK_QUEUE_MESSAGE
+		const result = await handleMissingUpsertSource(env, smolId, attempts)
+		if (result.action === 'retry') {
+			await env.SEARCH_QUEUE.send(
+				{
+					type: 'upsert',
+					smolId,
+				},
+				{
+					delaySeconds: result.delaySeconds,
+				}
+			)
 		}
-
-		if (attempts >= SEARCH_FINALIZE_MAX_ATTEMPTS) {
-			await setSearchState(env, smolId, (existing) => ({
-				...(existing ?? createQueuedSearchState()),
-				status: 'failed',
-				version: SEARCH_INDEX_VERSION,
-				indexed_at: undefined,
-				last_error: 'Source data missing for search indexing',
-				mutation_id: undefined,
-				mutation_requested_at: undefined,
-			}))
-			return ACK_QUEUE_MESSAGE
-		}
-
-		return {
-			action: 'retry',
-			delaySeconds: Math.min(30, Math.max(5, attempts * 5)),
-		}
+		return null
 	}
 
 	if (!source.public) {
@@ -669,28 +793,55 @@ async function upsertSmolVectors(env: Env, smolId: string, attempts: number): Pr
 			mutation_id: undefined,
 			mutation_requested_at: undefined,
 		}))
-		return ACK_QUEUE_MESSAGE
+		return null
 	}
 
 	const metadata = await extractSearchMetadata(env, source)
 	const texts = buildSearchTexts(source, metadata)
+	return {
+		source,
+		metadata,
+		texts,
+		vectorIds: getVectorIdsForSmol(smolId),
+	}
+}
+
+async function upsertSmolVectors(env: Env, smolId: string, attempts: number): Promise<SearchQueueDisposition> {
+	const prepared = await prepareSearchUpsert(env, smolId, attempts)
+	if (!prepared) {
+		return ACK_QUEUE_MESSAGE
+	}
+
 	const embeddings = await embedTexts(env, [
-		texts.style,
-		texts.title,
-		texts.lyrics,
-		texts.description,
+		prepared.texts.style,
+		prepared.texts.title,
+		prepared.texts.lyrics,
+		prepared.texts.description,
 	])
-	const vectorIds = getVectorIdsForSmol(smolId)
-	const mutation = await getSearchIndex(env).upsert(buildVectors(source, texts, embeddings, metadata))
+	const vectors = buildVectors(prepared.source, prepared.texts, embeddings, prepared.metadata)
+	const mutation = await getSearchIndex(env).upsert(vectors)
+
+	logSearchEvent('search_upsert_enqueued', {
+		smolId,
+		attempts,
+		title: prepared.source.title,
+		public: prepared.source.public,
+		instrumental: prepared.source.instrumental,
+		mutationId: mutation.mutationId,
+		vectorIds: prepared.vectorIds,
+		vectorDimensions: vectors.map((vector) => vector.values.length),
+		styleTagCount: prepared.metadata.style_tags.length,
+		lyricPresence: prepared.metadata.lyric_presence,
+	})
 
 	await setSearchState(env, smolId, (existing) => ({
 		...(existing ?? createQueuedSearchState()),
 		status: 'processing',
 		version: SEARCH_INDEX_VERSION,
 		queued_at: existing?.queued_at ?? nowIso(),
-		indexed_at: undefined,
-		vector_ids: vectorIds,
-		metadata,
+		indexed_at: existing?.indexed_at,
+		vector_ids: prepared.vectorIds,
+		metadata: prepared.metadata,
 		last_error: undefined,
 		mutation_id: mutation.mutationId,
 		mutation_requested_at: nowIso(),
@@ -700,12 +851,84 @@ async function upsertSmolVectors(env: Env, smolId: string, attempts: number): Pr
 		{
 			type: 'finalize',
 			smolId,
-			vectorIds,
+			vectorIds: prepared.vectorIds,
 		},
 		{
 			delaySeconds: SEARCH_FINALIZE_DELAY_SECONDS,
 		}
 	)
+	return ACK_QUEUE_MESSAGE
+}
+
+async function upsertSmolVectorBatch(env: Env, smolIds: string[], attempts: number): Promise<SearchQueueDisposition> {
+	const uniqueSmolIds = uniqueStrings(smolIds)
+	if (!uniqueSmolIds.length) {
+		return ACK_QUEUE_MESSAGE
+	}
+
+	const preparedEntries = (await Promise.all(
+		uniqueSmolIds.map(async (smolId) => await prepareSearchUpsert(env, smolId, attempts))
+	)).filter((entry): entry is PreparedSearchUpsert => Boolean(entry))
+
+	if (!preparedEntries.length) {
+		return ACK_QUEUE_MESSAGE
+	}
+
+	const flattenedTexts = preparedEntries.flatMap(({ texts }) => [
+		texts.style,
+		texts.title,
+		texts.lyrics,
+		texts.description,
+	])
+	const embeddings = await embedTexts(env, flattenedTexts)
+
+	let embeddingOffset = 0
+	const vectors = preparedEntries.flatMap((entry) => {
+		const entryEmbeddings = embeddings.slice(embeddingOffset, embeddingOffset + SEARCH_MODALITIES.length)
+		embeddingOffset += SEARCH_MODALITIES.length
+		return buildVectors(entry.source, entry.texts, entryEmbeddings, entry.metadata)
+	})
+
+	const mutation = await getSearchIndex(env).upsert(vectors)
+	const queuedAt = nowIso()
+
+	logSearchEvent('search_batch_upsert_enqueued', {
+		smolCount: preparedEntries.length,
+		attempts,
+		mutationId: mutation.mutationId,
+		vectorCount: vectors.length,
+		vectorDimensions: uniqueStrings(vectors.map((vector) => String(vector.values.length))),
+		smolIds: preparedEntries.map(({ source }) => source.id),
+	})
+
+	await Promise.all(preparedEntries.map(async (entry) => {
+		await setSearchState(env, entry.source.id, (existing) => ({
+			...(existing ?? createQueuedSearchState()),
+			status: 'processing',
+			version: SEARCH_INDEX_VERSION,
+			queued_at: existing?.queued_at ?? queuedAt,
+			indexed_at: existing?.indexed_at,
+			vector_ids: entry.vectorIds,
+			metadata: entry.metadata,
+			last_error: undefined,
+			mutation_id: mutation.mutationId,
+			mutation_requested_at: queuedAt,
+		}))
+	}))
+
+	await Promise.all(preparedEntries.map(async (entry) => {
+		await env.SEARCH_QUEUE.send(
+			{
+				type: 'finalize',
+				smolId: entry.source.id,
+				vectorIds: entry.vectorIds,
+			},
+			{
+				delaySeconds: SEARCH_FINALIZE_DELAY_SECONDS,
+			}
+		)
+	}))
+
 	return ACK_QUEUE_MESSAGE
 }
 
@@ -745,7 +968,18 @@ async function finalizeSmolVectors(env: Env, smolId: string, vectorIds: string[]
 		return ACK_QUEUE_MESSAGE
 	}
 
-	if (await isSearchMutationProcessed(env, record.search)) {
+	const progress = await getSearchMutationProgress(env, record.search)
+	if (progress.isProcessed) {
+		logSearchEvent('search_finalize_ready', {
+			smolId,
+			mutationId: progress.mutationId,
+			processedMutation: progress.processedMutation,
+			requestedAt: progress.requestedAt,
+			processedAt: progress.processedAt,
+			vectorCount: progress.vectorCount,
+			dimensions: progress.dimensions,
+		})
+
 		await setSearchState(env, smolId, (existing) => ({
 			...(existing ?? createQueuedSearchState()),
 			status: 'ready',
@@ -760,6 +994,16 @@ async function finalizeSmolVectors(env: Env, smolId: string, vectorIds: string[]
 		}))
 		return ACK_QUEUE_MESSAGE
 	}
+
+	logSearchEvent('search_finalize_pending', {
+		smolId,
+		mutationId: progress.mutationId,
+		processedMutation: progress.processedMutation,
+		requestedAt: progress.requestedAt,
+		processedAt: progress.processedAt,
+		vectorCount: progress.vectorCount,
+		dimensions: progress.dimensions,
+	})
 
 	return {
 		action: 'retry',
@@ -1018,9 +1262,11 @@ async function hydrateRankedCandidates(env: Env, ranked: RankedCandidate[], limi
 				continue
 			}
 
-			if (!search || search.status !== 'ready' || search.version !== SEARCH_INDEX_VERSION) {
+			if (!isSearchQueryableState(search)) {
 				continue
 			}
+
+			const activeSearch = search
 
 			const matchedFields = SEARCH_MODALITIES
 				.filter((modality) => (candidate.modalityScores[modality] ?? 0) > 0)
@@ -1036,9 +1282,9 @@ async function hydrateRankedCandidates(env: Env, ranked: RankedCandidate[], limi
 				score: candidate.score,
 				explanation: {
 					matchedFields,
-					style: search.metadata?.style_tags?.slice(0, 3),
-					mood: search.metadata?.mood_primary,
-					theme: search.metadata?.theme_primary,
+					style: activeSearch.metadata?.style_tags?.slice(0, 3),
+					mood: activeSearch.metadata?.mood_primary,
+					theme: activeSearch.metadata?.theme_primary,
 				},
 			})
 		}
@@ -1053,7 +1299,7 @@ export async function queueSearchIndexingById(env: Env, smolId: string): Promise
 		status: 'queued',
 		version: SEARCH_INDEX_VERSION,
 		queued_at: nowIso(),
-		indexed_at: undefined,
+		indexed_at: existing?.indexed_at,
 		last_error: undefined,
 		mutation_id: undefined,
 		mutation_requested_at: undefined,
@@ -1069,6 +1315,37 @@ export async function queueSearchIndexingById(env: Env, smolId: string): Promise
 	})
 
 	return true
+}
+
+export async function queueSearchIndexingBatchById(env: Env, smolIds: string[]): Promise<string[]> {
+	const uniqueSmolIds = uniqueStrings(smolIds)
+	if (!uniqueSmolIds.length) {
+		return []
+	}
+
+	const queuedIds = (await Promise.all(uniqueSmolIds.map(async (smolId) => {
+		const updated = await setSearchState(env, smolId, (existing) => ({
+			...(existing ?? createQueuedSearchState()),
+			status: 'queued',
+			version: SEARCH_INDEX_VERSION,
+			queued_at: nowIso(),
+			indexed_at: existing?.indexed_at,
+			last_error: undefined,
+			mutation_id: undefined,
+			mutation_requested_at: undefined,
+		}))
+
+		return updated ? smolId : null
+	}))).filter((smolId): smolId is string => Boolean(smolId))
+
+	await Promise.all(chunkArray(queuedIds, SEARCH_BACKFILL_UPSERT_BATCH_SIZE).map(async (chunk) => {
+		await env.SEARCH_QUEUE.send({
+			type: 'upsert_batch',
+			smolIds: chunk,
+		})
+	}))
+
+	return queuedIds
 }
 
 export async function hideSmolFromSearch(env: Env, smolId: string): Promise<boolean> {
@@ -1144,7 +1421,7 @@ export async function searchSimilarSmols(
 	}
 
 	const record = await getStoredSmolRecord(env, params.id)
-	if (record?.search?.status !== 'ready' || record.search.version !== SEARCH_INDEX_VERSION) {
+	if (!isSearchQueryableState(record?.search)) {
 		throw new HTTPException(409, { message: 'Search indexing still in progress for this smol' })
 	}
 
@@ -1166,18 +1443,36 @@ export async function searchSimilarSmols(
 }
 
 async function handleQueueMessage(message: Message<SearchQueueMessage>, env: Env): Promise<SearchQueueDisposition> {
+	logSearchEvent('search_queue_message_received', {
+		type: message.body.type,
+		smolId: 'smolId' in message.body ? message.body.smolId : undefined,
+		smolCount: message.body.type === 'upsert_batch' ? message.body.smolIds.length : undefined,
+		smolIds: message.body.type === 'upsert_batch' ? message.body.smolIds : undefined,
+		attempts: message.attempts,
+	})
+
 	switch (message.body.type) {
 		case 'upsert':
 			return await upsertSmolVectors(env, message.body.smolId, message.attempts)
+
+		case 'upsert_batch':
+			return await upsertSmolVectorBatch(env, message.body.smolIds, message.attempts)
 
 		case 'finalize': {
 			const vectorIds = message.body.vectorIds
 			const result = await finalizeSmolVectors(env, message.body.smolId, vectorIds)
 			if (result.action === 'retry' && message.attempts >= SEARCH_FINALIZE_MAX_ATTEMPTS) {
+				logSearchEvent('search_finalize_timeout', {
+					smolId: message.body.smolId,
+					attempts: message.attempts,
+					vectorIds,
+				})
+
 				await setSearchState(env, message.body.smolId, (existing) => ({
 					...(existing ?? createQueuedSearchState()),
 					status: 'failed',
 					version: SEARCH_INDEX_VERSION,
+					indexed_at: existing?.indexed_at,
 					vector_ids: vectorIds,
 					metadata: existing?.metadata,
 					last_error: 'Timed out waiting for Vectorize mutation processing',
@@ -1195,6 +1490,10 @@ async function handleQueueMessage(message: Message<SearchQueueMessage>, env: Env
 		}
 
 		case 'delete':
+			logSearchEvent('search_delete_requested', {
+				smolId: message.body.smolId,
+				vectorIds: message.body.vectorIds ?? getVectorIdsForSmol(message.body.smolId),
+			})
 			await deleteSmolVectors(env, message.body.smolId, message.body.vectorIds ?? getVectorIdsForSmol(message.body.smolId))
 			return ACK_QUEUE_MESSAGE
 	}
@@ -1216,12 +1515,28 @@ export async function processSearchQueue(batch: MessageBatch<SearchQueueMessage>
 			console.warn('Search queue message failed:', message.body, error)
 
 			if (message.attempts >= SEARCH_FINALIZE_MAX_ATTEMPTS) {
-				if (message.body.type !== 'delete') {
-					await setSearchState(env, message.body.smolId, (existing) => ({
+				if (message.body.type === 'upsert_batch') {
+					await Promise.all(message.body.smolIds.map(async (smolId) => {
+						await setSearchState(env, smolId, (existing) => ({
+							...(existing ?? createQueuedSearchState()),
+							status: 'failed',
+							version: SEARCH_INDEX_VERSION,
+							indexed_at: existing?.indexed_at,
+							vector_ids: existing?.vector_ids ?? getVectorIdsForSmol(smolId),
+							metadata: existing?.metadata,
+							last_error: error instanceof Error ? error.message : 'Unknown search indexing failure',
+							mutation_id: existing?.mutation_id,
+							mutation_requested_at: existing?.mutation_requested_at,
+						}))
+					}))
+				} else if (message.body.type !== 'delete') {
+					const { smolId } = message.body
+					await setSearchState(env, smolId, (existing) => ({
 						...(existing ?? createQueuedSearchState()),
 						status: 'failed',
 						version: SEARCH_INDEX_VERSION,
-						vector_ids: existing?.vector_ids ?? getVectorIdsForSmol(message.body.smolId),
+						indexed_at: existing?.indexed_at,
+						vector_ids: existing?.vector_ids ?? getVectorIdsForSmol(smolId),
 						metadata: existing?.metadata,
 						last_error: error instanceof Error ? error.message : 'Unknown search indexing failure',
 						mutation_id: existing?.mutation_id,

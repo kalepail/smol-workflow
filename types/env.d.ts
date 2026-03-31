@@ -56,6 +56,10 @@ type SearchQueueMessage =
 		smolId: string
 	}
 	| {
+		type: 'upsert_batch'
+		smolIds: string[]
+	}
+	| {
 		type: 'finalize'
 		smolId: string
 		vectorIds: string[]

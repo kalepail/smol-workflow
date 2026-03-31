@@ -2,7 +2,7 @@ import { Context, Hono } from 'hono'
 import { HTTPException } from 'hono/http-exception'
 import type { HonoEnv } from '../types'
 import { buildCursorWhereClause, buildPaginationResponse, parsePaginationParams } from '../utils/pagination'
-import { queueSearchIndexingById, searchPublicSmols, searchSimilarSmols } from '../utils/search'
+import { queueSearchIndexingBatchById, queueSearchIndexingById, searchPublicSmols, searchSimilarSmols } from '../utils/search'
 import { optionalAuth } from '../middleware/auth'
 
 const search = new Hono<HonoEnv>()
@@ -93,7 +93,7 @@ search.post('/admin/backfill', async (c) => {
 		.bind(...bindings)
 		.all<{ Id: string; Created_At: string }>()
 
-	const queued = await Promise.all(results.map(async ({ Id }) => await queueSearchIndexingById(c.env, Id)))
+	const queuedIds = await queueSearchIndexingBatchById(c.env, results.map(({ Id }) => Id))
 	const pagination = buildPaginationResponse(
 		results,
 		effectiveLimit,
@@ -103,7 +103,7 @@ search.post('/admin/backfill', async (c) => {
 
 	c.header('Cache-Control', 'no-store')
 	return c.json({
-		queued: queued.filter(Boolean).length,
+		queued: queuedIds.length,
 		pagination,
 	})
 })
