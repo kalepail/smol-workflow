@@ -245,7 +245,7 @@ async function main() {
 		throw new Error(`Invalid --page-limit value: ${options.pageLimit}`)
 	}
 
-	if (!Number.isFinite(options.maxWaves) || options.maxWaves < 1) {
+	if (options.maxWaves !== Infinity && (!Number.isFinite(options.maxWaves) || options.maxWaves < 1)) {
 		throw new Error(`Invalid --max-waves value: ${options.maxWaves}`)
 	}
 
