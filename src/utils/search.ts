@@ -676,7 +676,10 @@ async function getSearchMutationProgress(env: Env, search: SearchState | undefin
 
 function getSearchMutationProgressFromInfo(
 	search: SearchState | undefined,
-	info: SearchIndexDescribeSnapshot
+	info: SearchIndexDescribeSnapshot,
+	options?: {
+		allowTimestampFallback?: boolean
+	}
 ): SearchMutationProgress {
 	const mutationId = normalizeMutationTrackerValue(search?.mutation_id)
 	if (!mutationId) {
@@ -696,12 +699,15 @@ function getSearchMutationProgressFromInfo(
 				vectorCount: typeof info.vectorCount === 'number' ? info.vectorCount : undefined,
 				dimensions: typeof info.dimensions === 'number' ? info.dimensions : undefined,
 			}
-		}
+	}
 
 	const processedAt = normalizeMutationTimestamp(info.processedUpToDatetime)
 	const requestedAt = normalizeMutationTimestamp(search?.mutation_requested_at ?? search?.queued_at)
 	return {
-		isProcessed: processedAt !== undefined && requestedAt !== undefined && processedAt >= requestedAt,
+		isProcessed: options?.allowTimestampFallback === true
+			&& processedAt !== undefined
+			&& requestedAt !== undefined
+			&& processedAt >= requestedAt,
 		mutationId,
 			processedMutation,
 			requestedAt,
@@ -1670,7 +1676,7 @@ export async function reconcileSearchIndexingBatchById(env: Env, smolIds: string
 			continue
 		}
 
-		const progress = getSearchMutationProgressFromInfo(search, info)
+		const progress = getSearchMutationProgressFromInfo(search, info, { allowTimestampFallback: true })
 		if (progress.isProcessed) {
 			await setSearchState(env, smolId, (existing) => ({
 				...(existing ?? createQueuedSearchState()),

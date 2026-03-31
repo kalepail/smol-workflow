@@ -106,6 +106,74 @@ function createFinalizeRetryEnv() {
 	return env
 }
 
+function createFinalizeTimestampOnlyEnv() {
+	let record: WorkflowSteps = {
+		payload: {},
+		image_base64: undefined,
+		description: 'A song',
+		lyrics: {
+			title: 'Song',
+			style: ['dream pop'],
+			lyrics: 'hello world',
+		},
+		nsfw: 'safe',
+		song_ids: undefined,
+		songs: undefined,
+		search: {
+			status: 'processing',
+			version: SEARCH_INDEX_VERSION,
+			queued_at: '2026-03-31T12:00:00.000Z',
+			vector_ids: ['smol-1:style', 'smol-1:title', 'smol-1:lyrics', 'smol-1:description'],
+			mutation_id: '101',
+			mutation_requested_at: '2026-03-31T12:00:01.000Z',
+		},
+	}
+
+	const env = {
+		SMOL_KV: {
+			get: async () => record,
+			put: async (_key: string, value: string) => {
+				record = JSON.parse(value) as WorkflowSteps
+			},
+		},
+		SMOL_D1: {
+			prepare(sql: string): MockPreparedStatement {
+				return {
+					bind() {
+						return {
+							first: async <T>() => {
+								if (sql.includes('SELECT Id, Title, Public, Instrumental')) {
+									return {
+										Id: 'smol-1',
+										Title: 'Song',
+										Public: 1,
+										Instrumental: 0,
+									} as T
+								}
+								return null as T | null
+							},
+							run: async () => ({ success: true }),
+						}
+					},
+				}
+			},
+		},
+		SMOL_SEARCH_INDEX: {
+			describe: async () => ({
+				vectorCount: 4,
+				dimensions: 1024,
+				processedUpToMutation: 'other-mutation',
+				processedUpToDatetime: '2026-03-31T12:05:00.000Z',
+			}),
+		},
+	} as unknown as Env
+
+	return {
+		env,
+		getRecord: () => record,
+	}
+}
+
 function createFinalizeReadyEnv() {
 	let record: WorkflowSteps = {
 		payload: {},
@@ -661,6 +729,25 @@ test('finalize queue message marks a smol ready once the Vectorize mutation is p
 	assert.equal(getRecord().search?.status, 'ready')
 	assert.equal(getRecord().search?.version, SEARCH_INDEX_VERSION)
 	assert.ok(getRecord().search?.indexed_at)
+})
+
+test('finalize queue message keeps retrying when only the processed timestamp has advanced', async () => {
+	const { env, getRecord } = createFinalizeTimestampOnlyEnv()
+	const queued = createQueueMessage({
+		type: 'finalize',
+		smolId: 'smol-1',
+		vectorIds: ['smol-1:style', 'smol-1:title', 'smol-1:lyrics', 'smol-1:description'],
+	})
+
+	await processSearchQueue(
+		{ messages: [queued.message] } as unknown as MessageBatch<SearchQueueMessage>,
+		env,
+		{} as ExecutionContext
+	)
+
+	assert.equal(queued.acked, 0)
+	assert.equal(queued.retried.length, 1)
+	assert.equal(getRecord().search?.status, 'processing')
 })
 
 test('upsert queue message retries when D1 exists but KV payload is not yet visible', async () => {
