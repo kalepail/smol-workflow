@@ -7,20 +7,64 @@ declare namespace Cloudflare {
 		SK: string
 		CF_API_TOKEN: string
 		CF_ZONE_ID: string
+		SMOL_SEARCH_INDEX: Vectorize
+		SEARCH_QUEUE: Queue<SearchQueueMessage>
 	}
 }
 
 interface AiSongGeneratorLyrics {
-    title: string
-    style: string[]
-    lyrics: string
+	title: string
+	style: string[]
+	lyrics: string
 }
 
 interface AiSongGeneratorSong {
-    music_id: string
-    status: number
-    audio: string
+	music_id: string
+	status: number
+	audio: string
 }
+
+type SearchStatus = 'queued' | 'processing' | 'ready' | 'hidden' | 'failed'
+
+interface SearchStoredMetadata {
+	style_primary: string
+	mood_primary: string
+	theme_primary: string
+	lyric_presence: 'instrumental' | 'sparse' | 'lyric-heavy'
+	brightness_level: 'dark' | 'neutral' | 'bright'
+	energy_level: 'low' | 'mid' | 'high'
+	modality_guess: 'minor' | 'major' | 'mixed' | 'unknown'
+	style_tags: string[]
+	title: string
+}
+
+interface SearchState {
+	status: SearchStatus
+	version: string
+	queued_at?: string
+	indexed_at?: string
+	vector_ids?: string[]
+	metadata?: SearchStoredMetadata
+	last_error?: string
+	mutation_id?: string
+	mutation_requested_at?: string
+}
+
+type SearchQueueMessage =
+	| {
+		type: 'upsert'
+		smolId: string
+	}
+	| {
+		type: 'finalize'
+		smolId: string
+		vectorIds: string[]
+	}
+	| {
+		type: 'delete'
+		smolId: string
+		vectorIds?: string[]
+	}
 
 interface WorkflowSteps {
 	payload: WorkflowParams
@@ -56,6 +100,7 @@ interface WorkflowSteps {
 	// Incremented when a song doesn't have enough buffered data for fingerprinting.
 	// After 5 attempts, we accept partial data to handle short songs.
 	fingerprint_attempts?: Record<string, number>
+	search?: SearchState
 }
 
 type WorkflowParams = {

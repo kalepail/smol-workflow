@@ -5,6 +5,14 @@ import { env, WorkflowEntrypoint, WorkflowEvent, WorkflowStep, WorkflowStepConfi
 import { Client as SmolClient } from "smol-sdk";
 import { purgeCacheByTags } from "./utils/cache";
 
+type KaleWorkerBinding = Fetcher & {
+	submitTransaction(input: { xdr: string }): Promise<{
+		hash?: string
+		error?: string
+		errorCode?: string
+	}>
+}
+
 const KP = Keypair.fromSecret(env.SK)
 const PK = KP.publicKey()
 
@@ -66,7 +74,7 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
                 }
 
                 // Submit via kale-worker service binding (bypasses Turnstile auth)
-                const result = await this.env.KALE_WORKER.submitTransaction({ xdr: xdrEnvelope });
+                const result = await (this.env.KALE_WORKER as KaleWorkerBinding).submitTransaction({ xdr: xdrEnvelope });
 
                 if (result.error) {
                     throw new Error(`Transaction failed: ${result.error} (${result.errorCode})`);

@@ -7,6 +7,7 @@ import { NonRetryableError } from 'cloudflare:workflows';
 import { purgePlaylistCache, purgeUserCreatedCache, purgePublicSmolsCache } from './utils/cache';
 import { decideSongsStrategy, pollUntilComplete } from './utils/songs';
 import { isDurableObjectId } from './utils/durable-object-id';
+import { createHiddenSearchState, createQueuedSearchState, queueSearchDeletionById, queueSearchIndexingById } from './utils/search';
 
 /**
  * Smol Generation Workflow
@@ -213,6 +214,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 		// =====================================================================
 		await step.do('complete workflow', config, async () => {
 			await stub.setToFlush();
+			const isSearchPublic = typeof nsfw !== 'string' && nsfw?.safe === false ? false : is_public;
 
 			// Insert into D1
 			await this.env.SMOL_D1.prepare(`
@@ -226,7 +228,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 					songs[0].music_id,
 					songs[1].music_id,
 					address,
-					typeof nsfw !== 'string' && nsfw?.safe === false ? false : is_public,
+					isSearchPublic,
 					is_instrumental,
 				)
 				.run();
@@ -240,7 +242,22 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 				nsfw,
 				song_ids,
 				songs,
+				search: isSearchPublic ? createQueuedSearchState() : createHiddenSearchState(),
 			}));
+
+			if (isSearchPublic) {
+				try {
+					await queueSearchIndexingById(this.env, event.instanceId);
+				} catch (error) {
+					console.error(JSON.stringify({
+						event: 'search_sync_failed',
+						operation: 'indexing_on_creation',
+						smolId: event.instanceId,
+						intendedVisibility: 'public',
+						error: error instanceof Error ? { message: error.message, stack: error.stack } : String(error),
+					}));
+				}
+			}
 
 				// Cleanup old retry data if this is a retry
 				if (retry_id) {
@@ -256,6 +273,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 
 					await this.env.SMOL_D1.prepare(`DELETE FROM Smols WHERE Id = ?1`).bind(retry_id).run();
 					await this.env.SMOL_KV.delete(retry_id);
+					await queueSearchDeletionById(this.env, retry_id);
 
 				// Clean up orphaned R2 files from retry
 				await this.env.SMOL_BUCKET.delete(`${retry_id}.png`);

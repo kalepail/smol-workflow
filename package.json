@@ -6,22 +6,24 @@
 		"start:remote": "wrangler dev --remote --env dev",
 		"deploy": "wrangler deploy",
 		"typegen": "wrangler types --strict-vars=false",
-		"typecheck": "tsc --noEmit"
+		"typecheck": "tsc --noEmit",
+		"test": "tsx --test test/**/*.test.ts"
 	},
 	"devDependencies": {
 		"@cloudflare/workers-types": "^4.20260115.0",
 		"@types/node": "^25.0.8",
 		"itty-fetcher": "^1.0.10",
+		"tsx": "^4.21.0",
 		"typescript": "^5.9.3",
 		"wrangler": "^4.59.2"
 	},
 	"dependencies": {
 		"@simplewebauthn/server": "^13.2.2",
-		"music-metadata": "^11.10.6",
 		"@stellar/stellar-sdk": "^14.4.3",
 		"base64url": "^3.0.1",
 		"hono": "^4.11.4",
 		"jimp": "^1.6.0",
+		"music-metadata": "^11.10.6",
 		"smol-sdk": "file:./ext/smol-sdk"
 	}
 }

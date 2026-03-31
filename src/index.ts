@@ -14,6 +14,8 @@ import playlists from './api/playlists'
 import mixtapes from './api/mixtapes'
 import mint from './api/mint'
 import media from './api/media'
+import search from './api/search'
+import { processSearchQueue } from './utils/search'
 
 export const app = new Hono<HonoEnv>()
 
@@ -39,6 +41,7 @@ app.route('/mixtapes', mixtapes)
 app.route('/mint', mint)
 app.route('/song', media)
 app.route('/image', media)
+app.route('/search', search)
 app.route('/', smols)
 
 // 404 handler
@@ -49,6 +52,7 @@ app.notFound((c) => {
 // Export handler
 const handler = {
 	fetch: app.fetch,
+	queue: (batch, env, ctx) => processSearchQueue(batch as MessageBatch<SearchQueueMessage>, env, ctx),
 } satisfies ExportedHandler<Env>
 
 export { Workflow, TxWorkflow, SmolDurableObject, SmolState, handler as default }

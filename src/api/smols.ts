@@ -13,6 +13,8 @@ import {
 	userCacheKeyGenerator,
 } from '../utils/cache'
 import { isDurableObjectId } from '../utils/durable-object-id'
+import { queueSearchDeletionById } from '../utils/search'
+import { requireOwnedVisibilityToggle, syncSearchVisibilityAfterToggle } from '../utils/search-visibility'
 
 const smols = new Hono<HonoEnv>()
 
@@ -381,6 +383,30 @@ smols.put('/:id', parseAuth, async (c) => {
 		.bind(id, payload.sub)
 		.run()
 
+	const updated = await env.SMOL_D1.prepare(`
+		SELECT Public
+		FROM Smols
+		WHERE Id = ?1 AND "Address" = ?2
+	`)
+		.bind(id, payload.sub)
+		.first<{ Public: number }>()
+
+	const visibleUpdate = requireOwnedVisibilityToggle(updated)
+
+	c.executionCtx.waitUntil((async () => {
+		try {
+			await syncSearchVisibilityAfterToggle(env, id, visibleUpdate)
+		} catch (error) {
+			console.error(JSON.stringify({
+				event: 'search_sync_failed',
+				operation: 'visibility_toggle',
+				smolId: id,
+				intendedVisibility: visibleUpdate.Public === 1 ? 'public' : 'private',
+				error: error instanceof Error ? { message: error.message, stack: error.stack } : String(error),
+			}))
+		}
+	})())
+
 	// Purge user's individual page
 	c.executionCtx.waitUntil(
 		purgeCacheByTags([`user:${payload.sub}:smol:${id}`])
@@ -458,6 +484,17 @@ smols.delete('/:id', parseAuth, async (c) => {
 			await env.SMOL_BUCKET.delete(`${song.music_id}.mp3`)
 		}
 	}
+
+	c.executionCtx.waitUntil(
+		queueSearchDeletionById(env, id).catch((error) => {
+			console.error(JSON.stringify({
+				event: 'search_sync_failed',
+				operation: 'deletion',
+				smolId: id,
+				error: error instanceof Error ? { message: error.message, stack: error.stack } : String(error),
+			}))
+		})
+	)
 
 	// Purge user's created list and individual page
 	c.executionCtx.waitUntil(
