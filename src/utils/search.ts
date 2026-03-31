@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { HTTPException } from 'hono/http-exception'
 
 export const SEARCH_INDEX_VERSION = 'v2'
@@ -100,9 +101,17 @@ type SearchMutationProgress = {
 
 type PreparedSearchUpsert = {
 	source: SmolIndexSource
+	sourceHash: string
 	metadata: SearchStoredMetadata
 	texts: SearchTextFields
 	vectorIds: string[]
+}
+
+type BatchQueueSkipReason = 'current' | 'pending' | 'missing'
+
+export type BatchQueueResult = {
+	queuedIds: string[]
+	skipped: Record<BatchQueueSkipReason, number>
 }
 
 export type SearchMetadataExtraction = Pick<
@@ -192,6 +201,22 @@ function chunkArray<T>(values: T[], size: number): T[][] {
 		chunks.push(values.slice(index, index + size))
 	}
 	return chunks
+}
+
+function buildSearchSourceHash(source: SmolIndexSource): string {
+	return createHash('sha256')
+		.update(JSON.stringify({
+			id: source.id,
+			title: normalizeText(source.title),
+			public: source.public,
+			instrumental: source.instrumental,
+			prompt: normalizeText(source.prompt),
+			description: normalizeText(source.description),
+			lyrics_title: normalizeText(source.lyrics?.title),
+			lyrics: normalizeText(source.lyrics?.lyrics),
+			style: uniqueStrings(source.lyrics?.style ?? []),
+		}))
+		.digest('hex')
 }
 
 export function clampSearchLimit(limit: number | undefined): number {
@@ -796,10 +821,17 @@ async function prepareSearchUpsert(env: Env, smolId: string, attempts: number): 
 		return null
 	}
 
-	const metadata = await extractSearchMetadata(env, source)
+	const record = await getStoredSmolRecord(env, smolId)
+	const sourceHash = buildSearchSourceHash(source)
+	const metadata = record?.search?.version === SEARCH_INDEX_VERSION
+		&& record.search.source_hash === sourceHash
+		&& record.search.metadata
+		? record.search.metadata
+		: await extractSearchMetadata(env, source)
 	const texts = buildSearchTexts(source, metadata)
 	return {
 		source,
+		sourceHash,
 		metadata,
 		texts,
 		vectorIds: getVectorIdsForSmol(smolId),
@@ -840,6 +872,7 @@ async function upsertSmolVectors(env: Env, smolId: string, attempts: number): Pr
 		version: SEARCH_INDEX_VERSION,
 		queued_at: existing?.queued_at ?? nowIso(),
 		indexed_at: existing?.indexed_at,
+		source_hash: prepared.sourceHash,
 		vector_ids: prepared.vectorIds,
 		metadata: prepared.metadata,
 		last_error: undefined,
@@ -908,6 +941,7 @@ async function upsertSmolVectorBatch(env: Env, smolIds: string[], attempts: numb
 			version: SEARCH_INDEX_VERSION,
 			queued_at: existing?.queued_at ?? queuedAt,
 			indexed_at: existing?.indexed_at,
+			source_hash: entry.sourceHash,
 			vector_ids: entry.vectorIds,
 			metadata: entry.metadata,
 			last_error: undefined,
@@ -1300,6 +1334,7 @@ export async function queueSearchIndexingById(env: Env, smolId: string): Promise
 		version: SEARCH_INDEX_VERSION,
 		queued_at: nowIso(),
 		indexed_at: existing?.indexed_at,
+		source_hash: existing?.source_hash,
 		last_error: undefined,
 		mutation_id: undefined,
 		mutation_requested_at: undefined,
@@ -1317,19 +1352,89 @@ export async function queueSearchIndexingById(env: Env, smolId: string): Promise
 	return true
 }
 
-export async function queueSearchIndexingBatchById(env: Env, smolIds: string[]): Promise<string[]> {
+function isSearchMutationStillPending(
+	search: SearchState | undefined,
+	progress: Pick<SearchMutationProgress, 'processedMutation' | 'processedAt'>
+): boolean {
+	if (!search || search.version !== SEARCH_INDEX_VERSION) {
+		return false
+	}
+
+	if (search.status === 'queued' || search.status === 'processing') {
+		return true
+	}
+
+	if (search.status !== 'failed') {
+		return false
+	}
+
+	const mutationId = normalizeMutationTrackerValue(search.mutation_id)
+	const requestedAt = normalizeMutationTimestamp(search.mutation_requested_at ?? search.queued_at)
+	if (!mutationId || !requestedAt) {
+		return false
+	}
+
+	if (progress.processedMutation && progress.processedMutation === mutationId) {
+		return false
+	}
+
+	return progress.processedAt === undefined || requestedAt > progress.processedAt
+}
+
+export async function queueSearchIndexingBatchById(
+	env: Env,
+	smolIds: string[],
+	options: { force?: boolean } = {}
+): Promise<BatchQueueResult> {
 	const uniqueSmolIds = uniqueStrings(smolIds)
 	if (!uniqueSmolIds.length) {
-		return []
+		return {
+			queuedIds: [],
+			skipped: {
+				current: 0,
+				pending: 0,
+				missing: 0,
+			},
+		}
+	}
+
+	const info = await getSearchIndex(env).describe()
+	const progress = {
+		processedMutation: normalizeMutationTrackerValue(info.processedUpToMutation),
+		processedAt: normalizeMutationTimestamp(info.processedUpToDatetime),
+	}
+	const skipped: Record<BatchQueueSkipReason, number> = {
+		current: 0,
+		pending: 0,
+		missing: 0,
 	}
 
 	const queuedIds = (await Promise.all(uniqueSmolIds.map(async (smolId) => {
+		const record = await getStoredSmolRecord(env, smolId)
+		if (!record) {
+			skipped.missing += 1
+			return null
+		}
+
+		if (!options.force) {
+			if (isSearchQueryableState(record.search)) {
+				skipped.current += 1
+				return null
+			}
+
+			if (isSearchMutationStillPending(record.search, progress)) {
+				skipped.pending += 1
+				return null
+			}
+		}
+
 		const updated = await setSearchState(env, smolId, (existing) => ({
 			...(existing ?? createQueuedSearchState()),
 			status: 'queued',
 			version: SEARCH_INDEX_VERSION,
 			queued_at: nowIso(),
 			indexed_at: existing?.indexed_at,
+			source_hash: existing?.source_hash,
 			last_error: undefined,
 			mutation_id: undefined,
 			mutation_requested_at: undefined,
@@ -1345,7 +1450,10 @@ export async function queueSearchIndexingBatchById(env: Env, smolIds: string[]):
 		})
 	}))
 
-	return queuedIds
+	return {
+		queuedIds,
+		skipped,
+	}
 }
 
 export async function hideSmolFromSearch(env: Env, smolId: string): Promise<boolean> {

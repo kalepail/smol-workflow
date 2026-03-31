@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import test from 'node:test'
 import {
 	isSearchQueryableState,
@@ -343,11 +344,6 @@ function createBatchUpsertEnv() {
 			nsfw: 'safe',
 			song_ids: undefined,
 			songs: undefined,
-			search: {
-				status: 'queued',
-				version: SEARCH_INDEX_VERSION,
-				queued_at: '2026-03-31T12:00:00.000Z',
-			},
 		},
 		'smol-b': {
 			payload: {
@@ -363,22 +359,22 @@ function createBatchUpsertEnv() {
 			nsfw: 'safe',
 			song_ids: undefined,
 			songs: undefined,
-			search: {
-				status: 'queued',
-				version: SEARCH_INDEX_VERSION,
-				queued_at: '2026-03-31T12:00:00.000Z',
-			},
 		},
 	}
 
 	const finalizeMessages: SearchQueueMessage[] = []
 	const queuedMessages: SearchQueueMessage[] = []
 	const upserts: VectorizeVector[][] = []
+	const aiCalls = {
+		metadata: 0,
+		embedding: 0,
+	}
 
 	const env = {
 		AI: {
 			run: async (model: string, payload: unknown) => {
 				if (model === '@cf/meta/llama-3.2-3b-instruct') {
+					aiCalls.metadata += 1
 					const title = (payload as { messages: Array<{ content: string }> }).messages[1]?.content ?? ''
 					if (title.includes('Neon River')) {
 						return {
@@ -408,6 +404,7 @@ function createBatchUpsertEnv() {
 				}
 
 				if (model === '@cf/baai/bge-m3') {
+					aiCalls.embedding += 1
 					const texts = (payload as { text: string[] }).text
 					return {
 						data: texts.map((_text, index) => [index + 1, index + 2, index + 3]),
@@ -455,6 +452,12 @@ function createBatchUpsertEnv() {
 			},
 		},
 		SMOL_SEARCH_INDEX: {
+			describe: async () => ({
+				vectorCount: 0,
+				dimensions: 1024,
+				processedUpToMutation: 'old-mutation',
+				processedUpToDatetime: '2026-03-31T11:59:00.000Z',
+			}),
 			upsert: async (vectors: VectorizeVector[]) => {
 				upserts.push(vectors)
 				return { mutationId: 'batch-1' }
@@ -476,6 +479,7 @@ function createBatchUpsertEnv() {
 		getFinalizeMessages: () => finalizeMessages,
 		getQueuedMessages: () => queuedMessages,
 		getUpserts: () => upserts,
+		getAiCalls: () => aiCalls,
 	}
 }
 
@@ -630,9 +634,10 @@ test('upsert queue message indexes an instrumental smol even when lyrics are mis
 test('batch queue helper marks songs queued and sends a batched upsert message', async () => {
 	const { env, getRecords, getQueuedMessages } = createBatchUpsertEnv()
 
-	const queuedIds = await queueSearchIndexingBatchById(env, ['smol-a', 'smol-b'])
+	const batch = await queueSearchIndexingBatchById(env, ['smol-a', 'smol-b'])
 
-	assert.deepEqual(queuedIds, ['smol-a', 'smol-b'])
+	assert.deepEqual(batch.queuedIds, ['smol-a', 'smol-b'])
+	assert.deepEqual(batch.skipped, { current: 0, pending: 0, missing: 0 })
 	assert.equal(getRecords()['smol-a']?.search?.status, 'queued')
 	assert.equal(getRecords()['smol-b']?.search?.status, 'queued')
 	assert.equal(getQueuedMessages().length, 1)
@@ -663,6 +668,106 @@ test('upsert_batch queue message indexes multiple smols in one Vectorize request
 	assert.equal(getRecords()['smol-b']?.search?.status, 'processing')
 	assert.equal(getRecords()['smol-a']?.search?.mutation_id, 'batch-1')
 	assert.equal(getRecords()['smol-b']?.search?.mutation_id, 'batch-1')
+})
+
+test('batch queue helper skips current, pending, and missing records unless forced', async () => {
+	const { env, getRecords, getQueuedMessages } = createBatchUpsertEnv()
+	const records = getRecords()
+
+	records['smol-a'].search = {
+		status: 'ready',
+		version: SEARCH_INDEX_VERSION,
+		indexed_at: '2026-03-31T12:05:00.000Z',
+	}
+
+	records['smol-b'].search = {
+		status: 'failed',
+		version: SEARCH_INDEX_VERSION,
+		mutation_id: 'new-mutation',
+		mutation_requested_at: '2026-03-31T12:10:00.000Z',
+	}
+
+	const batch = await queueSearchIndexingBatchById(env, ['smol-a', 'smol-b', 'missing'])
+
+	assert.deepEqual(batch.queuedIds, [])
+	assert.deepEqual(batch.skipped, { current: 1, pending: 1, missing: 1 })
+	assert.equal(getQueuedMessages().length, 0)
+})
+
+test('batch queue helper force option overrides current and pending skips', async () => {
+	const { env, getRecords, getQueuedMessages } = createBatchUpsertEnv()
+	const records = getRecords()
+
+	records['smol-a'].search = {
+		status: 'ready',
+		version: SEARCH_INDEX_VERSION,
+		indexed_at: '2026-03-31T12:05:00.000Z',
+	}
+
+	records['smol-b'].search = {
+		status: 'failed',
+		version: SEARCH_INDEX_VERSION,
+		mutation_id: 'new-mutation',
+		mutation_requested_at: '2026-03-31T12:10:00.000Z',
+	}
+
+	const batch = await queueSearchIndexingBatchById(env, ['smol-a', 'smol-b'], { force: true })
+
+	assert.deepEqual(batch.queuedIds, ['smol-a', 'smol-b'])
+	assert.deepEqual(batch.skipped, { current: 0, pending: 0, missing: 0 })
+	assert.equal(getQueuedMessages().length, 1)
+})
+
+test('upsert reuses cached metadata when the source hash is unchanged', async () => {
+	const { env, getRecords, getAiCalls } = createBatchUpsertEnv()
+	const record = getRecords()['smol-a']
+	if (!record) {
+		throw new Error('Expected smol-a record')
+	}
+
+	record.search = {
+		status: 'queued',
+		version: SEARCH_INDEX_VERSION,
+		metadata: {
+		style_primary: 'cached style',
+		mood_primary: 'cached mood',
+		theme_primary: 'cached theme',
+		lyric_presence: 'sparse',
+		brightness_level: 'neutral',
+		energy_level: 'mid',
+		modality_guess: 'mixed',
+		style_tags: ['cached'],
+		title: 'Neon River',
+		},
+		source_hash: createHash('sha256')
+		.update(JSON.stringify({
+			id: 'smol-a',
+			title: 'Neon River',
+			public: true,
+			instrumental: false,
+			prompt: 'Warm dream pop',
+			description: 'A dreamy late-night pop song',
+			lyrics_title: 'Neon River',
+			lyrics: 'city lights drift softly through the night',
+			style: ['dream pop'],
+		}))
+		.digest('hex'),
+	}
+
+	const queued = createQueueMessage({
+		type: 'upsert',
+		smolId: 'smol-a',
+	})
+
+	await processSearchQueue(
+		{ messages: [queued.message] } as unknown as MessageBatch<SearchQueueMessage>,
+		env,
+		{} as ExecutionContext
+	)
+
+	assert.equal(queued.acked, 1)
+	assert.equal(getAiCalls().metadata, 0)
+	assert.equal(getAiCalls().embedding, 1)
 })
 
 test('search state remains queryable while a previously indexed smol is being refreshed', async () => {

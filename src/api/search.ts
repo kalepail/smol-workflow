@@ -71,6 +71,7 @@ search.post('/admin/backfill', async (c) => {
 
 	const url = new URL(c.req.url)
 	const { limit, cursor } = parsePaginationParams(url)
+	const force = parseBooleanParam(url.searchParams.get('force')) === true
 	const effectiveLimit = Math.min(limit, 100)
 	const whereClause = buildCursorWhereClause(cursor, 'Public = 1')
 	const bindings: unknown[] = []
@@ -93,7 +94,7 @@ search.post('/admin/backfill', async (c) => {
 		.bind(...bindings)
 		.all<{ Id: string; Created_At: string }>()
 
-	const queuedIds = await queueSearchIndexingBatchById(c.env, results.map(({ Id }) => Id))
+	const batch = await queueSearchIndexingBatchById(c.env, results.map(({ Id }) => Id), { force })
 	const pagination = buildPaginationResponse(
 		results,
 		effectiveLimit,
@@ -103,7 +104,8 @@ search.post('/admin/backfill', async (c) => {
 
 	c.header('Cache-Control', 'no-store')
 	return c.json({
-		queued: queuedIds.length,
+		queued: batch.queuedIds.length,
+		skipped: batch.skipped,
 		pagination,
 	})
 })

@@ -43,6 +43,7 @@ interface SearchState {
 	version: string
 	queued_at?: string
 	indexed_at?: string
+	source_hash?: string
 	vector_ids?: string[]
 	metadata?: SearchStoredMetadata
 	last_error?: string
