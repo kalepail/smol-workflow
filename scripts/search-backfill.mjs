@@ -145,6 +145,7 @@ function formatInfo(info) {
 }
 
 async function waitForWave(options, wave) {
+	const startedAt = Date.now()
 	let stallPolls = 0
 	let lastMutation = wave.before.processedUpToMutation
 	let lastVectorCount = wave.before.vectorCount ?? 0
@@ -162,9 +163,10 @@ async function waitForWave(options, wave) {
 		const pending = reconcile.skipped?.pending ?? 0
 		const advanced = info.processedUpToMutation !== lastMutation || (info.vectorCount ?? 0) > lastVectorCount
 		const pendingImproved = pending < lastPending
+		const elapsedSeconds = Math.round((Date.now() - startedAt) / 1000)
 
 		console.log(
-			`poll wave=${wave.wave} pending=${pending} ready=${reconcile.ready} requeued=${reconcile.requeued} ${formatInfo(info)}`
+			`poll wave=${wave.wave} elapsed=${elapsedSeconds}s pending=${pending} ready=${reconcile.ready} requeued=${reconcile.requeued} ${formatInfo(info)}`
 		)
 
 		if (pending === 0) {
@@ -230,7 +232,8 @@ async function main() {
 		const waveCursor = cursor
 		cursor = backfill.pagination?.nextCursor
 
-		if (backfill.queued > 0) {
+		const shouldWait = backfill.queued > 0 || (backfill.queued === 0 && (backfill.skipped?.pending ?? 0) > 0)
+		if (shouldWait) {
 			const outcome = await waitForWave(options, {
 				wave,
 				cursor: waveCursor,
