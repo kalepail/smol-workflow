@@ -15,7 +15,7 @@ import mixtapes from './api/mixtapes'
 import mint from './api/mint'
 import media from './api/media'
 import search from './api/search'
-import { processSearchQueue } from './utils/search'
+import { processSearchQueue, runSearchBackfillCron } from './utils/search'
 
 export const app = new Hono<HonoEnv>()
 
@@ -53,6 +53,9 @@ app.notFound((c) => {
 const handler = {
 	fetch: app.fetch,
 	queue: (batch, env, ctx) => processSearchQueue(batch as MessageBatch<SearchQueueMessage>, env, ctx),
+	scheduled: (_controller, env, ctx) => {
+		ctx.waitUntil(runSearchBackfillCron(env))
+	},
 } satisfies ExportedHandler<Env>
 
 export { Workflow, TxWorkflow, SmolDurableObject, SmolState, handler as default }

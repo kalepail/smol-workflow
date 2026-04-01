@@ -7,6 +7,10 @@ declare namespace Cloudflare {
 		SK: string
 		CF_API_TOKEN: string
 		CF_ZONE_ID: string
+		SEARCH_BACKFILL_CRON_ENABLED: string
+		SEARCH_BACKFILL_CRON_PAGE_LIMIT: string
+		SEARCH_BACKFILL_CRON_STALL_RUNS: string
+		SEARCH_BACKFILL_CRON_MAX_WAVES: string
 		SMOL_SEARCH_INDEX: Vectorize
 		SEARCH_QUEUE: Queue<SearchQueueMessage>
 	}

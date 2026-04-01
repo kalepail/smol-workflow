@@ -74,6 +74,55 @@ By default it now:
 
 If the script reports a stall, resume later with `--resume-from-state` or the cursor it prints.
 
+## 7. Optional cron backfill
+
+This repo now includes a bounded scheduled backfill step in the Worker itself.
+It is intended as a safe maintenance pass, not a high-throughput bulk loader:
+
+- it processes up to a bounded number of pages per cron run
+- it uses the same backfill + reconcile helpers as the admin routes
+- it keeps a cursor checkpoint in `SMOL_KV`
+- it does not advance the cursor while the current page still has pending items
+- it records health, recent run history, and Vectorize watermark snapshots for monitoring
+- once a full pass completes for the current `SEARCH_INDEX_VERSION`, it stops re-scanning
+
+The default production config runs every 5 minutes with a page limit of 20 and up to 5
+stable pages per invocation:
+
+```jsonc
+"vars": {
+  "SEARCH_BACKFILL_CRON_ENABLED": "true",
+  "SEARCH_BACKFILL_CRON_PAGE_LIMIT": "20",
+  "SEARCH_BACKFILL_CRON_STALL_RUNS": "6",
+  "SEARCH_BACKFILL_CRON_MAX_WAVES": "5"
+},
+"triggers": {
+  "crons": ["*/5 * * * *"]
+}
+```
+
+The cron worker now behaves more like the local backfill runner:
+- it can advance through several already-current pages in one invocation
+- it still stops immediately once a page queues new work or has pending items
+- it resumes from the held cursor on the next scheduled run
+
+If you need a faster catch-up, use the manual wave runner first, then leave cron enabled as a
+safe low-pressure completion and repair loop.
+
+To inspect the cron monitor remotely, call:
+
+```bash
+curl -H "x-admin-secret: $SMOL_ADMIN_SECRET" \
+  https://api.smol.xyz/search/admin/backfill/status
+```
+
+The response includes:
+- current cron `status` and `health`
+- the held or next cursor
+- `consecutiveStalledRuns` against the configured threshold
+- the latest Vectorize watermark snapshot
+- a short `recentRuns` history for debugging
+
 ## Notes
 
 - Existing vectors inserted before metadata indexes were created must be re-upserted.

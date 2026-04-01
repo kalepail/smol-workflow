@@ -2,12 +2,14 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import test from 'node:test'
 import {
+	getSearchBackfillCronStatus,
 	isSearchQueryableState,
 	normalizeExtractedSearchMetadata,
 	processSearchQueue,
 	queueSearchIndexingBatchById,
 	queueSearchIndexingById,
 	reconcileSearchIndexingBatchById,
+	runSearchBackfillCron,
 	SEARCH_INDEX_VERSION,
 	tryParseJsonObject,
 } from '../src/utils/search'
@@ -16,6 +18,7 @@ import { requireOwnedVisibilityToggle } from '../src/utils/search-visibility'
 type MockPreparedStatement = {
 	bind: (...args: unknown[]) => {
 		first: <T>() => Promise<T | null>
+		all: <T>() => Promise<{ results: T[] }>
 		run: () => Promise<unknown>
 	}
 }
@@ -87,6 +90,7 @@ function createFinalizeRetryEnv() {
 								}
 								return null as T | null
 							},
+							all: async <T>() => ({ results: [] as T[] }),
 							run: async () => ({ success: true }),
 						}
 					},
@@ -152,6 +156,7 @@ function createFinalizeTimestampOnlyEnv() {
 								}
 								return null as T | null
 							},
+							all: async <T>() => ({ results: [] as T[] }),
 							run: async () => ({ success: true }),
 						}
 					},
@@ -220,6 +225,7 @@ function createFinalizeReadyEnv() {
 								}
 								return null as T | null
 							},
+							all: async <T>() => ({ results: [] as T[] }),
 							run: async () => ({ success: true }),
 						}
 					},
@@ -270,6 +276,7 @@ function createUpsertRetryEnv() {
 
 								return null as T | null
 							},
+							all: async <T>() => ({ results: [] as T[] }),
 							run: async () => ({ success: true }),
 						}
 					},
@@ -372,6 +379,7 @@ function createInstrumentalUpsertEnv() {
 
 								return null as T | null
 							},
+							all: async <T>() => ({ results: [] as T[] }),
 							run: async () => ({ success: true }),
 						}
 					},
@@ -516,6 +524,7 @@ function createBatchUpsertEnv() {
 
 								return null as T | null
 							},
+							all: async <T>() => ({ results: [] as T[] }),
 							run: async () => ({ success: true }),
 						}
 					},
@@ -681,6 +690,110 @@ function createReconcileEnv() {
 		env,
 		getRecords: () => records,
 		getQueuedMessages: () => queuedMessages,
+	}
+}
+
+function createCronBackfillEnv(options: {
+	cursor?: string
+	records: Record<string, WorkflowSteps>
+	maxWaves?: string
+	pages?: Array<Array<{ Id: string; Created_At: string }>>
+}) {
+	const kv = new Map<string, WorkflowSteps | Record<string, unknown>>(
+		Object.entries(options.records)
+	)
+	const queueMessages: SearchQueueMessage[] = []
+	const pages = options.pages ?? [[
+		{ Id: 'smol-a', Created_At: '2026-03-31 12:00:00' },
+		{ Id: 'smol-b', Created_At: '2026-03-31 11:00:00' },
+	]]
+	let pageReads = 0
+
+	if (options.cursor) {
+		kv.set('__internal:search-backfill:v2', {
+			version: SEARCH_INDEX_VERSION,
+			status: 'waiting',
+			health: 'watching',
+			cursor: options.cursor,
+			updated_at: '2026-03-31T12:00:00.000Z',
+			last_progress_at: '2026-03-31T12:00:00.000Z',
+			page_limit: 2,
+			stall_threshold_runs: 2,
+			consecutive_stalled_runs: 0,
+			last_next_cursor: null,
+			last_vectorize: {
+				vector_count: 10,
+				dimensions: 1024,
+				processed_up_to_mutation: 'mutation-other',
+				processed_up_to_datetime: '2026-03-31T12:30:00.000Z',
+			},
+			last_stats: {
+				page_size: 2,
+				queued: 0,
+				skipped: { current: 0, pending: 2, missing: 0 },
+				reconcile: {
+					ready: 0,
+					requeued: 0,
+					skipped: { current: 0, hidden: 0, pending: 2, missing: 0, no_state: 0 },
+				},
+				has_more: true,
+			},
+			recent_runs: [],
+		})
+	}
+
+	const env = {
+		SEARCH_BACKFILL_CRON_ENABLED: 'true',
+		SEARCH_BACKFILL_CRON_PAGE_LIMIT: '2',
+		SEARCH_BACKFILL_CRON_STALL_RUNS: '2',
+		SEARCH_BACKFILL_CRON_MAX_WAVES: options.maxWaves ?? '1',
+		SMOL_KV: {
+			get: async (key: string) => kv.get(key) ?? null,
+			put: async (key: string, value: string) => {
+				kv.set(key, JSON.parse(value) as WorkflowSteps)
+			},
+		},
+		SMOL_D1: {
+			prepare(sql: string): MockPreparedStatement {
+				return {
+					bind() {
+						return {
+							first: async <T>() => null as T | null,
+							all: async <T>() => {
+								if (sql.includes('SELECT Id, Created_At')) {
+									const rows = pages[Math.min(pageReads, pages.length - 1)] ?? []
+									pageReads += 1
+									return { results: rows as T[] }
+								}
+
+								return { results: [] as T[] }
+							},
+							run: async () => ({ success: true }),
+						}
+					},
+				}
+			},
+		},
+		SMOL_SEARCH_INDEX: {
+			describe: async () => ({
+				vectorCount: 10,
+				dimensions: 1024,
+				processedUpToMutation: 'mutation-other',
+				processedUpToDatetime: '2026-03-31T12:30:00.000Z',
+			}),
+		},
+		SEARCH_QUEUE: {
+			send: async (message: SearchQueueMessage) => {
+				queueMessages.push(message)
+			},
+		},
+	} as unknown as Env
+
+	return {
+		env,
+		getQueueMessages: () => queueMessages,
+		getState: () => kv.get('__internal:search-backfill:v2') as Record<string, unknown> | undefined,
+		getPageReads: () => pageReads,
 	}
 }
 
@@ -1032,4 +1145,258 @@ test('search state is not queryable before the first successful index', () => {
 		version: SEARCH_INDEX_VERSION,
 		indexed_at: '2026-03-31T12:05:00.000Z',
 	}), false)
+})
+
+test('scheduled backfill cron holds its cursor while the current page still has pending work', async () => {
+	const { env, getQueueMessages, getState } = createCronBackfillEnv({
+		cursor: 'cursor-1',
+		records: {
+			'smol-a': {
+				payload: {},
+				image_base64: undefined,
+				description: 'A searchable song',
+				lyrics: {
+					title: 'Song A',
+					style: ['dream pop'],
+					lyrics: 'hello world',
+				},
+				nsfw: 'safe',
+				song_ids: undefined,
+				songs: undefined,
+			},
+			'smol-b': {
+				payload: {},
+				image_base64: undefined,
+				description: 'Another searchable song',
+				lyrics: {
+					title: 'Song B',
+					style: ['folk'],
+					lyrics: 'hello again',
+				},
+				nsfw: 'safe',
+				song_ids: undefined,
+				songs: undefined,
+			},
+		},
+	})
+
+	const result = await runSearchBackfillCron(env)
+
+	assert.equal(result.status, 'waiting')
+	assert.equal(result.cursor, 'cursor-1')
+	assert.equal(result.queued, 2)
+	assert.equal(result.reconcile.skipped.pending, 2)
+	assert.equal(getQueueMessages().length, 1)
+	assert.equal(getQueueMessages()[0]?.type, 'upsert_batch')
+	assert.equal(getState()?.status, 'waiting')
+	assert.equal(getState()?.cursor, 'cursor-1')
+})
+
+test('scheduled backfill cron advances once the current page is already stable', async () => {
+	const { env, getQueueMessages, getState } = createCronBackfillEnv({
+		cursor: 'cursor-1',
+		records: {
+			'smol-a': {
+				payload: {},
+				image_base64: undefined,
+				description: 'Already indexed',
+				lyrics: {
+					title: 'Song A',
+					style: ['dream pop'],
+					lyrics: 'hello world',
+				},
+				nsfw: 'safe',
+				song_ids: undefined,
+				songs: undefined,
+				search: {
+					status: 'ready',
+					version: SEARCH_INDEX_VERSION,
+					indexed_at: '2026-03-31T12:05:00.000Z',
+				},
+			},
+			'smol-b': {
+				payload: {},
+				image_base64: undefined,
+				description: 'Already indexed too',
+				lyrics: {
+					title: 'Song B',
+					style: ['folk'],
+					lyrics: 'hello again',
+				},
+				nsfw: 'safe',
+				song_ids: undefined,
+				songs: undefined,
+				search: {
+					status: 'ready',
+					version: SEARCH_INDEX_VERSION,
+					indexed_at: '2026-03-31T12:06:00.000Z',
+				},
+			},
+		},
+	})
+
+	const result = await runSearchBackfillCron(env)
+
+	assert.equal(result.status, 'idle')
+	assert.equal(result.queued, 0)
+	assert.equal(result.reconcile.skipped.current, 2)
+	assert.equal(getQueueMessages().length, 0)
+	assert.equal(getState()?.status, 'idle')
+	assert.equal(getState()?.cursor, result.nextCursor)
+	assert.ok(typeof result.nextCursor === 'string' && result.nextCursor.length > 0)
+})
+
+test('scheduled backfill cron reports stalled health after repeated waiting with no progress', async () => {
+	const { env, getState } = createCronBackfillEnv({
+		cursor: 'cursor-1',
+		records: {
+			'smol-a': {
+				payload: {},
+				image_base64: undefined,
+				description: 'A searchable song',
+				lyrics: {
+					title: 'Song A',
+					style: ['dream pop'],
+					lyrics: 'hello world',
+				},
+				nsfw: 'safe',
+				song_ids: undefined,
+				songs: undefined,
+				search: {
+					status: 'processing',
+					version: SEARCH_INDEX_VERSION,
+					queued_at: '2026-03-31T12:00:00.000Z',
+					mutation_id: 'mutation-a',
+					mutation_requested_at: '2026-03-31T13:00:01.000Z',
+				},
+			},
+			'smol-b': {
+				payload: {},
+				image_base64: undefined,
+				description: 'Another searchable song',
+				lyrics: {
+					title: 'Song B',
+					style: ['folk'],
+					lyrics: 'hello again',
+				},
+				nsfw: 'safe',
+				song_ids: undefined,
+				songs: undefined,
+				search: {
+					status: 'processing',
+					version: SEARCH_INDEX_VERSION,
+					queued_at: '2026-03-31T12:00:00.000Z',
+					mutation_id: 'mutation-b',
+					mutation_requested_at: '2026-03-31T13:00:01.000Z',
+				},
+			},
+		},
+	})
+
+	const first = await runSearchBackfillCron(env)
+	const second = await runSearchBackfillCron(env)
+	const status = await getSearchBackfillCronStatus(env)
+
+	assert.equal(first.health, 'watching')
+	assert.equal(second.health, 'stalled')
+	assert.equal(second.consecutiveStalledRuns, 2)
+	assert.equal(status.health, 'stalled')
+	assert.equal(status.consecutiveStalledRuns, 2)
+	assert.equal(status.stallThresholdRuns, 2)
+	assert.equal(getState()?.health, 'stalled')
+	assert.equal(Array.isArray(status.recentRuns), true)
+	assert.equal(status.recentRuns?.length, 2)
+})
+
+test('scheduled backfill cron can advance across stable pages before stopping on a pending page', async () => {
+	const { env, getQueueMessages, getState, getPageReads } = createCronBackfillEnv({
+		cursor: 'cursor-1',
+		maxWaves: '2',
+		pages: [
+			[
+				{ Id: 'smol-a', Created_At: '2026-03-31 12:00:00' },
+				{ Id: 'smol-b', Created_At: '2026-03-31 11:00:00' },
+			],
+			[
+				{ Id: 'smol-c', Created_At: '2026-03-31 10:00:00' },
+				{ Id: 'smol-d', Created_At: '2026-03-31 09:00:00' },
+			],
+		],
+		records: {
+			'smol-a': {
+				payload: {},
+				image_base64: undefined,
+				description: 'Already indexed',
+				lyrics: {
+					title: 'Song A',
+					style: ['dream pop'],
+					lyrics: 'hello world',
+				},
+				nsfw: 'safe',
+				song_ids: undefined,
+				songs: undefined,
+				search: {
+					status: 'ready',
+					version: SEARCH_INDEX_VERSION,
+					indexed_at: '2026-03-31T12:05:00.000Z',
+				},
+			},
+			'smol-b': {
+				payload: {},
+				image_base64: undefined,
+				description: 'Already indexed too',
+				lyrics: {
+					title: 'Song B',
+					style: ['folk'],
+					lyrics: 'hello again',
+				},
+				nsfw: 'safe',
+				song_ids: undefined,
+				songs: undefined,
+				search: {
+					status: 'ready',
+					version: SEARCH_INDEX_VERSION,
+					indexed_at: '2026-03-31T12:06:00.000Z',
+				},
+			},
+			'smol-c': {
+				payload: {},
+				image_base64: undefined,
+				description: 'Needs indexing',
+				lyrics: {
+					title: 'Song C',
+					style: ['ambient'],
+					lyrics: 'fresh page new work',
+				},
+				nsfw: 'safe',
+				song_ids: undefined,
+				songs: undefined,
+			},
+			'smol-d': {
+				payload: {},
+				image_base64: undefined,
+				description: 'Needs indexing too',
+				lyrics: {
+					title: 'Song D',
+					style: ['house'],
+					lyrics: 'keep moving forward',
+				},
+				nsfw: 'safe',
+				song_ids: undefined,
+				songs: undefined,
+			},
+		},
+	})
+
+	const result = await runSearchBackfillCron(env)
+
+	assert.equal(result.status, 'waiting')
+	assert.equal(result.queued, 2)
+	assert.equal(result.skipped.current, 2)
+	assert.equal(result.reconcile.skipped.pending, 2)
+	assert.equal(getQueueMessages().length, 1)
+	assert.equal(getQueueMessages()[0]?.type, 'upsert_batch')
+	assert.equal(getPageReads(), 2)
+	assert.equal(getState()?.status, 'waiting')
+	assert.equal(getState()?.cursor, result.cursor)
 })
