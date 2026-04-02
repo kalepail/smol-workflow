@@ -448,6 +448,87 @@ smols.put('/:smol_id/:song_id', parseAuth, async (c) => {
 	return c.body(null, 204)
 })
 
+// Admin bulk delete (gated behind SECRET token, skips minted/public)
+smols.delete('/admin/bulk', parseAuth, async (c) => {
+	if (!c.get('isAdmin')) {
+		throw new HTTPException(403, { message: 'Admin access required' })
+	}
+
+	const { env } = c
+	const { ids, allowPublic }: { ids: string[]; allowPublic?: boolean } = await c.req.json()
+
+	if (!Array.isArray(ids) || ids.length === 0) {
+		throw new HTTPException(400, { message: 'Missing ids array' })
+	}
+
+	if (ids.length > 100) {
+		throw new HTTPException(400, { message: 'Max 100 ids per request' })
+	}
+
+	let deleted = 0
+	const skipped: string[] = []
+
+	for (const id of ids) {
+		const smol = await env.SMOL_D1.prepare(`SELECT Id, Mint_Token, Public, Address FROM Smols WHERE Id = ?1`)
+			.bind(id)
+			.first<{ Id: string; Mint_Token: string | null; Public: number; Address: string }>()
+
+		if (!smol) {
+			skipped.push(id)
+			continue
+		}
+
+		if (smol.Mint_Token) {
+			skipped.push(id)
+			continue
+		}
+
+		if (smol.Public && !allowPublic) {
+			skipped.push(id)
+			continue
+		}
+
+		await env.SMOL_D1.prepare(`DELETE FROM Smols WHERE Id = ?1`).bind(id).run()
+		await env.SMOL_D1.prepare(`DELETE FROM Likes WHERE Id = ?1`).bind(id).run()
+
+		const smolKv: any = await env.SMOL_KV.get(id, 'json')
+
+		try {
+			if (isDurableObjectId(id)) {
+				const doid = env.DURABLE_OBJECT.idFromString(id)
+				const stub = env.DURABLE_OBJECT.get(doid)
+				await stub.setToFlush()
+			}
+		} catch {}
+
+		await env.SMOL_KV.delete(id)
+		await env.SMOL_BUCKET.delete(`${id}.png`)
+
+		if (smolKv?.songs) {
+			for (const song of smolKv.songs) {
+				await env.SMOL_BUCKET.delete(`${song.music_id}.mp3`)
+			}
+		}
+
+		c.executionCtx.waitUntil(
+			queueSearchDeletionById(env, id).catch(() => {})
+		)
+
+		// Purge caches for this smol's owner
+		c.executionCtx.waitUntil(
+			purgeCacheByTags([
+				`user:${smol.Address}:created`,
+				`user:${smol.Address}:smol:${id}`,
+				`smol:${id}:anonymous`,
+			])
+		)
+
+		deleted++
+	}
+
+	return c.json({ deleted, skipped: skipped.length, total: ids.length })
+})
+
 // Delete smol
 smols.delete('/:id', parseAuth, async (c) => {
 	const { env, req } = c

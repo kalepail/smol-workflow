@@ -16,6 +16,7 @@ export async function parseAuth(c: Context<HonoEnv>, next: Next) {
 
 		if (token === c.env.SECRET) {
 			// Admin token
+			c.set('isAdmin', true)
 		} else if (token) {
 			c.set('jwtPayload', await verify(token, c.env.SECRET, 'HS256'))
 		} else {
