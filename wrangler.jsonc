@@ -90,7 +90,10 @@
                 "retry_delay": 5
             },
             {
-                "queue": "smol-search-queue-dlq"
+                "queue": "smol-search-queue-dlq",
+                "max_batch_size": 5,
+                "max_batch_timeout": 10,
+                "max_retries": 0
             }
         ]
     },
@@ -147,7 +150,7 @@
     ],
     "triggers": {
         "crons": [
-            "*/5 * * * *"
+            "0 * * * *"
         ]
     },
     "r2_buckets": [
