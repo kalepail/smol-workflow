@@ -2493,7 +2493,14 @@ export async function processSearchQueue(batch: MessageBatch<SearchQueueMessage>
 							mutation_requested_at: existing?.mutation_requested_at,
 						}))
 					}))
-				} else if (message.body.type !== 'delete') {
+				} else if (message.body.type === 'delete') {
+					logSearchEvent('search_delete_failed_permanently', {
+						smolId: message.body.smolId,
+						vectorIds: message.body.vectorIds ?? getVectorIdsForSmol(message.body.smolId),
+						attempts: message.attempts,
+						error: error instanceof Error ? error.message : String(error),
+					})
+				} else {
 					const { smolId } = message.body
 					await setSearchState(env, smolId, (existing) => ({
 						...(existing ?? createQueuedSearchState()),
@@ -2515,5 +2522,26 @@ export async function processSearchQueue(batch: MessageBatch<SearchQueueMessage>
 				delaySeconds: Math.min(60, Math.max(5, message.attempts * 5)),
 			})
 		}
+	}
+}
+
+export async function processSearchDLQ(batch: MessageBatch<SearchQueueMessage>, env: Env, _ctx: ExecutionContext): Promise<void> {
+	for (const message of batch.messages) {
+		logSearchEvent('search_dlq_received', {
+			type: message.body.type,
+			body: message.body,
+			attempts: message.attempts,
+		})
+
+		if (message.body.type === 'delete') {
+			try {
+				await deleteSmolVectors(env, message.body.smolId, message.body.vectorIds ?? getVectorIdsForSmol(message.body.smolId))
+				logSearchEvent('search_dlq_delete_recovered', { smolId: message.body.smolId })
+			} catch (error) {
+				console.error('DLQ delete retry failed:', message.body.smolId, error)
+			}
+		}
+
+		message.ack()
 	}
 }

@@ -15,7 +15,7 @@ import mixtapes from './api/mixtapes'
 import mint from './api/mint'
 import media from './api/media'
 import search from './api/search'
-import { processSearchQueue, runSearchBackfillCron } from './utils/search'
+import { processSearchQueue, processSearchDLQ, runSearchBackfillCron } from './utils/search'
 
 export const app = new Hono<HonoEnv>()
 
@@ -52,7 +52,12 @@ app.notFound((c) => {
 // Export handler
 const handler = {
 	fetch: app.fetch,
-	queue: (batch, env, ctx) => processSearchQueue(batch as MessageBatch<SearchQueueMessage>, env, ctx),
+	queue: (batch, env, ctx) => {
+		if (batch.queue === 'smol-search-queue-dlq') {
+			return processSearchDLQ(batch as MessageBatch<SearchQueueMessage>, env, ctx)
+		}
+		return processSearchQueue(batch as MessageBatch<SearchQueueMessage>, env, ctx)
+	},
 	scheduled: (_controller, env, ctx) => {
 		ctx.waitUntil(runSearchBackfillCron(env))
 	},
