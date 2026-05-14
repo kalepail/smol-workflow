@@ -128,4 +128,6 @@ type WorkflowTxParams = {
 	xdr: string
 	ids?: string[]    // Required for 'batch-mint', not used for 'mint'
 	sub: string       // JWT sub of the user who initiated the mint
+	ownerSub?: string
+	ownerSubsById?: Record<string, string>
 }

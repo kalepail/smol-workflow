@@ -107,12 +107,18 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
                     throw new NonRetryableError('Smol already has mint metadata');
                 }
 
+                const ownerSub = event.payload.ownerSub ?? event.payload.sub;
+                const userTags = new Set([
+                    `user:${ownerSub}:created`,
+                    `user:${ownerSub}:smol:${event.payload.entropy}`,
+                    `user:${event.payload.sub}:smol:${event.payload.entropy}`,
+                ]);
+
                 // Purge cached list/detail payloads that include mint metadata.
                 await purgeCacheByTags([
                     'public-smols',
                     'mixtapes',
-                    `user:${event.payload.sub}:created`,
-                    `user:${event.payload.sub}:smol:${event.payload.entropy}`,
+                    ...userTags,
                     `smol:${event.payload.entropy}:anonymous`,
                 ]);
             });
@@ -125,7 +131,7 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
                 }
 
                 // Collect smol IDs for cache purging
-                const smolCacheTags: string[] = [];
+                const smolCacheTags = new Set<string>();
 
                 for (let i = 0; i < results.length; i++) {
                     const [tokenSACAddress, cometAMMAddress] = results[i];
@@ -143,16 +149,19 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
                         console.warn(`Smol ${id} already has mint metadata`);
                     }
 
+                    const ownerSub = event.payload.ownerSubsById?.[id] ?? event.payload.sub;
+
                     // Collect cache tags for list/detail payloads that include mint metadata.
-                    smolCacheTags.push(`user:${event.payload.sub}:smol:${id}`);
-                    smolCacheTags.push(`smol:${id}:anonymous`);
+                    smolCacheTags.add(`user:${ownerSub}:created`);
+                    smolCacheTags.add(`user:${ownerSub}:smol:${id}`);
+                    smolCacheTags.add(`user:${event.payload.sub}:smol:${id}`);
+                    smolCacheTags.add(`smol:${id}:anonymous`);
                 }
 
-                if (smolCacheTags.length > 0) {
+                if (smolCacheTags.size > 0) {
                     await purgeCacheByTags([
                         'public-smols',
                         'mixtapes',
-                        `user:${event.payload.sub}:created`,
                         ...smolCacheTags,
                     ]);
                 }

@@ -1,19 +1,30 @@
 import { Hono } from 'hono'
 import { HTTPException } from 'hono/http-exception'
+import { xdr as stellarXdr } from '@stellar/stellar-sdk/minimal'
 import type { HonoEnv } from '../types'
 import { parseAuth } from '../middleware/auth'
 
 const mint = new Hono<HonoEnv>()
 const MAX_BATCH_MINT_IDS = 100
-const MAX_SIGNED_XDR_LENGTH = 10000
+// Current Mainnet Soroban contract_bandwidth_v0.tx_max_size_bytes.
+// Verified with `stellar network settings` on 2026-05-14; update if validators
+// change network transaction bandwidth limits.
+const MAX_SIGNED_XDR_BYTES = 132096
 
 function assertSignedXdr(value: unknown): string {
 	if (!value || typeof value !== 'string') {
 		throw new HTTPException(400, { message: 'Missing signed transaction' })
 	}
 
-	if (value.length > MAX_SIGNED_XDR_LENGTH) {
-		throw new HTTPException(400, { message: 'Signed transaction is too large' })
+	let byteLength: number
+	try {
+		byteLength = stellarXdr.TransactionEnvelope.fromXDR(value, 'base64').toXDR().length
+	} catch {
+		throw new HTTPException(400, { message: 'Invalid signed transaction XDR' })
+	}
+
+	if (byteLength > MAX_SIGNED_XDR_BYTES) {
+		throw new HTTPException(400, { message: `Signed transaction exceeds ${MAX_SIGNED_XDR_BYTES} bytes` })
 	}
 
 	return value
@@ -70,6 +81,7 @@ mint.post('/', parseAuth, async (c) => {
 		throw new HTTPException(404, { message: 'Some smols not found' })
 	}
 
+	const ownerSubsById: Record<string, string> = {}
 	for (const record of smolRecords.results) {
 		if (record.Mint_Token || record.Mint_Amm) {
 			throw new HTTPException(409, { message: `Smol ${record.Id} already minted` })
@@ -77,17 +89,19 @@ mint.post('/', parseAuth, async (c) => {
 		if (!record.Address) {
 			throw new HTTPException(404, { message: `Smol ${record.Id} not found` })
 		}
-		if (record.Address !== payload.sub) {
-			throw new HTTPException(403, { message: `Smol ${record.Id} not owned by you` })
-		}
+		ownerSubsById[record.Id] = record.Address
 	}
 
+	// Do not require Smols.Address to match the authenticated user. Minting is
+	// intentionally an artist/collector action, and public smols may be minted by
+	// people who did not create the original generated smol.
 	await env.TX_WORKFLOW.create({
 		params: {
 			type: 'batch-mint',
 			xdr,
 			ids,
 			sub: payload.sub,
+			ownerSubsById,
 		},
 	})
 
@@ -128,16 +142,16 @@ mint.post('/:id', parseAuth, async (c) => {
 		throw new HTTPException(404, { message: 'Smol not found' })
 	}
 
-	if (smolRecord.Address !== payload.sub) {
-		throw new HTTPException(403, { message: 'Smol not owned by you' })
-	}
-
+	// Do not require Smols.Address to match the authenticated user. Minting is
+	// intentionally an artist/collector action, and public smols may be minted by
+	// people who did not create the original generated smol.
 	await env.TX_WORKFLOW.create({
 		params: {
 			type: 'mint',
 			xdr,
 			entropy: id,
 			sub: payload.sub,
+			ownerSub: smolRecord.Address,
 		},
 	})
 
