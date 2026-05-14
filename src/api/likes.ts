@@ -24,7 +24,7 @@ likes.get(
 			SELECT l.Id
 			FROM Likes l
 			INNER JOIN Smols s ON s.Id = l.Id
-			WHERE l."Address" = ?1 AND s.Public = 1
+			WHERE l."Address" = ?1
 		`)
 			.bind(payload.sub)
 			.all()
@@ -60,13 +60,13 @@ likes.put('/:id', parseAuth, async (c) => {
 	}
 
 	const smol = await env.SMOL_D1.prepare(
-		`SELECT 1 FROM Smols WHERE Id = ?1 AND Public = 1`
+		`SELECT 1 FROM Smols WHERE Id = ?1`
 	)
 		.bind(id)
 		.first()
 
 	if (!smol) {
-		throw new HTTPException(404, { message: 'Smol not found or not public' })
+		throw new HTTPException(404, { message: 'Smol not found' })
 	}
 
 	await env.SMOL_D1.prepare(`INSERT OR IGNORE INTO Likes (Id, "Address") VALUES (?1, ?2)`)

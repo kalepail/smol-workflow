@@ -176,7 +176,7 @@ smols.get(
 		const payload = c.get('jwtPayload')!
 		const { limit, cursor } = parsePaginationParams(new URL(req.url))
 
-	const whereClause = buildCursorWhereClause(cursor, 'l."Address" = ? AND s.Public = 1', 's.')
+	const whereClause = buildCursorWhereClause(cursor, 'l."Address" = ?', 's.')
 	const bindings: any[] = []
 
 	let query: string
@@ -243,10 +243,6 @@ smols.get(
 			.first<SmolD1Record>()
 
 		if (smol_d1) {
-			if (smol_d1.Public !== 1 && smol_d1.Address !== payload?.sub) {
-				throw new HTTPException(404, { message: 'Smol not found' })
-			}
-
 			if (payload?.sub) {
 				const likedRow = await env.SMOL_D1.prepare(
 					`SELECT 1 FROM Likes WHERE Id = ?1 AND "Address" = ?2`
@@ -276,9 +272,7 @@ smols.get(
 				liked,
 			})
 
-			if (smol_d1.Public !== 1) {
-				response.headers.set('Cache-Control', 'no-store')
-			} else if (payload?.sub) {
+			if (payload?.sub) {
 				response.headers.set('Cache-Control', 'private, max-age=30')
 			} else {
 				response.headers.set('Cache-Control', 'public, max-age=30, stale-while-revalidate=60')
