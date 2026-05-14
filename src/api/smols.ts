@@ -18,7 +18,9 @@ import { queueSearchDeletionById } from '../utils/search'
 import { requireOwnedVisibilityToggle, syncSearchVisibilityAfterToggle } from '../utils/search-visibility'
 
 const smols = new Hono<HonoEnv>()
-const MAX_PROMPT_LENGTH = 2000
+// Keep these in sync with smol-fe generation controls and provider payload limits.
+const MAX_LYRICAL_PROMPT_LENGTH = 2280
+const MAX_INSTRUMENTAL_PROMPT_LENGTH = 380
 
 interface SmolListItem {
 	Id: string
@@ -347,8 +349,11 @@ smols.post('/', parseAuth, async (c) => {
 		throw new HTTPException(400, { message: 'Missing prompt' })
 	}
 
-	if (body.prompt.length > MAX_PROMPT_LENGTH) {
-		throw new HTTPException(400, { message: `Prompt must be ${MAX_PROMPT_LENGTH} characters or less` })
+	const isInstrumental = body.instrumental ?? false
+	const maxPromptLength = isInstrumental ? MAX_INSTRUMENTAL_PROMPT_LENGTH : MAX_LYRICAL_PROMPT_LENGTH
+
+	if (body.prompt.length > maxPromptLength) {
+		throw new HTTPException(400, { message: `Prompt must be ${maxPromptLength} characters or less` })
 	}
 
 	const instanceId = env.DURABLE_OBJECT.newUniqueId().toString()
@@ -358,7 +363,7 @@ smols.post('/', parseAuth, async (c) => {
 			address: payload.sub,
 			prompt: body.prompt,
 			public: body.public ?? true,
-			instrumental: body.instrumental ?? false,
+			instrumental: isInstrumental,
 			playlist: body.playlist,
 		},
 	})
