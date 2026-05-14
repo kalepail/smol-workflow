@@ -43,3 +43,6 @@ CREATE TABLE IF NOT EXISTS Mixtapes (
     "Address" TEXT NOT NULL,
     Created_At DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX IF NOT EXISTS idx_smols_artist_public_created
+ON Smols("Address", Public, Created_At DESC, Id DESC);
