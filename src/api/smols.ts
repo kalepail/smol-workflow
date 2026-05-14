@@ -38,6 +38,26 @@ interface SmolD1Record {
 	[key: string]: unknown
 }
 
+async function hasRetryableSmolState(env: Env, id: string): Promise<boolean> {
+	let retrySteps: any
+
+	if (isDurableObjectId(id)) {
+		try {
+			const doid = env.DURABLE_OBJECT.idFromString(id)
+			const stub = env.DURABLE_OBJECT.get(doid)
+			retrySteps = await stub.getSteps()
+		} catch {
+			retrySteps = undefined
+		}
+	}
+
+	if (!retrySteps?.payload) {
+		retrySteps = await env.SMOL_KV.get(id, 'json')
+	}
+
+	return !!(retrySteps?.payload?.address && retrySteps?.payload?.prompt)
+}
+
 // Get all public smols
 smols.get(
 	'/',
@@ -374,15 +394,7 @@ smols.post('/retry/:id', async (c) => {
 
 	const id = req.param('id')
 
-	const smol = await env.SMOL_D1.prepare(`
-		SELECT Id
-		FROM Smols
-		WHERE Id = ?1
-	`)
-		.bind(id)
-		.first<{ Id: string }>()
-
-	if (!smol) {
+	if (!await hasRetryableSmolState(env, id)) {
 		throw new HTTPException(404, { message: 'Smol not found' })
 	}
 

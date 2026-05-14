@@ -72,7 +72,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 							}
 						}
 
-						if (!retry_steps) {
+						if (!retry_steps?.payload) {
 							// Fallback for legacy gens and invalid/non-DO IDs
 							retry_steps = await this.env.SMOL_KV.get(retry_id, 'json') as WorkflowSteps;
 						}

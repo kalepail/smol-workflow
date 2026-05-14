@@ -148,6 +148,7 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
 
                 for (let i = 0; i < results.length; i++) {
                     const [tokenSACAddress, cometAMMAddress] = results[i];
+                    // The contract returns one result per submitted smol in the same order.
                     const id = resultIds[i];
 
                     const result = await this.env.SMOL_D1.prepare(`
