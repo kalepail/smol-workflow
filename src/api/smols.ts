@@ -29,6 +29,7 @@ interface SmolListItem {
 	Mint_Token: string | null
 	Mint_Amm: string | null
 	Created_At: string
+	Public: number
 }
 
 interface SmolD1Record {
@@ -77,7 +78,7 @@ smols.get(
 		if (whereClause.length > 1) {
 			// Has cursor bindings
 			query = `
-				SELECT Id, Title, Song_1, Mint_Token, Mint_Amm, Created_At
+				SELECT Id, Title, Song_1, Mint_Token, Mint_Amm, Created_At, Public
 				FROM Smols
 				WHERE ${whereClause[0]}
 				ORDER BY Created_At DESC, Id DESC
@@ -87,7 +88,7 @@ smols.get(
 		} else {
 			// No cursor bindings
 			query = `
-				SELECT Id, Title, Song_1, Mint_Token, Mint_Amm, Created_At
+				SELECT Id, Title, Song_1, Mint_Token, Mint_Amm, Created_At, Public
 				FROM Smols
 				WHERE ${whereClause[0]}
 				ORDER BY Created_At DESC, Id DESC
@@ -140,7 +141,7 @@ smols.get(
 	if (whereClause.length > 1) {
 		// Has cursor bindings
 		query = `
-			SELECT Id, Title, Song_1, Mint_Token, Mint_Amm, Created_At
+			SELECT Id, Title, Song_1, Mint_Token, Mint_Amm, Created_At, Public
 			FROM Smols
 			WHERE ${whereClause[0]}
 			ORDER BY Created_At DESC, Id DESC
@@ -150,7 +151,7 @@ smols.get(
 	} else {
 		// No cursor bindings
 		query = `
-			SELECT Id, Title, Song_1, Mint_Token, Mint_Amm, Created_At
+			SELECT Id, Title, Song_1, Mint_Token, Mint_Amm, Created_At, Public
 			FROM Smols
 			WHERE ${whereClause[0]}
 			ORDER BY Created_At DESC, Id DESC
@@ -203,7 +204,7 @@ smols.get(
 	if (whereClause.length > 1) {
 		// Has cursor bindings
 		query = `
-			SELECT s.Id, s.Title, s.Song_1, s.Mint_Token, s.Mint_Amm, s.Created_At
+			SELECT s.Id, s.Title, s.Song_1, s.Mint_Token, s.Mint_Amm, s.Created_At, s.Public
 			FROM Smols s
 			INNER JOIN Likes l ON s.Id = l.Id
 			WHERE ${whereClause[0]}
@@ -214,7 +215,7 @@ smols.get(
 	} else {
 		// No cursor bindings
 		query = `
-			SELECT s.Id, s.Title, s.Song_1, s.Mint_Token, s.Mint_Amm, s.Created_At
+			SELECT s.Id, s.Title, s.Song_1, s.Mint_Token, s.Mint_Amm, s.Created_At, s.Public
 			FROM Smols s
 			INNER JOIN Likes l ON s.Id = l.Id
 			WHERE ${whereClause[0]}

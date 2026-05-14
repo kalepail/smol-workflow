@@ -25,6 +25,7 @@ interface ArtistSmol {
 	Mint_Token: string | null
 	Mint_Amm: string | null
 	Created_At: string
+	Public: number
 }
 
 artists.get(
@@ -42,7 +43,7 @@ artists.get(
 		const bindings: any[] = []
 
 		const query = `
-			SELECT s.Id, s.Title, s.Song_1, s.Address, s.Plays, s.Views, s.Mint_Token, s.Mint_Amm, s.Created_At
+			SELECT s.Id, s.Title, s.Song_1, s.Address, s.Plays, s.Views, s.Mint_Token, s.Mint_Amm, s.Created_At, s.Public
 			FROM Smols s
 			WHERE ${whereClause[0]}
 			ORDER BY s.Created_At DESC, s.Id DESC

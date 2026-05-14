@@ -19,6 +19,22 @@ test('authenticated liked-smol list is not filtered to public discovery items', 
 	assert.doesNotMatch(smolsSource, /l\."Address"\s*=\s*\?\s+AND\s+s\.Public\s*=\s*1/)
 })
 
+test('smol list responses expose the existing D1 Public field', async () => {
+	const smolsSource = await source('src/api/smols.ts')
+
+	assert.match(smolsSource, /interface SmolListItem[\s\S]*Public: number/)
+	assert.match(smolsSource, /SELECT Id, Title, Song_1, Mint_Token, Mint_Amm, Created_At, Public/)
+	assert.match(smolsSource, /SELECT s\.Id, s\.Title, s\.Song_1, s\.Mint_Token, s\.Mint_Amm, s\.Created_At, s\.Public/)
+})
+
+test('search results expose Public after public-only hydration', async () => {
+	const searchSource = await source('src/utils/search.ts')
+
+	assert.match(searchSource, /Public: number/)
+	assert.match(searchSource, /if \(!row \|\| row\.Public !== 1\)/)
+	assert.match(searchSource, /Public: row\.Public/)
+})
+
 test('likes endpoints can include any existing smol, public or non-public', async () => {
 	const likesSource = await source('src/api/likes.ts')
 

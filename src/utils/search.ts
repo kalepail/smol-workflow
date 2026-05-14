@@ -242,6 +242,7 @@ export type SearchResultItem = {
 	Mint_Token: string | null
 	Mint_Amm: string | null
 	Created_At: string
+	Public: number
 	score: number
 	explanation: {
 		matchedFields: SearchModality[]
@@ -2086,6 +2087,7 @@ async function hydrateRankedCandidates(env: Env, ranked: RankedCandidate[], limi
 				Mint_Token: row.Mint_Token,
 				Mint_Amm: row.Mint_Amm,
 				Created_At: row.Created_At,
+				Public: row.Public,
 				score: candidate.score,
 				explanation: {
 					matchedFields,

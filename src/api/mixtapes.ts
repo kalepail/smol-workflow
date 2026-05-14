@@ -26,6 +26,7 @@ interface MixtapeSmolRow {
 	Mint_Token: string | null
 	Mint_Amm: string | null
 	Song_1: string
+	Public: number
 }
 
 function parseStoredSmolIds(smols: string): string[] {
@@ -74,7 +75,7 @@ async function loadPublicSmolRows(env: Env, ids: string[]): Promise<Map<string, 
 	const results = await Promise.all(batches.map((batch) => {
 		const placeholders = batch.map(() => '?').join(',')
 		return env.SMOL_D1.prepare(`
-				SELECT Id, Title, "Address" as Address, Mint_Token, Mint_Amm, Song_1
+				SELECT Id, Title, "Address" as Address, Mint_Token, Mint_Amm, Song_1, Public
 				FROM Smols
 				WHERE Public = 1 AND Id IN (${placeholders})
 			`)
@@ -213,6 +214,7 @@ mixtapes.get(
 					Mint_Token: row.Mint_Token,
 					Mint_Amm: row.Mint_Amm,
 					Song_1: row.Song_1,
+					Public: row.Public,
 					Tags: kv?.lyrics?.style || [],
 				}
 			})

@@ -24,6 +24,7 @@ interface Smol {
 	Mint_Token: string | null
 	Mint_Amm: string | null
 	Created_At: string
+	Public: number
 }
 
 playlists.get(
@@ -44,7 +45,7 @@ playlists.get(
 		if (whereClause.length > 1) {
 			// Has cursor bindings
 			query = `
-				SELECT s.Id, s.Title, s.Song_1, s.Address, s.Plays, s.Views, s.Mint_Token, s.Mint_Amm, s.Created_At
+				SELECT s.Id, s.Title, s.Song_1, s.Address, s.Plays, s.Views, s.Mint_Token, s.Mint_Amm, s.Created_At, s.Public
 				FROM Smols s
 				INNER JOIN Playlists p ON s.Id = p.Id
 				WHERE ${whereClause[0]}
@@ -55,7 +56,7 @@ playlists.get(
 		} else {
 			// No cursor bindings
 			query = `
-				SELECT s.Id, s.Title, s.Song_1, s.Address, s.Plays, s.Views, s.Mint_Token, s.Mint_Amm, s.Created_At
+				SELECT s.Id, s.Title, s.Song_1, s.Address, s.Plays, s.Views, s.Mint_Token, s.Mint_Amm, s.Created_At, s.Public
 				FROM Smols s
 				INNER JOIN Playlists p ON s.Id = p.Id
 				WHERE ${whereClause[0]}
