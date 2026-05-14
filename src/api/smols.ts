@@ -369,7 +369,7 @@ smols.post('/', parseAuth, async (c) => {
 })
 
 // Retry smol creation
-smols.post('/retry/:id', parseAuth, async (c) => {
+smols.post('/retry/:id', async (c) => {
 	const { env, req } = c
 
 	const id = req.param('id')

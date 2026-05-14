@@ -79,7 +79,9 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 
 						payload = {
 							...payload, // original payload
-							...retry_steps?.payload // previous payload (notably we keep the original address)
+							// Retry can be started by anyone; attribution intentionally stays
+							// with the original smol creator from the saved payload.
+							...retry_steps?.payload
 						};
 					}
 				);
