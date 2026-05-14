@@ -224,6 +224,11 @@ export function createPollSongsFunction(params: {
 	return async function pollSongs(mode: 'streaming' | 'complete'): Promise<AiSongGeneratorSong[]> {
 		let songs = await getSongs(env, song_ids, source);
 
+		if (songs.length !== song_ids.length) {
+			await stub.saveStep('songs', songs);
+			throw new Error(`Waiting for song statuses (${songs.length}/${song_ids.length} returned)`);
+		}
+
 		let has_audio = false;
 		let all_have_audio = true;
 		let is_complete = true;
