@@ -15,6 +15,7 @@ import mixtapes from './api/mixtapes'
 import mint from './api/mint'
 import media from './api/media'
 import search from './api/search'
+import artists from './api/artists'
 import { processSearchQueue, processSearchDLQ, runSearchBackfillCron } from './utils/search'
 
 export const app = new Hono<HonoEnv>()
@@ -42,6 +43,7 @@ app.route('/mint', mint)
 app.route('/song', media)
 app.route('/image', media)
 app.route('/search', search)
+app.route('/artists', artists)
 app.route('/', smols)
 
 // 404 handler

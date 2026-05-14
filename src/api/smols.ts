@@ -9,9 +9,12 @@ import {
 	buildPaginationResponse,
 } from '../utils/pagination'
 import {
+	purgeArtistSmolsCache,
 	purgeCacheByTags,
+	purgePublicSmolsCache,
 	userCacheKeyGenerator,
 } from '../utils/cache'
+import { artistSmolsCacheTag } from '../utils/cache-tags'
 import { isDurableObjectId } from '../utils/durable-object-id'
 import { queueSearchDeletionById } from '../utils/search'
 import { requireOwnedVisibilityToggle, syncSearchVisibilityAfterToggle } from '../utils/search-visibility'
@@ -409,7 +412,11 @@ smols.put('/:id', parseAuth, async (c) => {
 
 	// Purge user's individual page
 	c.executionCtx.waitUntil(
-		purgeCacheByTags([`user:${payload.sub}:smol:${id}`])
+		Promise.all([
+			purgeArtistSmolsCache(payload.sub),
+			purgePublicSmolsCache(),
+			purgeCacheByTags([`user:${payload.sub}:smol:${id}`]),
+		])
 	)
 
 	return c.body(null, 204)
@@ -517,6 +524,8 @@ smols.delete('/admin/bulk', parseAuth, async (c) => {
 		// Purge caches for this smol's owner
 		c.executionCtx.waitUntil(
 			purgeCacheByTags([
+				artistSmolsCacheTag(smol.Address),
+				'public-smols',
 				`user:${smol.Address}:created`,
 				`user:${smol.Address}:smol:${id}`,
 				`smol:${id}:anonymous`,
@@ -580,6 +589,8 @@ smols.delete('/:id', parseAuth, async (c) => {
 	// Purge user's created list and individual page
 	c.executionCtx.waitUntil(
 		purgeCacheByTags([
+			artistSmolsCacheTag(payload.sub),
+			'public-smols',
 			`user:${payload.sub}:created`,
 			`user:${payload.sub}:smol:${id}`,
 		])
