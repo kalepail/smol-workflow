@@ -371,16 +371,23 @@ smols.post('/', parseAuth, async (c) => {
 		throw new HTTPException(400, { message: `Prompt must be ${maxPromptLength} characters or less` })
 	}
 
+	const workflowParams = {
+		address: payload.sub,
+		prompt: body.prompt,
+		public: body.public ?? true,
+		instrumental: isInstrumental,
+		playlist: body.playlist,
+	}
+
 	const instanceId = env.DURABLE_OBJECT.newUniqueId().toString()
+	const doid = env.DURABLE_OBJECT.idFromString(instanceId)
+	const stub = env.DURABLE_OBJECT.get(doid)
+
+	await stub.saveStep('payload', workflowParams)
+
 	const instance = await env.WORKFLOW.create({
 		id: instanceId,
-		params: {
-			address: payload.sub,
-			prompt: body.prompt,
-			public: body.public ?? true,
-			instrumental: isInstrumental,
-			playlist: body.playlist,
-		},
+		params: workflowParams,
 	})
 
 	console.log('Workflow started', instanceId, await instance.status())
