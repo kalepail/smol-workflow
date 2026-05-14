@@ -2,6 +2,7 @@ import { Keypair, scValToNative, xdr } from "@stellar/stellar-sdk/minimal";
 import { rpc } from "@stellar/stellar-sdk";
 import { basicNodeSigner } from "@stellar/stellar-sdk/minimal/contract";
 import { WorkflowEntrypoint, WorkflowEvent, WorkflowStep, WorkflowStepConfig } from "cloudflare:workers";
+import { NonRetryableError } from "cloudflare:workflows";
 import { Client as SmolClient } from "smol-sdk";
 import { purgeCacheByTags } from "./utils/cache";
 
@@ -94,17 +95,22 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
             await step.do('persist mint metadata', config, async () => {
                 const [tokenSACAddress, cometAMMAddress] = scValToNative(xdr.ScVal.fromXDR(res.returnValue, 'base64'));
 
-                await this.env.SMOL_D1.prepare(`
+                const result = await this.env.SMOL_D1.prepare(`
                     UPDATE Smols
                     SET Mint_Token = ?1, Mint_Amm = ?2
-                    WHERE Id = ?3
+                    WHERE Id = ?3 AND Mint_Token IS NULL AND Mint_Amm IS NULL
                 `)
                     .bind(tokenSACAddress, cometAMMAddress, event.payload.entropy)
                     .run();
 
+                if (result.meta.changes === 0) {
+                    throw new NonRetryableError('Smol already has mint metadata');
+                }
+
                 // Purge cached list/detail payloads that include mint metadata.
                 await purgeCacheByTags([
                     'public-smols',
+                    'mixtapes',
                     `user:${event.payload.sub}:created`,
                     `user:${event.payload.sub}:smol:${event.payload.entropy}`,
                     `smol:${event.payload.entropy}:anonymous`,
@@ -121,13 +127,17 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
                     const [tokenSACAddress, cometAMMAddress] = results[i];
                     const id = event.payload.ids![i];
 
-                    await this.env.SMOL_D1.prepare(`
+                    const result = await this.env.SMOL_D1.prepare(`
                         UPDATE Smols
                         SET Mint_Token = ?1, Mint_Amm = ?2
-                        WHERE Id = ?3
+                        WHERE Id = ?3 AND Mint_Token IS NULL AND Mint_Amm IS NULL
                     `)
                         .bind(tokenSACAddress, cometAMMAddress, id)
                         .run();
+
+                    if (result.meta.changes === 0) {
+                        throw new NonRetryableError(`Smol ${id} already has mint metadata`);
+                    }
 
                     // Collect cache tags for list/detail payloads that include mint metadata.
                     smolCacheTags.push(`user:${event.payload.sub}:smol:${id}`);
@@ -137,6 +147,7 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
                 if (smolCacheTags.length > 0) {
                     await purgeCacheByTags([
                         'public-smols',
+                        'mixtapes',
                         `user:${event.payload.sub}:created`,
                         ...smolCacheTags,
                     ]);

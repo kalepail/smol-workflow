@@ -1,17 +1,54 @@
-import { Hono } from 'hono'
+import { Context, Hono } from 'hono'
 import { HTTPException } from 'hono/http-exception'
-import { cache } from 'hono/cache'
 import { Jimp, ResizeStrategy } from 'jimp'
 import type { HonoEnv } from '../types'
+import { optionalAuth } from '../middleware/auth'
 import { parseRange } from '../utils'
 
 const media = new Hono<HonoEnv>()
 
+async function getReadableSongRow(c: Context<HonoEnv>, musicId: string) {
+	const payload = c.get('jwtPayload')
+	const row = await c.env.SMOL_D1.prepare(`
+		SELECT Public, "Address" as Address
+		FROM Smols
+		WHERE Song_1 = ?1 OR Song_2 = ?1
+	`)
+		.bind(musicId)
+		.first<{ Public: number; Address: string | null }>()
+
+	if (!row || (row.Public !== 1 && row.Address !== payload?.sub)) {
+		throw new HTTPException(404, { message: 'Song not found' })
+	}
+
+	return row
+}
+
+async function getReadableImageRow(c: Context<HonoEnv>, smolId: string) {
+	const payload = c.get('jwtPayload')
+	const row = await c.env.SMOL_D1.prepare(`
+		SELECT Public, "Address" as Address
+		FROM Smols
+		WHERE Id = ?1
+	`)
+		.bind(smolId)
+		.first<{ Public: number; Address: string | null }>()
+
+	if (!row || (row.Public !== 1 && row.Address !== payload?.sub)) {
+		throw new HTTPException(404, { message: 'Image not found' })
+	}
+
+	return row
+}
+
 // Serve songs
-media.get('/:id{.+\\.mp3}', async (c) => {
+media.get('/:id{.+\\.mp3}', optionalAuth, async (c) => {
 	const { env, req, executionCtx } = c
 	const id = req.param('id')
+	const musicId = id.replace(/\.mp3$/, '')
 	const rangeHeader = req.header('range')
+
+	const smol = await getReadableSongRow(c, musicId)
 
 	const objectMeta = await env.SMOL_BUCKET.head(id)
 
@@ -23,6 +60,10 @@ media.get('/:id{.+\\.mp3}', async (c) => {
 	objectMeta.writeHttpMetadata(headers)
 	headers.set('Accept-Ranges', 'bytes')
 	headers.set('Content-Type', 'audio/mpeg')
+	headers.set(
+		'Cache-Control',
+		smol.Public === 1 ? 'public, max-age=31536000, immutable' : 'no-store'
+	)
 
 	let status = 200
 	let body: ReadableStream | null = null
@@ -57,10 +98,9 @@ media.get('/:id{.+\\.mp3}', async (c) => {
 	const shouldIncrementPlays = !rangeHeader || (rangeHeader && rangeHeader.startsWith('bytes=0-'))
 
 	if (shouldIncrementPlays) {
-		const dbId = id.replace('.mp3', '')
 		executionCtx.waitUntil(
 			env.SMOL_D1.prepare('UPDATE Smols SET Plays = Plays + 1 WHERE Song_1 = ?1 OR Song_2 = ?1')
-				.bind(dbId)
+				.bind(musicId)
 				.run()
 		)
 	}
@@ -74,14 +114,15 @@ media.get('/:id{.+\\.mp3}', async (c) => {
 // Serve images
 media.get(
 	'/:id{.+\\.png}',
-	cache({
-		cacheName: 'smol-workflow',
-		cacheControl: 'public, max-age=31536000, immutable',
-	}),
+	optionalAuth,
 	async (c) => {
 		const { env, req } = c
 		const id = req.param('id')
+		const smolId = id.replace(/\.png$/, '')
 		const scale = req.query('scale')
+
+		const smol = await getReadableImageRow(c, smolId)
+
 		const image = await env.SMOL_BUCKET.get(id)
 
 		if (!image) {
@@ -112,6 +153,9 @@ media.get(
 		return new Response(scaled_image ?? image.body, {
 			headers: {
 				'Content-Type': 'image/png',
+				'Cache-Control': smol.Public === 1
+					? 'public, max-age=31536000, immutable'
+					: 'no-store',
 			},
 		})
 	}

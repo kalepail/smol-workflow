@@ -5,7 +5,7 @@ import { parseAuth } from '../middleware/auth'
 
 const mint = new Hono<HonoEnv>()
 const MAX_BATCH_MINT_IDS = 100
-const MAX_SIGNED_XDR_LENGTH = 200000
+const MAX_SIGNED_XDR_LENGTH = 10000
 
 function assertSignedXdr(value: unknown): string {
 	if (!value || typeof value !== 'string') {

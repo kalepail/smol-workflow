@@ -58,3 +58,6 @@ ON Playlists(Title, Id);
 
 CREATE INDEX IF NOT EXISTS idx_mixtapes_created
 ON Mixtapes(Created_At DESC, Id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_users_address
+ON Users("Address");

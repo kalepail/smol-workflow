@@ -65,23 +65,25 @@ function assertStringLength(value: string, fieldName: string, maxLength: number)
 async function loadPublicSmolRows(env: Env, ids: string[]): Promise<Map<string, MixtapeSmolRow>> {
 	const uniqueIds = [...new Set(ids)].filter(Boolean)
 	const rows = new Map<string, MixtapeSmolRow>()
+	const batches: string[][] = []
 
 	for (let index = 0; index < uniqueIds.length; index += MAX_MIXTAPE_SMOLS) {
-		const batch = uniqueIds.slice(index, index + MAX_MIXTAPE_SMOLS)
-		if (batch.length === 0) {
-			continue
-		}
+		batches.push(uniqueIds.slice(index, index + MAX_MIXTAPE_SMOLS))
+	}
 
+	const results = await Promise.all(batches.map((batch) => {
 		const placeholders = batch.map(() => '?').join(',')
-		const { results } = await env.SMOL_D1.prepare(`
-			SELECT Id, Title, "Address" as Address, Mint_Token, Mint_Amm, Song_1
-			FROM Smols
-			WHERE Public = 1 AND Id IN (${placeholders})
-		`)
+		return env.SMOL_D1.prepare(`
+				SELECT Id, Title, "Address" as Address, Mint_Token, Mint_Amm, Song_1
+				FROM Smols
+				WHERE Public = 1 AND Id IN (${placeholders})
+			`)
 			.bind(...batch)
 			.all<MixtapeSmolRow>()
+	}))
 
-		for (const row of results) {
+	for (const result of results) {
+		for (const row of result.results) {
 			rows.set(row.Id, row)
 		}
 	}

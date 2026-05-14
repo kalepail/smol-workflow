@@ -28,6 +28,13 @@ interface SmolListItem {
 	Created_At: string
 }
 
+interface SmolD1Record {
+	Id: string
+	Public: number
+	Address: string | null
+	[key: string]: unknown
+}
+
 // Get all public smols
 smols.get(
 	'/',
@@ -166,7 +173,7 @@ smols.get(
 		const payload = c.get('jwtPayload')!
 		const { limit, cursor } = parsePaginationParams(new URL(req.url))
 
-	const whereClause = buildCursorWhereClause(cursor, 'l."Address" = ?', 's.')
+	const whereClause = buildCursorWhereClause(cursor, 'l."Address" = ? AND s.Public = 1', 's.')
 	const bindings: any[] = []
 
 	let query: string
@@ -240,9 +247,13 @@ smols.get(
 
 		const smol_d1 = await env.SMOL_D1.prepare(`SELECT * FROM Smols WHERE Id = ?1`)
 			.bind(id)
-			.first()
+			.first<SmolD1Record>()
 
 		if (smol_d1) {
+			if (smol_d1.Public !== 1 && smol_d1.Address !== payload?.sub) {
+				throw new HTTPException(404, { message: 'Smol not found' })
+			}
+
 			const smol_kv: any = await env.SMOL_KV.get(id, 'json')
 
 			// Increment views non-blockingly
@@ -262,8 +273,13 @@ smols.get(
 				liked,
 			})
 
-			// Only cache completed SMOLs (those in D1)
-			response.headers.set('Cache-Control', 'public, max-age=30, stale-while-revalidate=60')
+			if (smol_d1.Public !== 1) {
+				response.headers.set('Cache-Control', 'no-store')
+			} else if (payload?.sub) {
+				response.headers.set('Cache-Control', 'private, max-age=30')
+			} else {
+				response.headers.set('Cache-Control', 'public, max-age=30, stale-while-revalidate=60')
+			}
 
 			// Add cache tags for individual smol
 			// Use user-specific tag if authenticated, so we only purge that user's cache entry
@@ -292,8 +308,14 @@ smols.get(
 			}
 		})
 
+		const steps = (await stub.getSteps()) as any || {}
+
+		if (steps?.payload?.address !== payload?.sub) {
+			throw new HTTPException(404, { message: 'Smol not found' })
+		}
+
 		// Replace image_base64 with boolean marker (interfaces use this to know when image is ready)
-		const { image_base64, ...rest } = (await stub.getSteps()) as any || {}
+		const { image_base64, ...rest } = steps
 		const kv_do = { ...rest, image: !!image_base64 }
 
 		const response = c.json({
@@ -442,6 +464,7 @@ smols.put('/:id', parseAuth, async (c) => {
 	c.executionCtx.waitUntil(
 		purgeCacheByTags([
 			'public-smols',
+			'mixtapes',
 			`user:${payload.sub}:created`,
 			`user:${payload.sub}:smol:${id}`,
 			`smol:${id}:anonymous`,
@@ -524,6 +547,9 @@ smols.delete('/admin/bulk', parseAuth, async (c) => {
 			continue
 		}
 
+		const likeRows = await env.SMOL_D1.prepare(`SELECT "Address" as Address FROM Likes WHERE Id = ?1`)
+			.bind(id)
+			.all<{ Address: string }>()
 		await env.SMOL_D1.prepare(`DELETE FROM Smols WHERE Id = ?1`).bind(id).run()
 		await env.SMOL_D1.prepare(`DELETE FROM Likes WHERE Id = ?1`).bind(id).run()
 
@@ -553,9 +579,15 @@ smols.delete('/admin/bulk', parseAuth, async (c) => {
 		// Purge caches for this smol's owner
 		c.executionCtx.waitUntil(
 			purgeCacheByTags([
+				'public-smols',
+				'mixtapes',
 				`user:${smol.Address}:created`,
 				`user:${smol.Address}:smol:${id}`,
 				`smol:${id}:anonymous`,
+				...((likeRows.results || []).flatMap((like) => [
+					`user:${like.Address}:liked`,
+					`user:${like.Address}:likes`,
+				])),
 			])
 		)
 
@@ -582,6 +614,10 @@ smols.delete('/:id', parseAuth, async (c) => {
 	if (result.meta.changes === 0) {
 		throw new HTTPException(404, { message: 'Smol not found or not owned by you' })
 	}
+
+	const likeRows = await env.SMOL_D1.prepare(`SELECT "Address" as Address FROM Likes WHERE Id = ?1`)
+		.bind(id)
+		.all<{ Address: string }>()
 
 	const smol: any = await env.SMOL_KV.get(id, 'json')
 
@@ -618,9 +654,14 @@ smols.delete('/:id', parseAuth, async (c) => {
 	c.executionCtx.waitUntil(
 		purgeCacheByTags([
 			'public-smols',
+			'mixtapes',
 			`user:${payload.sub}:created`,
 			`user:${payload.sub}:smol:${id}`,
 			`smol:${id}:anonymous`,
+			...((likeRows.results || []).flatMap((like) => [
+				`user:${like.Address}:liked`,
+				`user:${like.Address}:likes`,
+			])),
 		])
 	)
 
