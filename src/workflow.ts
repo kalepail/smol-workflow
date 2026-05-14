@@ -117,7 +117,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 				},
 			} as WorkflowStepConfig,
 			async () => {
-				return await pixellab(prompt, 'pixflux');
+				return await pixellab(this.env, prompt, 'pixflux');
 			}
 		);
 

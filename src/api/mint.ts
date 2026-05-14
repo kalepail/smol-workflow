@@ -4,24 +4,56 @@ import type { HonoEnv } from '../types'
 import { parseAuth } from '../middleware/auth'
 
 const mint = new Hono<HonoEnv>()
+const MAX_BATCH_MINT_IDS = 100
+const MAX_SIGNED_XDR_LENGTH = 200000
+
+function assertSignedXdr(value: unknown): string {
+	if (!value || typeof value !== 'string') {
+		throw new HTTPException(400, { message: 'Missing signed transaction' })
+	}
+
+	if (value.length > MAX_SIGNED_XDR_LENGTH) {
+		throw new HTTPException(400, { message: 'Signed transaction is too large' })
+	}
+
+	return value
+}
+
+function assertMintIds(value: unknown): string[] {
+	if (!value || !Array.isArray(value) || value.length === 0) {
+		throw new HTTPException(400, { message: 'Missing or invalid ids array' })
+	}
+
+	if (value.length > MAX_BATCH_MINT_IDS) {
+		throw new HTTPException(400, { message: `Max ${MAX_BATCH_MINT_IDS} smols per batch mint` })
+	}
+
+	const ids = value.map((id) => {
+		if (typeof id !== 'string' || !id.trim()) {
+			throw new HTTPException(400, { message: 'Invalid smol id in ids array' })
+		}
+
+		return id.trim()
+	})
+
+	if (new Set(ids).size !== ids.length) {
+		throw new HTTPException(400, { message: 'Duplicate smol ids are not allowed' })
+	}
+
+	return ids
+}
 
 mint.post('/', parseAuth, async (c) => {
 	const { env, req } = c
 	const payload = c.get('jwtPayload')!
 	const body = await req.json() as { xdr?: string; ids?: string[] }
-
-	if (!body?.xdr || typeof body.xdr !== 'string') {
-		throw new HTTPException(400, { message: 'Missing signed transaction' })
-	}
-
-	if (!body?.ids || !Array.isArray(body.ids) || body.ids.length === 0) {
-		throw new HTTPException(400, { message: 'Missing or invalid ids array' })
-	}
+	const xdr = assertSignedXdr(body?.xdr)
+	const ids = assertMintIds(body?.ids)
 
 	const smolRecords = await env.SMOL_D1.prepare(
-		`SELECT Id, Title, Address, Mint_Token, Mint_Amm FROM Smols WHERE Id IN (${body.ids.map(() => '?').join(', ')})`
+		`SELECT Id, Title, Address, Mint_Token, Mint_Amm FROM Smols WHERE Id IN (${ids.map(() => '?').join(', ')})`
 	)
-		.bind(...body.ids)
+		.bind(...ids)
 		.all<{
 			Id: string
 			Title: string
@@ -34,7 +66,7 @@ mint.post('/', parseAuth, async (c) => {
 		throw new HTTPException(404, { message: 'No smols found' })
 	}
 
-	if (smolRecords.results.length !== body.ids.length) {
+	if (smolRecords.results.length !== ids.length) {
 		throw new HTTPException(404, { message: 'Some smols not found' })
 	}
 
@@ -45,13 +77,16 @@ mint.post('/', parseAuth, async (c) => {
 		if (!record.Address) {
 			throw new HTTPException(404, { message: `Smol ${record.Id} not found` })
 		}
+		if (record.Address !== payload.sub) {
+			throw new HTTPException(403, { message: `Smol ${record.Id} not owned by you` })
+		}
 	}
 
 	await env.TX_WORKFLOW.create({
 		params: {
 			type: 'batch-mint',
-			xdr: body.xdr,
-			ids: body.ids,
+			xdr,
+			ids,
 			sub: payload.sub,
 		},
 	})
@@ -64,13 +99,10 @@ mint.post('/:id', parseAuth, async (c) => {
 	const payload = c.get('jwtPayload')!
 	const id = req.param('id')
 	const body = await req.json() as { xdr?: string }
+	const xdr = assertSignedXdr(body?.xdr)
 
 	if (!id) {
 		throw new HTTPException(400, { message: 'Missing smol id' })
-	}
-
-	if (!body?.xdr || typeof body.xdr !== 'string') {
-		throw new HTTPException(400, { message: 'Missing signed transaction' })
 	}
 
 	const smolRecord = await env.SMOL_D1.prepare(
@@ -96,10 +128,14 @@ mint.post('/:id', parseAuth, async (c) => {
 		throw new HTTPException(404, { message: 'Smol not found' })
 	}
 
+	if (smolRecord.Address !== payload.sub) {
+		throw new HTTPException(403, { message: 'Smol not owned by you' })
+	}
+
 	await env.TX_WORKFLOW.create({
 		params: {
 			type: 'mint',
-			xdr: body.xdr,
+			xdr,
 			entropy: id,
 			sub: payload.sub,
 		},

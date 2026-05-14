@@ -1,7 +1,7 @@
 import { Keypair, scValToNative, xdr } from "@stellar/stellar-sdk/minimal";
 import { rpc } from "@stellar/stellar-sdk";
 import { basicNodeSigner } from "@stellar/stellar-sdk/minimal/contract";
-import { env, WorkflowEntrypoint, WorkflowEvent, WorkflowStep, WorkflowStepConfig } from "cloudflare:workers";
+import { WorkflowEntrypoint, WorkflowEvent, WorkflowStep, WorkflowStepConfig } from "cloudflare:workers";
 import { Client as SmolClient } from "smol-sdk";
 import { purgeCacheByTags } from "./utils/cache";
 
@@ -12,9 +12,6 @@ type KaleWorkerBinding = Fetcher & {
 		errorCode?: string
 	}>
 }
-
-const KP = Keypair.fromSecret(env.SK)
-const PK = KP.publicKey()
 
 const config: WorkflowStepConfig = {
     retries: {
@@ -105,8 +102,13 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
                     .bind(tokenSACAddress, cometAMMAddress, event.payload.entropy)
                     .run();
 
-                // Purge user's individual smol page
-                await purgeCacheByTags([`user:${event.payload.sub}:smol:${event.payload.entropy}`]);
+                // Purge cached list/detail payloads that include mint metadata.
+                await purgeCacheByTags([
+                    'public-smols',
+                    `user:${event.payload.sub}:created`,
+                    `user:${event.payload.sub}:smol:${event.payload.entropy}`,
+                    `smol:${event.payload.entropy}:anonymous`,
+                ]);
             });
         } else if (event.payload.type === 'batch-mint') {
             await step.do('persist batch mint metadata', config, async () => {
@@ -127,13 +129,17 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
                         .bind(tokenSACAddress, cometAMMAddress, id)
                         .run();
 
-                    // Collect cache tags for user's individual smol pages
+                    // Collect cache tags for list/detail payloads that include mint metadata.
                     smolCacheTags.push(`user:${event.payload.sub}:smol:${id}`);
+                    smolCacheTags.push(`smol:${id}:anonymous`);
                 }
 
-                // Purge user's individual smol pages
                 if (smolCacheTags.length > 0) {
-                    await purgeCacheByTags(smolCacheTags);
+                    await purgeCacheByTags([
+                        'public-smols',
+                        `user:${event.payload.sub}:created`,
+                        ...smolCacheTags,
+                    ]);
                 }
             });
         }
@@ -142,6 +148,8 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
     }
 
     async signTransaction(xdr: string) {
+        const signerKeypair = Keypair.fromSecret(this.env.SK);
+        const signerPublicKey = signerKeypair.publicKey();
         const contract = new SmolClient({
             contractId: this.env.SMOL_CONTRACT_ID,
             rpcUrl: this.env.RPC_URL,
@@ -151,8 +159,8 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
         const at = contract.txFromXDR(xdr);
 
         await at.signAuthEntries({
-            address: PK,
-            signAuthEntry: basicNodeSigner(KP, this.env.NETWORK_PASSPHRASE).signAuthEntry
+            address: signerPublicKey,
+            signAuthEntry: basicNodeSigner(signerKeypair, this.env.NETWORK_PASSPHRASE).signAuthEntry
         });
 
         return at.built!.toXDR();

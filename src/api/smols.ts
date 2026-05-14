@@ -17,6 +17,7 @@ import { queueSearchDeletionById } from '../utils/search'
 import { requireOwnedVisibilityToggle, syncSearchVisibilityAfterToggle } from '../utils/search-visibility'
 
 const smols = new Hono<HonoEnv>()
+const MAX_PROMPT_LENGTH = 2000
 
 interface SmolListItem {
 	Id: string
@@ -319,8 +320,12 @@ smols.post('/', parseAuth, async (c) => {
 		playlist?: string
 	} = await req.json()
 
-	if (!body.prompt) {
+	if (!body.prompt || typeof body.prompt !== 'string') {
 		throw new HTTPException(400, { message: 'Missing prompt' })
+	}
+
+	if (body.prompt.length > MAX_PROMPT_LENGTH) {
+		throw new HTTPException(400, { message: `Prompt must be ${MAX_PROMPT_LENGTH} characters or less` })
 	}
 
 	const instanceId = env.DURABLE_OBJECT.newUniqueId().toString()
@@ -344,8 +349,22 @@ smols.post('/', parseAuth, async (c) => {
 // Retry smol creation
 smols.post('/retry/:id', parseAuth, async (c) => {
 	const { env, req } = c
+	const payload = c.get('jwtPayload')!
 
 	const id = req.param('id')
+
+	const smol = await env.SMOL_D1.prepare(`
+		SELECT Id
+		FROM Smols
+		WHERE Id = ?1 AND "Address" = ?2
+	`)
+		.bind(id, payload.sub)
+		.first<{ Id: string }>()
+
+	if (!smol) {
+		throw new HTTPException(404, { message: 'Smol not found or not owned by you' })
+	}
+
 	const instanceId = env.DURABLE_OBJECT.newUniqueId().toString()
 	const instance = await env.WORKFLOW.create({
 		id: instanceId,
@@ -364,6 +383,18 @@ smols.put('/:id', parseAuth, async (c) => {
 	const { env, req } = c
 	const id = req.param('id')
 	const payload = c.get('jwtPayload')!
+
+	const smolRecord = await env.SMOL_D1.prepare(`
+		SELECT Public
+		FROM Smols
+		WHERE Id = ?1 AND "Address" = ?2
+	`)
+		.bind(id, payload.sub)
+		.first<{ Public: number }>()
+
+	if (!smolRecord) {
+		throw new HTTPException(404, { message: 'Smol not found or not owned by you' })
+	}
 
 	const smol_kv: any = await env.SMOL_KV.get(id, 'json')
 
@@ -409,7 +440,12 @@ smols.put('/:id', parseAuth, async (c) => {
 
 	// Purge user's individual page
 	c.executionCtx.waitUntil(
-		purgeCacheByTags([`user:${payload.sub}:smol:${id}`])
+		purgeCacheByTags([
+			'public-smols',
+			`user:${payload.sub}:created`,
+			`user:${payload.sub}:smol:${id}`,
+			`smol:${id}:anonymous`,
+		])
 	)
 
 	return c.body(null, 204)
@@ -559,6 +595,7 @@ smols.delete('/:id', parseAuth, async (c) => {
 
 	await env.SMOL_KV.delete(id)
 	await env.SMOL_BUCKET.delete(`${id}.png`)
+	await env.SMOL_D1.prepare(`DELETE FROM Likes WHERE Id = ?1`).bind(id).run()
 
 	if (smol) {
 		for (let song of smol.songs) {
@@ -580,8 +617,10 @@ smols.delete('/:id', parseAuth, async (c) => {
 	// Purge user's created list and individual page
 	c.executionCtx.waitUntil(
 		purgeCacheByTags([
+			'public-smols',
 			`user:${payload.sub}:created`,
 			`user:${payload.sub}:smol:${id}`,
+			`smol:${id}:anonymous`,
 		])
 	)
 

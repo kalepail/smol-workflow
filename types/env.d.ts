@@ -5,6 +5,7 @@ declare namespace Cloudflare {
 	interface Env {
 		SECRET: string
 		SK: string
+		PIXELLAB_KEY: string
 		CF_API_TOKEN: string
 		CF_ZONE_ID: string
 		SEARCH_BACKFILL_CRON_ENABLED: string

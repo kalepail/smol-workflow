@@ -19,11 +19,37 @@ import { processSearchQueue, processSearchDLQ, runSearchBackfillCron } from './u
 
 export const app = new Hono<HonoEnv>()
 
+const DEV_CORS_ORIGINS = new Set([
+	'http://localhost:3000',
+	'http://localhost:5173',
+	'http://127.0.0.1:3000',
+	'http://127.0.0.1:5173',
+])
+
+function allowedCorsOrigin(origin: string): string | null {
+	if (!origin) {
+		return null
+	}
+
+	try {
+		const url = new URL(origin)
+		const isSmolOrigin = url.protocol === 'https:' && (url.hostname === 'smol.xyz' || url.hostname.endsWith('.smol.xyz'))
+
+		if (isSmolOrigin || DEV_CORS_ORIGINS.has(origin)) {
+			return origin
+		}
+	} catch {
+		return null
+	}
+
+	return null
+}
+
 // Global CORS middleware
 app.use(
 	'*',
 	cors({
-		origin: (origin) => origin ?? '*',
+		origin: (origin) => allowedCorsOrigin(origin),
 		credentials: true,
 	})
 )

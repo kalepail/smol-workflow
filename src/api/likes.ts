@@ -43,6 +43,16 @@ likes.put('/:id', parseAuth, async (c) => {
 	const id = req.param('id')
 	const payload = c.get('jwtPayload')!
 
+	const smol = await env.SMOL_D1.prepare(
+		`SELECT 1 FROM Smols WHERE Id = ?1 AND Public = 1`
+	)
+		.bind(id)
+		.first()
+
+	if (!smol) {
+		return c.body(null, 404)
+	}
+
 	const deleteResult = await env.SMOL_D1.prepare(
 		`DELETE FROM Likes WHERE Id = ?1 AND "Address" = ?2`
 	)
