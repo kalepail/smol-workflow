@@ -50,6 +50,9 @@ ON Smols(Public, Created_At DESC, Id DESC);
 CREATE INDEX IF NOT EXISTS idx_smols_address_created
 ON Smols("Address", Created_At DESC, Id DESC);
 
+CREATE INDEX IF NOT EXISTS idx_smols_artist_public_created
+ON Smols("Address", Public, Created_At DESC, Id DESC);
+
 CREATE INDEX IF NOT EXISTS idx_smols_song_1
 ON Smols(Song_1);
 

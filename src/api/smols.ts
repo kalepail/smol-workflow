@@ -12,6 +12,7 @@ import {
 	purgeCacheByTags,
 	userCacheKeyGenerator,
 } from '../utils/cache'
+import { artistSmolsCacheTag } from '../utils/cache-tags'
 import { isDurableObjectId } from '../utils/durable-object-id'
 import { queueSearchDeletionById } from '../utils/search'
 import { requireOwnedVisibilityToggle, syncSearchVisibilityAfterToggle } from '../utils/search-visibility'
@@ -463,6 +464,7 @@ smols.put('/:id', parseAuth, async (c) => {
 	// Purge user's individual page
 	c.executionCtx.waitUntil(
 		purgeCacheByTags([
+			artistSmolsCacheTag(payload.sub),
 			'public-smols',
 			'mixtapes',
 			`user:${payload.sub}:created`,
@@ -580,6 +582,7 @@ smols.delete('/admin/bulk', parseAuth, async (c) => {
 		// Purge caches for this smol's owner
 		c.executionCtx.waitUntil(
 			purgeCacheByTags([
+				artistSmolsCacheTag(smol.Address),
 				'public-smols',
 				'mixtapes',
 				`user:${smol.Address}:created`,
@@ -659,6 +662,7 @@ smols.delete('/:id', parseAuth, async (c) => {
 	// Purge user's created list and individual page
 	c.executionCtx.waitUntil(
 		purgeCacheByTags([
+			artistSmolsCacheTag(payload.sub),
 			'public-smols',
 			'mixtapes',
 			`user:${payload.sub}:created`,

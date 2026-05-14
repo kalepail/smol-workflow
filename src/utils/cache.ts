@@ -5,6 +5,7 @@
 import { env } from 'cloudflare:workers'
 import type { Context } from 'hono'
 import type { HonoEnv } from '../types'
+import { artistSmolsCacheTag } from './cache-tags'
 
 /**
  * Purge cache by tags using Cloudflare API
@@ -103,6 +104,13 @@ export function purgeMixtapesCache(): Promise<boolean> {
  */
 export function purgePublicSmolsCache(): Promise<boolean> {
 	return purgeCacheByTags(['public-smols'])
+}
+
+/**
+ * Helper to purge public smols for a specific artist.
+ */
+export function purgeArtistSmolsCache(artistAddress: string): Promise<boolean> {
+	return purgeCacheByTags([artistSmolsCacheTag(artistAddress)])
 }
 
 /**

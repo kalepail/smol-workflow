@@ -5,6 +5,7 @@ import { WorkflowEntrypoint, WorkflowEvent, WorkflowStep, WorkflowStepConfig } f
 import { NonRetryableError } from "cloudflare:workflows";
 import { Client as SmolClient } from "smol-sdk";
 import { purgeCacheByTags } from "./utils/cache";
+import { artistSmolsCacheTag } from "./utils/cache-tags";
 
 type KaleWorkerBinding = Fetcher & {
 	submitTransaction(input: { xdr: string }): Promise<{
@@ -94,13 +95,14 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
             // as contract addresses are deterministic and we could get the values from the simulation
             await step.do('persist mint metadata', config, async () => {
                 const [tokenSACAddress, cometAMMAddress] = scValToNative(xdr.ScVal.fromXDR(res.returnValue, 'base64'));
+                const id = event.payload.entropy!;
 
                 const result = await this.env.SMOL_D1.prepare(`
                     UPDATE Smols
                     SET Mint_Token = ?1, Mint_Amm = ?2
                     WHERE Id = ?3 AND Mint_Token IS NULL AND Mint_Amm IS NULL
                 `)
-                    .bind(tokenSACAddress, cometAMMAddress, event.payload.entropy)
+                    .bind(tokenSACAddress, cometAMMAddress, id)
                     .run();
 
                 if (result.meta.changes === 0) {
@@ -109,9 +111,10 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
 
                 const ownerSub = event.payload.ownerSub ?? event.payload.sub;
                 const userTags = new Set([
+                    artistSmolsCacheTag(ownerSub),
                     `user:${ownerSub}:created`,
-                    `user:${ownerSub}:smol:${event.payload.entropy}`,
-                    `user:${event.payload.sub}:smol:${event.payload.entropy}`,
+                    `user:${ownerSub}:smol:${id}`,
+                    `user:${event.payload.sub}:smol:${id}`,
                 ]);
 
                 // Purge cached list/detail payloads that include mint metadata.
@@ -119,7 +122,7 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
                     'public-smols',
                     'mixtapes',
                     ...userTags,
-                    `smol:${event.payload.entropy}:anonymous`,
+                    `smol:${id}:anonymous`,
                 ]);
             });
         } else if (event.payload.type === 'batch-mint') {
@@ -131,7 +134,7 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
                 }
 
                 // Collect smol IDs for cache purging
-                const smolCacheTags = new Set<string>();
+                const smolCacheTags = new Set<string>(['public-smols', 'mixtapes']);
 
                 for (let i = 0; i < results.length; i++) {
                     const [tokenSACAddress, cometAMMAddress] = results[i];
@@ -152,6 +155,7 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
                     const ownerSub = event.payload.ownerSubsById?.[id] ?? event.payload.sub;
 
                     // Collect cache tags for list/detail payloads that include mint metadata.
+                    smolCacheTags.add(artistSmolsCacheTag(ownerSub));
                     smolCacheTags.add(`user:${ownerSub}:created`);
                     smolCacheTags.add(`user:${ownerSub}:smol:${id}`);
                     smolCacheTags.add(`user:${event.payload.sub}:smol:${id}`);
@@ -159,11 +163,7 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
                 }
 
                 if (smolCacheTags.size > 0) {
-                    await purgeCacheByTags([
-                        'public-smols',
-                        'mixtapes',
-                        ...smolCacheTags,
-                    ]);
+                    await purgeCacheByTags([...smolCacheTags]);
                 }
             });
         }

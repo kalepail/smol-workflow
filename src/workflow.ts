@@ -4,7 +4,7 @@ import { imageDescribe } from './ai/cf';
 import { generateLyrics } from './ai/aisonggenerator';
 import { checkNSFW } from './ai/nsfw';
 import { NonRetryableError } from 'cloudflare:workflows';
-import { purgePlaylistCache, purgeUserCreatedCache, purgePublicSmolsCache } from './utils/cache';
+import { purgeArtistSmolsCache, purgePlaylistCache, purgeUserCreatedCache, purgePublicSmolsCache } from './utils/cache';
 import { decideSongsStrategy, pollUntilComplete } from './utils/songs';
 import { isDurableObjectId } from './utils/durable-object-id';
 import { createHiddenSearchState, createQueuedSearchState, queueSearchDeletionById, queueSearchIndexingById } from './utils/search';
@@ -296,6 +296,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 
 			// Purge caches so the smol appears immediately
 			await Promise.all([
+				purgeArtistSmolsCache(address),
 				purgeUserCreatedCache(address),
 				purgePublicSmolsCache(),
 			]);
