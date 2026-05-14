@@ -117,10 +117,9 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
                     `user:${event.payload.sub}:smol:${id}`,
                 ]);
 
-                // Purge cached list/detail payloads that include mint metadata.
+                // Avoid global list purges for common mint writes; short-lived
+                // public/mixtape list caches can refresh naturally.
                 await purgeCacheByTags([
-                    'public-smols',
-                    'mixtapes',
                     ...userTags,
                     `smol:${id}:anonymous`,
                 ]);
@@ -145,8 +144,7 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
                     throw new NonRetryableError('Batch mint result count does not match requested smol count');
                 }
 
-                // Collect smol IDs for cache purging
-                const smolCacheTags = new Set<string>(['public-smols', 'mixtapes']);
+                const smolCacheTags = new Set<string>();
 
                 for (let i = 0; i < results.length; i++) {
                     const [tokenSACAddress, cometAMMAddress] = results[i];
