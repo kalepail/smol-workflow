@@ -128,8 +128,20 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
         } else if (event.payload.type === 'batch-mint') {
             await step.do('persist batch mint metadata', config, async () => {
                 const results = scValToNative(xdr.ScVal.fromXDR(res.returnValue, 'base64')) as [string, string][];
+                const requestedIds = event.payload.ids ?? [];
+                const mintableIds = event.payload.mintableIds ?? requestedIds;
 
-                if (!Array.isArray(results) || results.length !== event.payload.ids?.length) {
+                if (!Array.isArray(results)) {
+                    throw new NonRetryableError('Batch mint result is not a list');
+                }
+
+                const resultIds = results.length === requestedIds.length
+                    ? requestedIds
+                    : results.length === mintableIds.length
+                        ? mintableIds
+                        : null;
+
+                if (!resultIds) {
                     throw new NonRetryableError('Batch mint result count does not match requested smol count');
                 }
 
@@ -138,7 +150,7 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
 
                 for (let i = 0; i < results.length; i++) {
                     const [tokenSACAddress, cometAMMAddress] = results[i];
-                    const id = event.payload.ids![i];
+                    const id = resultIds[i];
 
                     const result = await this.env.SMOL_D1.prepare(`
                         UPDATE Smols

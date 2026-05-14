@@ -81,15 +81,33 @@ mint.post('/', parseAuth, async (c) => {
 		throw new HTTPException(404, { message: 'Some smols not found' })
 	}
 
+	const recordsById = new Map(smolRecords.results.map((record) => [record.Id, record]))
 	const ownerSubsById: Record<string, string> = {}
-	for (const record of smolRecords.results) {
-		if (record.Mint_Token || record.Mint_Amm) {
-			throw new HTTPException(409, { message: `Smol ${record.Id} already minted` })
-		}
+	const mintableIds: string[] = []
+	const alreadyMintedIds: string[] = []
+
+	for (const id of ids) {
+		const record = recordsById.get(id)!
 		if (!record.Address) {
 			throw new HTTPException(404, { message: `Smol ${record.Id} not found` })
 		}
+
 		ownerSubsById[record.Id] = record.Address
+
+		if (record.Mint_Token || record.Mint_Amm) {
+			alreadyMintedIds.push(record.Id)
+		} else {
+			mintableIds.push(record.Id)
+		}
+	}
+
+	if (mintableIds.length === 0) {
+		return c.json({
+			acceptedIds: [],
+			skipped: {
+				alreadyMinted: alreadyMintedIds,
+			},
+		})
 	}
 
 	// Do not require Smols.Address to match the authenticated user. Minting is
@@ -100,12 +118,18 @@ mint.post('/', parseAuth, async (c) => {
 			type: 'batch-mint',
 			xdr,
 			ids,
+			mintableIds,
 			sub: payload.sub,
 			ownerSubsById,
 		},
 	})
 
-	return c.body(null, 202)
+	return c.json({
+		acceptedIds: mintableIds,
+		skipped: {
+			alreadyMinted: alreadyMintedIds,
+		},
+	}, 202)
 })
 
 mint.post('/:id', parseAuth, async (c) => {

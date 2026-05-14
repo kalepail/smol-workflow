@@ -127,6 +127,7 @@ type WorkflowTxParams = {
 	entropy?: string  // Required for 'mint', not used for 'batch-mint'
 	xdr: string
 	ids?: string[]    // Required for 'batch-mint', not used for 'mint'
+	mintableIds?: string[]
 	sub: string       // JWT sub of the user who initiated the mint
 	ownerSub?: string
 	ownerSubsById?: Record<string, string>
