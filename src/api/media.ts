@@ -10,12 +10,12 @@ const media = new Hono<HonoEnv>()
 async function getReadableSongRow(c: Context<HonoEnv>, musicId: string) {
 	const payload = c.get('jwtPayload')
 	const row = await c.env.SMOL_D1.prepare(`
-		SELECT Public, "Address" as Address
+		SELECT Id, Public, "Address" as Address
 		FROM Smols
 		WHERE Song_1 = ?1 OR Song_2 = ?1
 	`)
 		.bind(musicId)
-		.first<{ Public: number; Address: string | null }>()
+		.first<{ Id: string; Public: number; Address: string | null }>()
 
 	if (!row || (row.Public !== 1 && row.Address !== payload?.sub)) {
 		throw new HTTPException(404, { message: 'Song not found' })
@@ -62,8 +62,11 @@ media.get('/:id{.+\\.mp3}', optionalAuth, async (c) => {
 	headers.set('Content-Type', 'audio/mpeg')
 	headers.set(
 		'Cache-Control',
-		smol.Public === 1 ? 'public, max-age=31536000, immutable' : 'no-store'
+		smol.Public === 1 ? 'public, max-age=300, stale-while-revalidate=60' : 'no-store'
 	)
+	if (smol.Public === 1) {
+		headers.set('Cache-Tag', `smol:${smol.Id}:media`)
+	}
 
 	let status = 200
 	let body: ReadableStream | null = null
@@ -154,8 +157,9 @@ media.get(
 			headers: {
 				'Content-Type': 'image/png',
 				'Cache-Control': smol.Public === 1
-					? 'public, max-age=31536000, immutable'
+					? 'public, max-age=300, stale-while-revalidate=60'
 					: 'no-store',
+				...(smol.Public === 1 ? { 'Cache-Tag': `smol:${smolId}:media` } : {}),
 			},
 		})
 	}

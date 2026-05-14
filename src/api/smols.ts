@@ -102,7 +102,7 @@ smols.get(
 	parseAuth,
 	cache({
 		cacheName: 'smol-workflow',
-		cacheControl: 'public, max-age=30, stale-while-revalidate=60',
+		cacheControl: 'private, max-age=30',
 		keyGenerator: userCacheKeyGenerator, // Each user gets separate cache via sub claim
 	}),
 	async (c) => {
@@ -110,7 +110,7 @@ smols.get(
 		const payload = c.get('jwtPayload')!
 		const { limit, cursor } = parsePaginationParams(new URL(req.url))
 
-	const whereClause = buildCursorWhereClause(cursor, 'Address = ?')
+	const whereClause = buildCursorWhereClause(cursor, '"Address" = ?')
 	const bindings: any[] = []
 
 	let query: string
@@ -165,7 +165,7 @@ smols.get(
 	parseAuth,
 	cache({
 		cacheName: 'smol-workflow',
-		cacheControl: 'public, max-age=30, stale-while-revalidate=60',
+		cacheControl: 'private, max-age=30',
 		keyGenerator: userCacheKeyGenerator, // Each user gets separate cache via sub claim
 	}),
 	async (c) => {
@@ -232,18 +232,8 @@ smols.get(
 		const { env, req, executionCtx } = c
 		const id = req.param('id')
 
-		// Determine if requester has liked the smol (if authenticated)
 		const payload = c.get('jwtPayload')
 		let liked = false
-		if (payload?.sub) {
-			const likedRow = await env.SMOL_D1.prepare(
-				`SELECT 1 FROM Likes WHERE Id = ?1 AND "Address" = ?2`
-			)
-				.bind(id, payload.sub)
-				.first()
-
-			liked = !!likedRow
-		}
 
 		const smol_d1 = await env.SMOL_D1.prepare(`SELECT * FROM Smols WHERE Id = ?1`)
 			.bind(id)
@@ -252,6 +242,16 @@ smols.get(
 		if (smol_d1) {
 			if (smol_d1.Public !== 1 && smol_d1.Address !== payload?.sub) {
 				throw new HTTPException(404, { message: 'Smol not found' })
+			}
+
+			if (payload?.sub) {
+				const likedRow = await env.SMOL_D1.prepare(
+					`SELECT 1 FROM Likes WHERE Id = ?1 AND "Address" = ?2`
+				)
+					.bind(id, payload.sub)
+					.first()
+
+				liked = !!likedRow
 			}
 
 			const smol_kv: any = await env.SMOL_KV.get(id, 'json')
@@ -310,7 +310,7 @@ smols.get(
 
 		const steps = (await stub.getSteps()) as any || {}
 
-		if (steps?.payload?.address !== payload?.sub) {
+		if (!payload?.sub || steps?.payload?.address !== payload.sub) {
 			throw new HTTPException(404, { message: 'Smol not found' })
 		}
 
@@ -468,6 +468,7 @@ smols.put('/:id', parseAuth, async (c) => {
 			`user:${payload.sub}:created`,
 			`user:${payload.sub}:smol:${id}`,
 			`smol:${id}:anonymous`,
+			`smol:${id}:media`,
 		])
 	)
 
@@ -550,8 +551,8 @@ smols.delete('/admin/bulk', parseAuth, async (c) => {
 		const likeRows = await env.SMOL_D1.prepare(`SELECT "Address" as Address FROM Likes WHERE Id = ?1`)
 			.bind(id)
 			.all<{ Address: string }>()
-		await env.SMOL_D1.prepare(`DELETE FROM Smols WHERE Id = ?1`).bind(id).run()
 		await env.SMOL_D1.prepare(`DELETE FROM Likes WHERE Id = ?1`).bind(id).run()
+		await env.SMOL_D1.prepare(`DELETE FROM Smols WHERE Id = ?1`).bind(id).run()
 
 		const smolKv: any = await env.SMOL_KV.get(id, 'json')
 
@@ -584,6 +585,7 @@ smols.delete('/admin/bulk', parseAuth, async (c) => {
 				`user:${smol.Address}:created`,
 				`user:${smol.Address}:smol:${id}`,
 				`smol:${id}:anonymous`,
+				`smol:${id}:media`,
 				...((likeRows.results || []).flatMap((like) => [
 					`user:${like.Address}:liked`,
 					`user:${like.Address}:likes`,
@@ -603,15 +605,15 @@ smols.delete('/:id', parseAuth, async (c) => {
 	const id = req.param('id')
 	const payload = c.get('jwtPayload')!
 
-	// Check ownership and delete in one query
-	const result = await env.SMOL_D1.prepare(`
-		DELETE FROM Smols
+	const ownedSmol = await env.SMOL_D1.prepare(`
+		SELECT Id
+		FROM Smols
 		WHERE Id = ?1 AND "Address" = ?2
 	`)
 		.bind(id, payload.sub)
-		.run()
+		.first<{ Id: string }>()
 
-	if (result.meta.changes === 0) {
+	if (!ownedSmol) {
 		throw new HTTPException(404, { message: 'Smol not found or not owned by you' })
 	}
 
@@ -620,6 +622,11 @@ smols.delete('/:id', parseAuth, async (c) => {
 		.all<{ Address: string }>()
 
 	const smol: any = await env.SMOL_KV.get(id, 'json')
+
+	await env.SMOL_D1.prepare(`DELETE FROM Likes WHERE Id = ?1`).bind(id).run()
+	await env.SMOL_D1.prepare(`DELETE FROM Smols WHERE Id = ?1 AND "Address" = ?2`)
+		.bind(id, payload.sub)
+		.run()
 
 	try {
 		if (isDurableObjectId(id)) {
@@ -631,7 +638,6 @@ smols.delete('/:id', parseAuth, async (c) => {
 
 	await env.SMOL_KV.delete(id)
 	await env.SMOL_BUCKET.delete(`${id}.png`)
-	await env.SMOL_D1.prepare(`DELETE FROM Likes WHERE Id = ?1`).bind(id).run()
 
 	if (smol) {
 		for (let song of smol.songs) {
@@ -658,6 +664,7 @@ smols.delete('/:id', parseAuth, async (c) => {
 			`user:${payload.sub}:created`,
 			`user:${payload.sub}:smol:${id}`,
 			`smol:${id}:anonymous`,
+			`smol:${id}:media`,
 			...((likeRows.results || []).flatMap((like) => [
 				`user:${like.Address}:liked`,
 				`user:${like.Address}:likes`,

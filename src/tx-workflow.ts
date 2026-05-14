@@ -120,6 +120,10 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
             await step.do('persist batch mint metadata', config, async () => {
                 const results = scValToNative(xdr.ScVal.fromXDR(res.returnValue, 'base64')) as [string, string][];
 
+                if (!Array.isArray(results) || results.length !== event.payload.ids?.length) {
+                    throw new NonRetryableError('Batch mint result count does not match requested smol count');
+                }
+
                 // Collect smol IDs for cache purging
                 const smolCacheTags: string[] = [];
 
@@ -136,7 +140,7 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
                         .run();
 
                     if (result.meta.changes === 0) {
-                        throw new NonRetryableError(`Smol ${id} already has mint metadata`);
+                        console.warn(`Smol ${id} already has mint metadata`);
                     }
 
                     // Collect cache tags for list/detail payloads that include mint metadata.

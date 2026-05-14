@@ -1,5 +1,6 @@
 import { Hono } from 'hono'
 import { cache } from 'hono/cache'
+import { HTTPException } from 'hono/http-exception'
 import type { HonoEnv } from '../types'
 import { parseAuth } from '../middleware/auth'
 import { purgeUserLikedCache, userCacheKeyGenerator } from '../utils/cache'
@@ -12,7 +13,7 @@ likes.get(
 	parseAuth,
 	cache({
 		cacheName: 'smol-workflow',
-		cacheControl: 'public, max-age=20, stale-while-revalidate=40',
+		cacheControl: 'private, max-age=20',
 		keyGenerator: userCacheKeyGenerator, // Each user gets separate cache via sub claim
 	}),
 	async (c) => {
@@ -65,10 +66,10 @@ likes.put('/:id', parseAuth, async (c) => {
 		.first()
 
 	if (!smol) {
-		return c.body(null, 404)
+		throw new HTTPException(404, { message: 'Smol not found or not public' })
 	}
 
-	await env.SMOL_D1.prepare(`INSERT INTO Likes (Id, "Address") VALUES (?1, ?2)`)
+	await env.SMOL_D1.prepare(`INSERT OR IGNORE INTO Likes (Id, "Address") VALUES (?1, ?2)`)
 		.bind(id, payload.sub)
 		.run()
 
