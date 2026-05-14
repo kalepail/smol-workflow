@@ -372,20 +372,19 @@ smols.post('/', parseAuth, async (c) => {
 // Retry smol creation
 smols.post('/retry/:id', parseAuth, async (c) => {
 	const { env, req } = c
-	const payload = c.get('jwtPayload')!
 
 	const id = req.param('id')
 
 	const smol = await env.SMOL_D1.prepare(`
 		SELECT Id
 		FROM Smols
-		WHERE Id = ?1 AND "Address" = ?2
+		WHERE Id = ?1
 	`)
-		.bind(id, payload.sub)
+		.bind(id)
 		.first<{ Id: string }>()
 
 	if (!smol) {
-		throw new HTTPException(404, { message: 'Smol not found or not owned by you' })
+		throw new HTTPException(404, { message: 'Smol not found' })
 	}
 
 	const instanceId = env.DURABLE_OBJECT.newUniqueId().toString()
