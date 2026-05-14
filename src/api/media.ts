@@ -5,6 +5,7 @@ import type { HonoEnv } from '../types'
 import { parseRange } from '../utils'
 
 const media = new Hono<HonoEnv>()
+const MEDIA_CACHE_CONTROL = 'public, max-age=2592000, stale-while-revalidate=86400'
 
 async function getSongSmolId(env: Env, musicId: string): Promise<string | null> {
 	const row = await env.SMOL_D1.prepare(`
@@ -38,7 +39,7 @@ media.get('/:id{.+\\.mp3}', async (c) => {
 	headers.set('Content-Type', 'audio/mpeg')
 	// Media URLs are intentionally link-shareable by opaque ID. Public/private
 	// controls listing and detail visibility, not direct asset playback.
-	headers.set('Cache-Control', 'public, max-age=300, stale-while-revalidate=60')
+	headers.set('Cache-Control', MEDIA_CACHE_CONTROL)
 	if (smolId) {
 		headers.set('Cache-Tag', `smol:${smolId}:media`)
 	}
@@ -129,7 +130,7 @@ media.get(
 			headers: {
 				'Content-Type': 'image/png',
 				// Media URLs are intentionally link-shareable by opaque ID.
-				'Cache-Control': 'public, max-age=300, stale-while-revalidate=60',
+				'Cache-Control': MEDIA_CACHE_CONTROL,
 				'Cache-Tag': `smol:${smolId}:media`,
 			},
 		})
