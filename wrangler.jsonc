@@ -21,6 +21,7 @@
     "preview_urls": false,
     "observability": {
         "enabled": true,
+        "head_sampling_rate": 1,
         "logs": {
             "invocation_logs": true
         }
@@ -115,6 +116,7 @@
    * Note: Use secrets to store sensitive data.
    * https://developers.cloudflare.com/workers/configuration/secrets/
    */
+    // Required Worker secrets: SECRET, SK, PIXELLAB_KEY, CF_API_TOKEN, CF_ZONE_ID.
     /**
    * Static Assets
    * https://developers.cloudflare.com/workers/static-assets/binding/

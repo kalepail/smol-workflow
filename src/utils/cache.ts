@@ -17,37 +17,48 @@ export async function purgeCacheByTags(tags: string[]): Promise<boolean> {
 		return false
 	}
 
-	if (!tags.length) {
+	const uniqueTags = [...new Set(tags)]
+
+	if (!uniqueTags.length) {
 		console.warn('Cache purge skipped: no tags provided')
 		return false
 	}
 
 	try {
-		const response = await fetch(
-			`https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/purge_cache`,
-			{
-				method: 'POST',
-				headers: {
-					'Authorization': `Bearer ${env.CF_API_TOKEN}`,
-					'Content-Type': 'application/json',
-				},
-				body: JSON.stringify({ tags }),
-			}
-		)
-
-		if (!response.ok) {
-			const error = (await response.text()).slice(0, 300)
-			if (response.status === 401 || response.status === 403) {
-				console.warn('Cache purge skipped due auth error:', response.status)
-			} else {
-				console.error('Cache purge failed:', response.status, error)
-			}
-			return false
+		const tagChunks: string[][] = []
+		for (let i = 0; i < uniqueTags.length; i += 30) {
+			tagChunks.push(uniqueTags.slice(i, i + 30))
 		}
 
-		const result = await response.json() as { success: boolean }
-		console.log('Cache purged successfully for tags:', tags)
-		return result.success
+		const results = await Promise.all(tagChunks.map(async (chunk) => {
+			const response = await fetch(
+				`https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/purge_cache`,
+				{
+					method: 'POST',
+					headers: {
+						'Authorization': `Bearer ${env.CF_API_TOKEN}`,
+						'Content-Type': 'application/json',
+					},
+					body: JSON.stringify({ tags: chunk }),
+				}
+			)
+
+			if (!response.ok) {
+				const error = (await response.text()).slice(0, 300)
+				if (response.status === 401 || response.status === 403) {
+					console.warn('Cache purge skipped due auth error:', response.status)
+				} else {
+					console.error('Cache purge failed:', response.status, error)
+				}
+				return false
+			}
+
+			const result = await response.json() as { success: boolean }
+			return result.success
+		}))
+
+		console.log('Cache purged for tags:', uniqueTags)
+		return results.every(Boolean)
 	} catch (error) {
 		console.warn('Cache purge error:', error)
 		return false

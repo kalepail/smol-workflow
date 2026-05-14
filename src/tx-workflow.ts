@@ -1,7 +1,8 @@
 import { Keypair, scValToNative, xdr } from "@stellar/stellar-sdk/minimal";
 import { rpc } from "@stellar/stellar-sdk";
 import { basicNodeSigner } from "@stellar/stellar-sdk/minimal/contract";
-import { env, WorkflowEntrypoint, WorkflowEvent, WorkflowStep, WorkflowStepConfig } from "cloudflare:workers";
+import { WorkflowEntrypoint, WorkflowEvent, WorkflowStep, WorkflowStepConfig } from "cloudflare:workers";
+import { NonRetryableError } from "cloudflare:workflows";
 import { Client as SmolClient } from "smol-sdk";
 import { purgeCacheByTags } from "./utils/cache";
 import { artistSmolsCacheTag } from "./utils/cache-tags";
@@ -13,9 +14,6 @@ type KaleWorkerBinding = Fetcher & {
 		errorCode?: string
 	}>
 }
-
-const KP = Keypair.fromSecret(env.SK)
-const PK = KP.publicKey()
 
 const config: WorkflowStepConfig = {
     retries: {
@@ -99,68 +97,84 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
                 const [tokenSACAddress, cometAMMAddress] = scValToNative(xdr.ScVal.fromXDR(res.returnValue, 'base64'));
                 const id = event.payload.entropy!;
 
-                await this.env.SMOL_D1.prepare(`
+                const result = await this.env.SMOL_D1.prepare(`
                     UPDATE Smols
                     SET Mint_Token = ?1, Mint_Amm = ?2
-                    WHERE Id = ?3
+                    WHERE Id = ?3 AND Mint_Token IS NULL AND Mint_Amm IS NULL
                 `)
                     .bind(tokenSACAddress, cometAMMAddress, id)
                     .run();
 
-                const smol = await this.env.SMOL_D1.prepare(`
-                    SELECT Address
-                    FROM Smols
-                    WHERE Id = ?1
-                `)
-                    .bind(id)
-                    .first<{ Address: string | null }>();
-
-                const tags = [
-                    `user:${event.payload.sub}:smol:${id}`,
-                    `smol:${id}:anonymous`,
-                    'public-smols',
-                ];
-                if (smol?.Address) {
-                    tags.push(artistSmolsCacheTag(smol.Address));
+                if (result.meta.changes === 0) {
+                    throw new NonRetryableError('Smol already has mint metadata');
                 }
 
-                await purgeCacheByTags(tags);
+                const ownerSub = event.payload.ownerSub ?? event.payload.sub;
+                const userTags = new Set([
+                    artistSmolsCacheTag(ownerSub),
+                    `user:${ownerSub}:created`,
+                    `user:${ownerSub}:smol:${id}`,
+                    `user:${event.payload.sub}:smol:${id}`,
+                ]);
+
+                // Avoid global list purges for common mint writes; short-lived
+                // public/mixtape list caches can refresh naturally.
+                await purgeCacheByTags([
+                    ...userTags,
+                    `smol:${id}:anonymous`,
+                ]);
             });
         } else if (event.payload.type === 'batch-mint') {
             await step.do('persist batch mint metadata', config, async () => {
                 const results = scValToNative(xdr.ScVal.fromXDR(res.returnValue, 'base64')) as [string, string][];
+                const requestedIds = event.payload.ids ?? [];
+                const mintableIds = event.payload.mintableIds ?? requestedIds;
 
-                const cacheTags = new Set<string>(['public-smols']);
+                if (!Array.isArray(results)) {
+                    throw new NonRetryableError('Batch mint result is not a list');
+                }
+
+                const resultIds = results.length === requestedIds.length
+                    ? requestedIds
+                    : results.length === mintableIds.length
+                        ? mintableIds
+                        : null;
+
+                if (!resultIds) {
+                    throw new NonRetryableError('Batch mint result count does not match requested smol count');
+                }
+
+                const smolCacheTags = new Set<string>();
 
                 for (let i = 0; i < results.length; i++) {
                     const [tokenSACAddress, cometAMMAddress] = results[i];
-                    const id = event.payload.ids![i];
+                    // The contract returns one result per submitted smol in the same order.
+                    const id = resultIds[i];
 
-                    await this.env.SMOL_D1.prepare(`
+                    const result = await this.env.SMOL_D1.prepare(`
                         UPDATE Smols
                         SET Mint_Token = ?1, Mint_Amm = ?2
-                        WHERE Id = ?3
+                        WHERE Id = ?3 AND Mint_Token IS NULL AND Mint_Amm IS NULL
                     `)
                         .bind(tokenSACAddress, cometAMMAddress, id)
                         .run();
 
-                    const smol = await this.env.SMOL_D1.prepare(`
-                        SELECT Address
-                        FROM Smols
-                        WHERE Id = ?1
-                    `)
-                        .bind(id)
-                        .first<{ Address: string | null }>();
-
-                    cacheTags.add(`user:${event.payload.sub}:smol:${id}`);
-                    cacheTags.add(`smol:${id}:anonymous`);
-                    if (smol?.Address) {
-                        cacheTags.add(artistSmolsCacheTag(smol.Address));
+                    if (result.meta.changes === 0) {
+                        console.warn(`Smol ${id} already has mint metadata`);
                     }
+
+                    const ownerSub = event.payload.ownerSubsById?.[id] ?? event.payload.sub;
+
+                    // Collect cache tags for list/detail payloads that include mint metadata.
+                    smolCacheTags.add(artistSmolsCacheTag(ownerSub));
+                    smolCacheTags.add(`user:${ownerSub}:created`);
+                    smolCacheTags.add(`user:${ownerSub}:smol:${id}`);
+                    smolCacheTags.add(`user:${event.payload.sub}:smol:${id}`);
+                    smolCacheTags.add(`smol:${id}:anonymous`);
                 }
 
-                if (cacheTags.size > 0) {
-                    await purgeCacheByTags([...cacheTags]);
+                if (smolCacheTags.size > 0) {
+                    await purgeCacheByTags([...smolCacheTags]);
                 }
             });
         }
@@ -169,6 +183,8 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
     }
 
     async signTransaction(xdr: string) {
+        const signerKeypair = Keypair.fromSecret(this.env.SK);
+        const signerPublicKey = signerKeypair.publicKey();
         const contract = new SmolClient({
             contractId: this.env.SMOL_CONTRACT_ID,
             rpcUrl: this.env.RPC_URL,
@@ -178,8 +194,8 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
         const at = contract.txFromXDR(xdr);
 
         await at.signAuthEntries({
-            address: PK,
-            signAuthEntry: basicNodeSigner(KP, this.env.NETWORK_PASSPHRASE).signAuthEntry
+            address: signerPublicKey,
+            signAuthEntry: basicNodeSigner(signerKeypair, this.env.NETWORK_PASSPHRASE).signAuthEntry
         });
 
         return at.built!.toXDR();

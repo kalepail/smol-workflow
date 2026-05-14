@@ -4,6 +4,14 @@ import { getCookie } from 'hono/cookie'
 import { HTTPException } from 'hono/http-exception'
 import type { HonoEnv } from '../types'
 
+async function verifyJwtOrThrow(token: string, secret: string) {
+	try {
+		return await verify(token, secret, 'HS256')
+	} catch {
+		throw new HTTPException(401, { message: 'Invalid token' })
+	}
+}
+
 /**
  * Required authentication middleware
  * Throws 401 if no valid token is found
@@ -18,7 +26,7 @@ export async function parseAuth(c: Context<HonoEnv>, next: Next) {
 			// Admin token
 			c.set('isAdmin', true)
 		} else if (token) {
-			c.set('jwtPayload', await verify(token, c.env.SECRET, 'HS256'))
+			c.set('jwtPayload', await verifyJwtOrThrow(token, c.env.SECRET))
 		} else {
 			throw new HTTPException(401, { message: 'Invalid "Authorization" header' })
 		}
@@ -26,7 +34,7 @@ export async function parseAuth(c: Context<HonoEnv>, next: Next) {
 		const token = getCookie(c, 'smol_token')
 
 		if (token) {
-			c.set('jwtPayload', await verify(token, c.env.SECRET, 'HS256'))
+			c.set('jwtPayload', await verifyJwtOrThrow(token, c.env.SECRET))
 		} else {
 			throw new HTTPException(401, { message: 'Invalid "Cookie" token' })
 		}

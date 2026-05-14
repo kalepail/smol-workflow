@@ -1,5 +1,6 @@
 import { Hono } from 'hono'
 import { cache } from 'hono/cache'
+import { HTTPException } from 'hono/http-exception'
 import type { HonoEnv } from '../types'
 import { parseAuth } from '../middleware/auth'
 import { purgeUserLikedCache, userCacheKeyGenerator } from '../utils/cache'
@@ -12,7 +13,7 @@ likes.get(
 	parseAuth,
 	cache({
 		cacheName: 'smol-workflow',
-		cacheControl: 'public, max-age=20, stale-while-revalidate=40',
+		cacheControl: 'private, max-age=20',
 		keyGenerator: userCacheKeyGenerator, // Each user gets separate cache via sub claim
 	}),
 	async (c) => {
@@ -20,8 +21,10 @@ likes.get(
 		const payload = c.get('jwtPayload')!
 
 		const { results } = await env.SMOL_D1.prepare(`
-			SELECT Id FROM Likes
-			WHERE "Address" = ?1
+			SELECT l.Id
+			FROM Likes l
+			INNER JOIN Smols s ON s.Id = l.Id
+			WHERE l."Address" = ?1
 		`)
 			.bind(payload.sub)
 			.all()
@@ -49,11 +52,26 @@ likes.put('/:id', parseAuth, async (c) => {
 		.bind(id, payload.sub)
 		.run()
 
-	if (deleteResult.meta.changes === 0) {
-		await env.SMOL_D1.prepare(`INSERT INTO Likes (Id, "Address") VALUES (?1, ?2)`)
-			.bind(id, payload.sub)
-			.run()
+	if (deleteResult.meta.changes > 0) {
+		c.executionCtx.waitUntil(
+			purgeUserLikedCache(payload.sub, id)
+		)
+		return c.body(null, 204)
 	}
+
+	const smol = await env.SMOL_D1.prepare(
+		`SELECT 1 FROM Smols WHERE Id = ?1`
+	)
+		.bind(id)
+		.first()
+
+	if (!smol) {
+		throw new HTTPException(404, { message: 'Smol not found' })
+	}
+
+	await env.SMOL_D1.prepare(`INSERT OR IGNORE INTO Likes (Id, "Address") VALUES (?1, ?2)`)
+		.bind(id, payload.sub)
+		.run()
 
 	// Purge cache for this user's liked and likes lists, plus the individual smol detail page
 	// This ensures the liked button updates immediately on the smol detail page

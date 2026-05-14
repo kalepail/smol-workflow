@@ -44,5 +44,29 @@ CREATE TABLE IF NOT EXISTS Mixtapes (
     Created_At DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE INDEX IF NOT EXISTS idx_smols_public_created
+ON Smols(Public, Created_At DESC, Id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_smols_address_created
+ON Smols("Address", Created_At DESC, Id DESC);
+
 CREATE INDEX IF NOT EXISTS idx_smols_artist_public_created
 ON Smols("Address", Public, Created_At DESC, Id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_smols_song_1
+ON Smols(Song_1);
+
+CREATE INDEX IF NOT EXISTS idx_smols_song_2
+ON Smols(Song_2);
+
+CREATE INDEX IF NOT EXISTS idx_likes_address_id
+ON Likes("Address", Id);
+
+CREATE INDEX IF NOT EXISTS idx_playlists_title_id
+ON Playlists(Title, Id);
+
+CREATE INDEX IF NOT EXISTS idx_mixtapes_created
+ON Mixtapes(Created_At DESC, Id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_users_address
+ON Users("Address");

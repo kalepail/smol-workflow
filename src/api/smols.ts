@@ -9,9 +9,7 @@ import {
 	buildPaginationResponse,
 } from '../utils/pagination'
 import {
-	purgeArtistSmolsCache,
 	purgeCacheByTags,
-	purgePublicSmolsCache,
 	userCacheKeyGenerator,
 } from '../utils/cache'
 import { artistSmolsCacheTag } from '../utils/cache-tags'
@@ -20,6 +18,9 @@ import { queueSearchDeletionById } from '../utils/search'
 import { requireOwnedVisibilityToggle, syncSearchVisibilityAfterToggle } from '../utils/search-visibility'
 
 const smols = new Hono<HonoEnv>()
+// Keep these in sync with smol-fe generation controls and provider payload limits.
+const MAX_LYRICAL_PROMPT_LENGTH = 2280
+const MAX_INSTRUMENTAL_PROMPT_LENGTH = 380
 
 interface SmolListItem {
 	Id: string
@@ -28,6 +29,33 @@ interface SmolListItem {
 	Mint_Token: string | null
 	Mint_Amm: string | null
 	Created_At: string
+}
+
+interface SmolD1Record {
+	Id: string
+	Public: number
+	Address: string | null
+	[key: string]: unknown
+}
+
+async function hasRetryableSmolState(env: Env, id: string): Promise<boolean> {
+	let retrySteps: any
+
+	if (isDurableObjectId(id)) {
+		try {
+			const doid = env.DURABLE_OBJECT.idFromString(id)
+			const stub = env.DURABLE_OBJECT.get(doid)
+			retrySteps = await stub.getSteps()
+		} catch {
+			retrySteps = undefined
+		}
+	}
+
+	if (!retrySteps?.payload) {
+		retrySteps = await env.SMOL_KV.get(id, 'json')
+	}
+
+	return !!(retrySteps?.payload?.address && retrySteps?.payload?.prompt)
 }
 
 // Get all public smols
@@ -97,7 +125,7 @@ smols.get(
 	parseAuth,
 	cache({
 		cacheName: 'smol-workflow',
-		cacheControl: 'public, max-age=30, stale-while-revalidate=60',
+		cacheControl: 'private, max-age=30',
 		keyGenerator: userCacheKeyGenerator, // Each user gets separate cache via sub claim
 	}),
 	async (c) => {
@@ -105,7 +133,7 @@ smols.get(
 		const payload = c.get('jwtPayload')!
 		const { limit, cursor } = parsePaginationParams(new URL(req.url))
 
-	const whereClause = buildCursorWhereClause(cursor, 'Address = ?')
+	const whereClause = buildCursorWhereClause(cursor, '"Address" = ?')
 	const bindings: any[] = []
 
 	let query: string
@@ -160,7 +188,7 @@ smols.get(
 	parseAuth,
 	cache({
 		cacheName: 'smol-workflow',
-		cacheControl: 'public, max-age=30, stale-while-revalidate=60',
+		cacheControl: 'private, max-age=30',
 		keyGenerator: userCacheKeyGenerator, // Each user gets separate cache via sub claim
 	}),
 	async (c) => {
@@ -227,24 +255,24 @@ smols.get(
 		const { env, req, executionCtx } = c
 		const id = req.param('id')
 
-		// Determine if requester has liked the smol (if authenticated)
 		const payload = c.get('jwtPayload')
 		let liked = false
-		if (payload?.sub) {
-			const likedRow = await env.SMOL_D1.prepare(
-				`SELECT 1 FROM Likes WHERE Id = ?1 AND "Address" = ?2`
-			)
-				.bind(id, payload.sub)
-				.first()
-
-			liked = !!likedRow
-		}
 
 		const smol_d1 = await env.SMOL_D1.prepare(`SELECT * FROM Smols WHERE Id = ?1`)
 			.bind(id)
-			.first()
+			.first<SmolD1Record>()
 
 		if (smol_d1) {
+			if (payload?.sub) {
+				const likedRow = await env.SMOL_D1.prepare(
+					`SELECT 1 FROM Likes WHERE Id = ?1 AND "Address" = ?2`
+				)
+					.bind(id, payload.sub)
+					.first()
+
+				liked = !!likedRow
+			}
+
 			const smol_kv: any = await env.SMOL_KV.get(id, 'json')
 
 			// Increment views non-blockingly
@@ -264,8 +292,11 @@ smols.get(
 				liked,
 			})
 
-			// Only cache completed SMOLs (those in D1)
-			response.headers.set('Cache-Control', 'public, max-age=30, stale-while-revalidate=60')
+			if (payload?.sub) {
+				response.headers.set('Cache-Control', 'private, max-age=30')
+			} else {
+				response.headers.set('Cache-Control', 'public, max-age=30, stale-while-revalidate=60')
+			}
 
 			// Add cache tags for individual smol
 			// Use user-specific tag if authenticated, so we only purge that user's cache entry
@@ -294,8 +325,14 @@ smols.get(
 			}
 		})
 
+		const steps = (await stub.getSteps()) as any || {}
+
+		if (!payload?.sub || steps?.payload?.address !== payload.sub) {
+			throw new HTTPException(404, { message: 'Smol not found' })
+		}
+
 		// Replace image_base64 with boolean marker (interfaces use this to know when image is ready)
-		const { image_base64, ...rest } = (await stub.getSteps()) as any || {}
+		const { image_base64, ...rest } = steps
 		const kv_do = { ...rest, image: !!image_base64 }
 
 		const response = c.json({
@@ -322,8 +359,15 @@ smols.post('/', parseAuth, async (c) => {
 		playlist?: string
 	} = await req.json()
 
-	if (!body.prompt) {
+	if (!body.prompt || typeof body.prompt !== 'string') {
 		throw new HTTPException(400, { message: 'Missing prompt' })
+	}
+
+	const isInstrumental = body.instrumental ?? false
+	const maxPromptLength = isInstrumental ? MAX_INSTRUMENTAL_PROMPT_LENGTH : MAX_LYRICAL_PROMPT_LENGTH
+
+	if (body.prompt.length > maxPromptLength) {
+		throw new HTTPException(400, { message: `Prompt must be ${maxPromptLength} characters or less` })
 	}
 
 	const instanceId = env.DURABLE_OBJECT.newUniqueId().toString()
@@ -333,7 +377,7 @@ smols.post('/', parseAuth, async (c) => {
 			address: payload.sub,
 			prompt: body.prompt,
 			public: body.public ?? true,
-			instrumental: body.instrumental ?? false,
+			instrumental: isInstrumental,
 			playlist: body.playlist,
 		},
 	})
@@ -345,10 +389,15 @@ smols.post('/', parseAuth, async (c) => {
 })
 
 // Retry smol creation
-smols.post('/retry/:id', parseAuth, async (c) => {
+smols.post('/retry/:id', async (c) => {
 	const { env, req } = c
 
 	const id = req.param('id')
+
+	if (!await hasRetryableSmolState(env, id)) {
+		throw new HTTPException(404, { message: 'Smol not found' })
+	}
+
 	const instanceId = env.DURABLE_OBJECT.newUniqueId().toString()
 	const instance = await env.WORKFLOW.create({
 		id: instanceId,
@@ -367,6 +416,18 @@ smols.put('/:id', parseAuth, async (c) => {
 	const { env, req } = c
 	const id = req.param('id')
 	const payload = c.get('jwtPayload')!
+
+	const smolRecord = await env.SMOL_D1.prepare(`
+		SELECT Public
+		FROM Smols
+		WHERE Id = ?1 AND "Address" = ?2
+	`)
+		.bind(id, payload.sub)
+		.first<{ Public: number }>()
+
+	if (!smolRecord) {
+		throw new HTTPException(404, { message: 'Smol not found or not owned by you' })
+	}
 
 	const smol_kv: any = await env.SMOL_KV.get(id, 'json')
 
@@ -412,10 +473,14 @@ smols.put('/:id', parseAuth, async (c) => {
 
 	// Purge user's individual page
 	c.executionCtx.waitUntil(
-		Promise.all([
-			purgeArtistSmolsCache(payload.sub),
-			purgePublicSmolsCache(),
-			purgeCacheByTags([`user:${payload.sub}:smol:${id}`]),
+		purgeCacheByTags([
+			artistSmolsCacheTag(payload.sub),
+			'public-smols',
+			'mixtapes',
+			`user:${payload.sub}:created`,
+			`user:${payload.sub}:smol:${id}`,
+			`smol:${id}:anonymous`,
+			`smol:${id}:media`,
 		])
 	)
 
@@ -495,8 +560,11 @@ smols.delete('/admin/bulk', parseAuth, async (c) => {
 			continue
 		}
 
-		await env.SMOL_D1.prepare(`DELETE FROM Smols WHERE Id = ?1`).bind(id).run()
+		const likeRows = await env.SMOL_D1.prepare(`SELECT "Address" as Address FROM Likes WHERE Id = ?1`)
+			.bind(id)
+			.all<{ Address: string }>()
 		await env.SMOL_D1.prepare(`DELETE FROM Likes WHERE Id = ?1`).bind(id).run()
+		await env.SMOL_D1.prepare(`DELETE FROM Smols WHERE Id = ?1`).bind(id).run()
 
 		const smolKv: any = await env.SMOL_KV.get(id, 'json')
 
@@ -526,9 +594,15 @@ smols.delete('/admin/bulk', parseAuth, async (c) => {
 			purgeCacheByTags([
 				artistSmolsCacheTag(smol.Address),
 				'public-smols',
+				'mixtapes',
 				`user:${smol.Address}:created`,
 				`user:${smol.Address}:smol:${id}`,
 				`smol:${id}:anonymous`,
+				`smol:${id}:media`,
+				...((likeRows.results || []).flatMap((like) => [
+					`user:${like.Address}:liked`,
+					`user:${like.Address}:likes`,
+				])),
 			])
 		)
 
@@ -544,19 +618,28 @@ smols.delete('/:id', parseAuth, async (c) => {
 	const id = req.param('id')
 	const payload = c.get('jwtPayload')!
 
-	// Check ownership and delete in one query
-	const result = await env.SMOL_D1.prepare(`
-		DELETE FROM Smols
+	const ownedSmol = await env.SMOL_D1.prepare(`
+		SELECT Id
+		FROM Smols
 		WHERE Id = ?1 AND "Address" = ?2
 	`)
 		.bind(id, payload.sub)
-		.run()
+		.first<{ Id: string }>()
 
-	if (result.meta.changes === 0) {
+	if (!ownedSmol) {
 		throw new HTTPException(404, { message: 'Smol not found or not owned by you' })
 	}
 
+	const likeRows = await env.SMOL_D1.prepare(`SELECT "Address" as Address FROM Likes WHERE Id = ?1`)
+		.bind(id)
+		.all<{ Address: string }>()
+
 	const smol: any = await env.SMOL_KV.get(id, 'json')
+
+	await env.SMOL_D1.prepare(`DELETE FROM Likes WHERE Id = ?1`).bind(id).run()
+	await env.SMOL_D1.prepare(`DELETE FROM Smols WHERE Id = ?1 AND "Address" = ?2`)
+		.bind(id, payload.sub)
+		.run()
 
 	try {
 		if (isDurableObjectId(id)) {
@@ -591,8 +674,15 @@ smols.delete('/:id', parseAuth, async (c) => {
 		purgeCacheByTags([
 			artistSmolsCacheTag(payload.sub),
 			'public-smols',
+			'mixtapes',
 			`user:${payload.sub}:created`,
 			`user:${payload.sub}:smol:${id}`,
+			`smol:${id}:anonymous`,
+			`smol:${id}:media`,
+			...((likeRows.results || []).flatMap((like) => [
+				`user:${like.Address}:liked`,
+				`user:${like.Address}:likes`,
+			])),
 		])
 	)
 

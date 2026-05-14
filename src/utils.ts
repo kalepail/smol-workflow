@@ -1,8 +1,3 @@
-import { Server } from "@stellar/stellar-sdk/minimal/rpc";
-import { env } from "cloudflare:workers";
-
-export const rpc = new Server(env.RPC_URL)
-
 export function sleep(ms: number) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -28,7 +23,6 @@ export function parseRange(header: string, size: number): { offset: number; leng
 	} else {
 		// If no end is specified, it means from start to the end of the file
 		if (start >= size && size > 0) return undefined; // If size is 0, start=0 is valid for an empty range
-		if (start >= size && size > 0) return undefined; 
 		return { offset: start, length: undefined }; // Explicitly set length to undefined
 	}
 }

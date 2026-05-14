@@ -72,14 +72,16 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 							}
 						}
 
-						if (!retry_steps) {
+						if (!retry_steps?.payload) {
 							// Fallback for legacy gens and invalid/non-DO IDs
 							retry_steps = await this.env.SMOL_KV.get(retry_id, 'json') as WorkflowSteps;
 						}
 
 						payload = {
 							...payload, // original payload
-							...retry_steps?.payload // previous payload (notably we keep the original address)
+							// Retry can be started by anyone; attribution intentionally stays
+							// with the original smol creator from the saved payload.
+							...retry_steps?.payload
 						};
 					}
 				);
@@ -117,7 +119,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 				},
 			} as WorkflowStepConfig,
 			async () => {
-				return await pixellab(prompt, 'pixflux');
+				return await pixellab(this.env, prompt, 'pixflux');
 			}
 		);
 

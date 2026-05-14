@@ -5,6 +5,7 @@ declare namespace Cloudflare {
 	interface Env {
 		SECRET: string
 		SK: string
+		PIXELLAB_KEY: string
 		CF_API_TOKEN: string
 		CF_ZONE_ID: string
 		SEARCH_BACKFILL_CRON_ENABLED: string
@@ -126,5 +127,8 @@ type WorkflowTxParams = {
 	entropy?: string  // Required for 'mint', not used for 'batch-mint'
 	xdr: string
 	ids?: string[]    // Required for 'batch-mint', not used for 'mint'
+	mintableIds?: string[]
 	sub: string       // JWT sub of the user who initiated the mint
+	ownerSub?: string
+	ownerSubsById?: Record<string, string>
 }

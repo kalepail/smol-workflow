@@ -1,17 +1,31 @@
 import { Hono } from 'hono'
 import { HTTPException } from 'hono/http-exception'
-import { cache } from 'hono/cache'
 import { Jimp, ResizeStrategy } from 'jimp'
 import type { HonoEnv } from '../types'
 import { parseRange } from '../utils'
 
 const media = new Hono<HonoEnv>()
+const MEDIA_CACHE_CONTROL = 'public, max-age=2592000, stale-while-revalidate=86400'
+
+async function getSongSmolId(env: Env, musicId: string): Promise<string | null> {
+	const row = await env.SMOL_D1.prepare(`
+		SELECT Id
+		FROM Smols
+		WHERE Song_1 = ?1 OR Song_2 = ?1
+	`)
+		.bind(musicId)
+		.first<{ Id: string }>()
+
+	return row?.Id ?? null
+}
 
 // Serve songs
 media.get('/:id{.+\\.mp3}', async (c) => {
 	const { env, req, executionCtx } = c
 	const id = req.param('id')
+	const musicId = id.replace(/\.mp3$/, '')
 	const rangeHeader = req.header('range')
+	const smolId = await getSongSmolId(env, musicId)
 
 	const objectMeta = await env.SMOL_BUCKET.head(id)
 
@@ -23,6 +37,12 @@ media.get('/:id{.+\\.mp3}', async (c) => {
 	objectMeta.writeHttpMetadata(headers)
 	headers.set('Accept-Ranges', 'bytes')
 	headers.set('Content-Type', 'audio/mpeg')
+	// Media URLs are intentionally link-shareable by opaque ID. Public/private
+	// controls listing and detail visibility, not direct asset playback.
+	headers.set('Cache-Control', MEDIA_CACHE_CONTROL)
+	if (smolId) {
+		headers.set('Cache-Tag', `smol:${smolId}:media`)
+	}
 
 	let status = 200
 	let body: ReadableStream | null = null
@@ -57,10 +77,9 @@ media.get('/:id{.+\\.mp3}', async (c) => {
 	const shouldIncrementPlays = !rangeHeader || (rangeHeader && rangeHeader.startsWith('bytes=0-'))
 
 	if (shouldIncrementPlays) {
-		const dbId = id.replace('.mp3', '')
 		executionCtx.waitUntil(
 			env.SMOL_D1.prepare('UPDATE Smols SET Plays = Plays + 1 WHERE Song_1 = ?1 OR Song_2 = ?1')
-				.bind(dbId)
+				.bind(musicId)
 				.run()
 		)
 	}
@@ -74,14 +93,12 @@ media.get('/:id{.+\\.mp3}', async (c) => {
 // Serve images
 media.get(
 	'/:id{.+\\.png}',
-	cache({
-		cacheName: 'smol-workflow',
-		cacheControl: 'public, max-age=31536000, immutable',
-	}),
 	async (c) => {
 		const { env, req } = c
 		const id = req.param('id')
+		const smolId = id.replace(/\.png$/, '')
 		const scale = req.query('scale')
+
 		const image = await env.SMOL_BUCKET.get(id)
 
 		if (!image) {
@@ -112,6 +129,9 @@ media.get(
 		return new Response(scaled_image ?? image.body, {
 			headers: {
 				'Content-Type': 'image/png',
+				// Media URLs are intentionally link-shareable by opaque ID.
+				'Cache-Control': MEDIA_CACHE_CONTROL,
+				'Cache-Tag': `smol:${smolId}:media`,
 			},
 		})
 	}

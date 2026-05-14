@@ -1,12 +1,14 @@
-const PIXELLAB_KEY = '8e3623e3-43e1-4699-a031-eb7fa7753f6a'
-
 // TODO very probably need to run some sort of sentiment analysis on this to filter out NSFW stuff
 
-export async function pixellab(description: string, model: 'pixflux' | 'bitforge') {
+export async function pixellab(env: Env, description: string, model: 'pixflux' | 'bitforge') {
     let res: any
 
     if (!model || !description)
         throw new Error('Missing parameters')
+
+    if (!env.PIXELLAB_KEY) {
+        throw new Error('Missing Pixellab API key')
+    }
 
     // description = `
     //     A rich scene without any characters or people.
@@ -15,10 +17,10 @@ export async function pixellab(description: string, model: 'pixflux' | 'bitforge
 
     switch (model) {
         case 'pixflux':
-            res = await pixflux(description)
+            res = await pixflux(env, description)
             break
         case 'bitforge':
-            res = await bitforge(description)
+            res = await bitforge(env, description)
             break
         default:
             throw new Error('Model not found')
@@ -27,7 +29,7 @@ export async function pixellab(description: string, model: 'pixflux' | 'bitforge
     return res.image.base64 as string
 }
 
-async function pixflux(description: string) {
+async function pixflux(env: Env, description: string) {
     const width = 64
     // const width = 32
 
@@ -35,7 +37,7 @@ async function pixflux(description: string) {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${PIXELLAB_KEY}`
+            'Authorization': `Bearer ${env.PIXELLAB_KEY}`
         },
         body: JSON.stringify({
             description,
@@ -61,14 +63,14 @@ async function pixflux(description: string) {
         })
 }
 
-async function bitforge(description: string) {
+async function bitforge(env: Env, description: string) {
     const width = 16
 
     return fetch('https://api.pixellab.ai/v1/generate-image-bitforge', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${PIXELLAB_KEY}`
+            'Authorization': `Bearer ${env.PIXELLAB_KEY}`
         },
         body: JSON.stringify({
             description,
