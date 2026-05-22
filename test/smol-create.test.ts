@@ -44,6 +44,18 @@ test('early owned get path reads seeded durable object payload for in-progress s
 	assert.match(getRouteSource, /const steps = \(await stub\.getSteps\(\)\) as any \|\| \{\}/)
 	assert.match(getRouteSource, /if \(!payload\?\.sub \|\| steps\?\.payload\?\.address !== payload\.sub\) \{/)
 	assert.match(getRouteSource, /const \{ image_base64, \.\.\.rest \} = steps/)
-	assert.match(getRouteSource, /kv_do,\s+wf: instance && \(await instance\.status\(\)\),\s+liked,/)
+	assert.match(getRouteSource, /const wfStatus = instance && \(await instance\.status\(\)\)/)
+	assert.match(getRouteSource, /const failure = getSmolFailure\(steps, wfStatus\)/)
+	assert.match(getRouteSource, /kv_do,\s+wf: wfStatus,\s+liked,/)
 	assert.match(getRouteSource, /response\.headers\.set\('Cache-Control', 'no-store'\)/)
+})
+
+test('in-progress get path exposes sanitized failure details for failed songs', async () => {
+	const smolsSource = await source('src/api/smols.ts')
+
+	assert.match(smolsSource, /interface SmolFailure/)
+	assert.match(smolsSource, /function getSmolFailure/)
+	assert.match(smolsSource, /code: 'content_policy'/)
+	assert.match(smolsSource, /song provider content policy/)
+	assert.match(smolsSource, /const kv_do = \{ \.\.\.rest, image: !!image_base64, \.\.\.\(failure \? \{ failure \} : \{\}\) \}/)
 })

@@ -39,6 +39,70 @@ interface SmolD1Record {
 	[key: string]: unknown
 }
 
+interface SmolFailure {
+	code: 'content_policy' | 'generation_timeout' | 'provider_unavailable' | 'generation_failed' | 'terminated'
+	title: string
+	message: string
+	retryable: boolean
+}
+
+function getSmolFailure(steps: any, wfStatus?: InstanceStatus | null): SmolFailure | undefined {
+	const failedSong = Array.isArray(steps?.songs)
+		? steps.songs.find((song: any) => typeof song?.status === 'number' && song.status < 0)
+		: undefined
+
+	if (failedSong) {
+		switch (failedSong.status) {
+			case -1:
+				return {
+					code: 'content_policy',
+					title: 'Song provider rejected this generation',
+					message: 'One generated song was rejected by the song provider content policy. Try again with a less sensitive prompt or lyrics.',
+					retryable: true,
+				}
+			case -2:
+				return {
+					code: 'generation_timeout',
+					title: 'Song generation timed out',
+					message: 'The song provider did not finish this generation in time. Retrying usually fixes this.',
+					retryable: true,
+				}
+			case -3:
+				return {
+					code: 'provider_unavailable',
+					title: 'Song provider is temporarily unavailable',
+					message: 'The song provider reported a temporary issue. Retrying later is the best next step.',
+					retryable: true,
+				}
+			default:
+				return {
+					code: 'generation_failed',
+					title: 'Song generation failed',
+					message: 'The song provider could not complete this generation. Try again or adjust the prompt.',
+					retryable: true,
+				}
+		}
+	}
+
+	if (wfStatus?.status === 'terminated') {
+		return {
+			code: 'terminated',
+			title: 'Generation was stopped',
+			message: 'This generation was stopped before it could finish.',
+			retryable: true,
+		}
+	}
+
+	if (wfStatus?.status === 'errored') {
+		return {
+			code: 'generation_failed',
+			title: 'Generation failed',
+			message: 'This generation failed before it could finish. Retrying may recover it.',
+			retryable: true,
+		}
+	}
+}
+
 async function hasRetryableSmolState(env: Env, id: string): Promise<boolean> {
 	let retrySteps: any
 
@@ -327,6 +391,7 @@ smols.get(
 		})
 
 		const steps = (await stub.getSteps()) as any || {}
+		const wfStatus = instance && (await instance.status())
 
 		if (!payload?.sub || steps?.payload?.address !== payload.sub) {
 			throw new HTTPException(404, { message: 'Smol not found' })
@@ -334,11 +399,12 @@ smols.get(
 
 		// Replace image_base64 with boolean marker (interfaces use this to know when image is ready)
 		const { image_base64, ...rest } = steps
-		const kv_do = { ...rest, image: !!image_base64 }
+		const failure = getSmolFailure(steps, wfStatus)
+		const kv_do = { ...rest, image: !!image_base64, ...(failure ? { failure } : {}) }
 
 		const response = c.json({
 			kv_do,
-			wf: instance && (await instance.status()),
+			wf: wfStatus,
 			liked,
 		})
 
