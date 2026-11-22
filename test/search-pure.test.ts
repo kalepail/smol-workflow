@@ -14,6 +14,7 @@ import {
 	normalizeMetadataPhrase,
 	normalizeMetadataEnum,
 	tryParseJsonObject,
+	extractTextGenerationContent,
 	normalizeExtractedSearchMetadata,
 	parseSearchHints,
 	fuseMatches,
@@ -774,4 +775,25 @@ test('fuseMatches + sortCandidates produces correct ranking for multi-modality m
 	assert.equal(ranked[0]?.smolId, 'smol-A')
 	assert.equal(ranked[1]?.smolId, 'smol-C')
 	assert.equal(ranked[2]?.smolId, 'smol-B')
+})
+
+test('extractTextGenerationContent reads chat-completion content (gemma-4 shape)', () => {
+	const content = '{"style_primary":"synthwave"}'
+	assert.equal(extractTextGenerationContent({
+		object: 'chat.completion',
+		choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
+	}), content)
+})
+
+test('extractTextGenerationContent falls back to legacy response field', () => {
+	assert.deepEqual(extractTextGenerationContent({ response: { style_primary: 'folk' } }), { style_primary: 'folk' })
+	assert.equal(extractTextGenerationContent({ response: '{"a":1}' }), '{"a":1}')
+})
+
+test('extractTextGenerationContent ignores empty content from a truncated thinking run', () => {
+	assert.equal(extractTextGenerationContent({
+		choices: [{ message: { role: 'assistant', content: '', reasoning_content: '...' }, finish_reason: 'length' }],
+	}), undefined)
+	assert.equal(extractTextGenerationContent(undefined), undefined)
+	assert.equal(extractTextGenerationContent('not an object'), undefined)
 })

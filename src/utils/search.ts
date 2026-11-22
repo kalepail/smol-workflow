@@ -5,7 +5,8 @@ import { buildCursorWhereClause, buildPaginationResponse, type PaginationRespons
 export const SEARCH_INDEX_VERSION = 'v2'
 
 const EMBEDDING_MODEL = '@cf/baai/bge-m3'
-const TAG_EXTRACTION_MODEL = '@cf/meta/llama-3.2-3b-instruct'
+// Replaces @cf/meta/llama-3.2-3b-instruct, which Workers AI deprecated on 2026-11-20.
+export const TAG_EXTRACTION_MODEL = '@cf/google/gemma-4-26b-a4b-it'
 const SEARCH_TOP_K = 100
 const SEARCH_RRF_K = 60
 const SEARCH_MAX_LIMIT = 20
@@ -144,6 +145,24 @@ export type SearchMetadataExtraction = Pick<
 
 type AiJsonGenerationOutput = {
 	response?: string | Record<string, unknown>
+}
+
+type TagExtractionOutput = Ai_Cf_Google_Gemma_4_26B_A4B_It_Output & AiJsonGenerationOutput
+
+// gemma-4 returns an OpenAI-style chat completion; older text-generation models
+// returned `{ response }`. Accept both so a model swap cannot silently drop tags.
+export function extractTextGenerationContent(response: unknown): string | Record<string, unknown> | undefined {
+	if (!response || typeof response !== 'object') {
+		return undefined
+	}
+
+	const output = response as TagExtractionOutput
+	const content = output.choices?.[0]?.message?.content
+	if (typeof content === 'string' && content.trim()) {
+		return content
+	}
+
+	return output.response
 }
 
 type SmolSearchRow = {
@@ -1038,8 +1057,8 @@ async function extractSearchMetadata(env: Env, source: SmolIndexSource): Promise
 		},
 	]
 
-	const parseMetadataResponse = (response: AiTextGenerationOutput & AiJsonGenerationOutput): SearchStoredMetadata | null => {
-		const parsed = normalizeExtractedSearchMetadata(tryParseJsonObject(response.response), fallback)
+	const parseMetadataResponse = (response: TagExtractionOutput): SearchStoredMetadata | null => {
+		const parsed = normalizeExtractedSearchMetadata(tryParseJsonObject(extractTextGenerationContent(response)), fallback)
 		if (!parsed) {
 			return null
 		}
@@ -1057,9 +1076,12 @@ async function extractSearchMetadata(env: Env, source: SmolIndexSource): Promise
 			response_format: {
 				type: 'json_object',
 			},
-			max_tokens: 250,
+			max_completion_tokens: 250,
 			temperature: 0,
-		}) as AiTextGenerationOutput & AiJsonGenerationOutput
+			// Thinking is on by default and would spend the token budget on reasoning,
+			// leaving `content` empty (verified live: finish_reason "length").
+			chat_template_kwargs: { enable_thinking: false },
+		}) as TagExtractionOutput
 
 		const parsed = parseMetadataResponse(response)
 		if (parsed) {
@@ -1075,20 +1097,23 @@ async function extractSearchMetadata(env: Env, source: SmolIndexSource): Promise
 	try {
 		const response = await env.AI.run(TAG_EXTRACTION_MODEL, {
 			messages,
-			max_tokens: 250,
+			max_completion_tokens: 250,
 			temperature: 0,
-		}) as AiTextGenerationOutput & AiJsonGenerationOutput
+			chat_template_kwargs: { enable_thinking: false },
+		}) as TagExtractionOutput
 
 		const parsed = parseMetadataResponse(response)
 		if (parsed) {
 			return parsed
 		}
 
+		const content = extractTextGenerationContent(response)
 		logSearchEvent('search_metadata_parse_failed', {
 			title: source.title,
-			responsePreview: typeof response.response === 'string'
-				? truncateText(response.response, 200)
-				: response.response,
+			finishReason: response.choices?.[0]?.finish_reason ?? undefined,
+			responsePreview: typeof content === 'string'
+				? truncateText(content, 200)
+				: content,
 		})
 	} catch (error) {
 		logSearchEvent('search_metadata_generation_failed', {

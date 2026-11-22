@@ -10,6 +10,7 @@ import {
 	queueSearchIndexingById,
 	reconcileSearchIndexingBatchById,
 	runSearchBackfillCron,
+	TAG_EXTRACTION_MODEL,
 	SEARCH_INDEX_VERSION,
 	tryParseJsonObject,
 } from '../src/utils/search'
@@ -328,17 +329,26 @@ function createInstrumentalUpsertEnv() {
 	const env = {
 		AI: {
 			run: async (model: string, payload: unknown) => {
-				if (model === '@cf/meta/llama-3.2-3b-instruct') {
+				if (model === TAG_EXTRACTION_MODEL) {
+					assert.deepEqual((payload as { chat_template_kwargs?: unknown }).chat_template_kwargs, { enable_thinking: false })
 					return {
-						response: {
-							style_primary: 'cinematic',
-							mood_primary: 'uplifting',
-							theme_primary: 'journey',
-							lyric_presence: 'instrumental',
-							brightness_level: 'bright',
-							energy_level: 'mid',
-							modality_guess: 'unknown',
-						},
+						object: 'chat.completion',
+						choices: [{
+							index: 0,
+							message: {
+								role: 'assistant',
+								content: JSON.stringify({
+									style_primary: 'cinematic',
+									mood_primary: 'uplifting',
+									theme_primary: 'journey',
+									lyric_presence: 'instrumental',
+									brightness_level: 'bright',
+									energy_level: 'mid',
+									modality_guess: 'unknown',
+								}, null, 2),
+							},
+							finish_reason: 'stop',
+						}],
 					}
 				}
 
@@ -452,7 +462,7 @@ function createBatchUpsertEnv() {
 	const env = {
 		AI: {
 			run: async (model: string, payload: unknown) => {
-				if (model === '@cf/meta/llama-3.2-3b-instruct') {
+				if (model === TAG_EXTRACTION_MODEL) {
 					aiCalls.metadata += 1
 					const title = (payload as { messages: Array<{ content: string }> }).messages[1]?.content ?? ''
 					if (title.includes('Neon River')) {
@@ -902,6 +912,7 @@ test('upsert queue message indexes an instrumental smol even when lyrics are mis
 	assert.equal(getUpserts()[0]?.length, 4)
 	assert.equal(new Set(getUpserts()[0]?.map((vector) => vector.id)).size, 4)
 	assert.ok(getUpserts()[0]?.every((vector) => vector.id.length <= 64))
+	assert.ok(getUpserts()[0]?.every((vector) => vector.metadata?.style_primary === 'cinematic'))
 	assert.equal(getRecord().search?.status, 'processing')
 	assert.equal(getRecord().search?.mutation_id, '202')
 	assert.equal(getFinalizeMessages().length, 1)

@@ -46,48 +46,92 @@ const config: WorkflowStepConfig = {
 	timeout: '5 minutes',
 }
 
+// Non-stream step results are capped at 1 MiB. Leave headroom for encoding.
+const MAX_RETRY_SNAPSHOT_BYTES = 900 * 1024;
+
+/**
+ * Reduce restored retry state to the fields `run` and `decideSongsStrategy`
+ * read, as a plain JSON value safe to persist as a step result. If the
+ * snapshot would exceed the step result limit, drop the image so the retry
+ * regenerates it instead of failing the step.
+ */
+export function toRetrySnapshot(restored: WorkflowSteps | null | undefined, retry_id: string): WorkflowSteps | null {
+	if (!restored?.payload) {
+		return null;
+	}
+
+	const snapshot = JSON.parse(JSON.stringify({
+		payload: restored.payload,
+		image_base64: restored.image_base64,
+		description: restored.description,
+		lyrics: restored.lyrics,
+		nsfw: restored.nsfw,
+		song_ids: restored.song_ids,
+		songs: restored.songs,
+		original_fingerprints: restored.original_fingerprints,
+	})) as WorkflowSteps;
+
+	if (new TextEncoder().encode(JSON.stringify(snapshot)).byteLength > MAX_RETRY_SNAPSHOT_BYTES) {
+		console.warn('Retry snapshot too large for a step result; regenerating image', retry_id);
+		snapshot.image_base64 = undefined;
+	}
+
+	return snapshot;
+}
+
 export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 	async run(event: WorkflowEvent<WorkflowParams>, step: WorkflowStep) {
 		let retry_steps: WorkflowSteps | undefined;
 		let payload = event.payload;
 
-		const { retry_id, playlist } = payload;
+		const { retry_id } = payload;
 
 		// =====================================================================
 		// STEP 1: Load retry state (if this is a retry)
+		//
+		// The restored state MUST be the step's return value. On replay (after a
+		// step retry, sleep or hibernation) Workflows return the cached result
+		// without re-running the callback, so assignments made inside the
+		// callback would be lost and `payload` would only hold `{ retry_id }`.
 		// =====================================================================
 			if (retry_id) {
-				await step.do(
+				const restoredSteps = await step.do(
 					'retry workflow',
 					config,
 					async () => {
+						let restored: WorkflowSteps | null | undefined;
+
 						if (isDurableObjectId(retry_id)) {
 							try {
 								const retry_doid = this.env.DURABLE_OBJECT.idFromString(retry_id);
 								const retry_stub = this.env.DURABLE_OBJECT.get(retry_doid);
 
-								retry_steps = await retry_stub.getSteps() as WorkflowSteps;
+								restored = await retry_stub.getSteps() as WorkflowSteps;
 							} catch (err) {
 								console.warn('Retry DO lookup failed, falling back to KV', retry_id, err);
 							}
 						}
 
-						if (!retry_steps?.payload) {
+						if (!restored?.payload) {
 							// Fallback for legacy gens and invalid/non-DO IDs
-							retry_steps = await this.env.SMOL_KV.get(retry_id, 'json') as WorkflowSteps;
+							restored = await this.env.SMOL_KV.get(retry_id, 'json') as WorkflowSteps | null;
 						}
 
-						payload = {
-							...payload, // original payload
-							// Retry can be started by anyone; attribution intentionally stays
-							// with the original smol creator from the saved payload.
-							...retry_steps?.payload
-						};
+						return toRetrySnapshot(restored, retry_id);
 					}
 				);
+
+				retry_steps = restoredSteps ?? undefined;
+
+				payload = {
+					...payload, // original payload
+					// Retry can be started by anyone; attribution intentionally stays
+					// with the original smol creator from the saved payload.
+					...retry_steps?.payload
+				};
 			}
 
-		const { address, prompt, public: is_public = true, instrumental: is_instrumental = false } = payload;
+		const { address, prompt, playlist, public: is_public = true, instrumental: is_instrumental = false } = payload;
 
 		if (!address) {
 			throw new NonRetryableError("Missing address: unable to start workflow without user authentication");

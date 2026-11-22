@@ -39,6 +39,6 @@ test('retry smol route accepts DO or KV state instead of requiring a D1 row', as
 test('retry workflow falls back to KV if durable object state has flushed', async () => {
 	const workflowSource = await source('src/workflow.ts')
 
-	assert.match(workflowSource, /if \(!retry_steps\?\.payload\) \{/)
-	assert.match(workflowSource, /retry_steps = await this\.env\.SMOL_KV\.get\(retry_id, 'json'\) as WorkflowSteps/)
+	assert.match(workflowSource, /if \(!restored\?\.payload\) \{/)
+	assert.match(workflowSource, /restored = await this\.env\.SMOL_KV\.get\(retry_id, 'json'\) as WorkflowSteps \| null/)
 })
