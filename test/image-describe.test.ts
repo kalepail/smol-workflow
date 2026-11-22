@@ -46,5 +46,6 @@ test('imageDescribe sends a data URI with streaming disabled to the moondream mo
 	assert.equal(calls[0]?.input.stream, false)
 	assert.equal(calls[0]?.input.image, 'data:image/png;base64,iVBORw0KGgo=')
 	assert.equal(calls[1]?.input.image, 'data:image/png;base64,iVBORw0KGgo=')
-	assert.match(String(calls[0]?.input.question), /original prompt to generate the image: a parrot/)
+	assert.match(String(calls[0]?.input.question), /Do not mention pixels, pixel art/)
+	assert.match(String(calls[0]?.input.question), /Original prompt for context: a parrot/)
 })

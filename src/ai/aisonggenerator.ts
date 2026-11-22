@@ -10,14 +10,16 @@ export async function generateLyrics(env: Env, prompt: string, description: stri
         ${description}
 
         # NOTES
-        Focus on creativity, story and lyrical variety over strict adherence to the prompt and description.
+        Write the title, lyrics, and style tags in the exact language of # Prompt unless another language is explicitly requested.
+        Keep # Prompt authoritative for genre, mood, and subject, using # Description as visual flavor.
     `;
     const promptWithoutDescription = `
         # Prompt
         ${prompt}
 
         # NOTES
-        Focus on creativity, story and lyrical variety over strict adherence to the prompt.
+        Write the title, lyrics, and style tags in the exact language of # Prompt unless another language is explicitly requested.
+        Focus on vivid imagery, singable cadence, and a memorable hook while staying faithful to # Prompt.
     `;
 
     if (prompt.length > 760) {

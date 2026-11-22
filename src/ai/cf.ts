@@ -8,10 +8,11 @@ export async function imageDescribe(env: Env, base64: string, prompt: string) {
     const response = await env.AI.run(IMAGE_DESCRIBE_MODEL, {
         task: 'query',
         image,
-        question: `
-            Describe this image in a few sentences. Be creative but specific. Focus on story, emotion and environment.
-            Keep in mind this was the original prompt to generate the image: ${prompt}
-        `,
+        question: [
+            'Describe the scene, subject, lighting, colors, and emotional atmosphere in 2-3 vivid, grounded sentences as if it were a real place or moment.',
+            'Do not mention pixels, pixel art, pixelated graphics, 8-bit, sprites, digital art, or that this is an image.',
+            `Original prompt for context: ${prompt}`,
+        ].join(' '),
         // The binding streams SSE unless stream is explicitly false.
         stream: false,
         reasoning: false,
