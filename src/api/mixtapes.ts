@@ -157,10 +157,12 @@ mixtapes.get(
 		const allSmolIds = results.flatMap((mixtape) => parseStoredSmolIds(mixtape.Smols))
 		const publicSmolRows = await loadPublicSmolRows(env, allSmolIds)
 
-		const mixtapes = results.map((mixtape) => ({
-			...mixtape,
-			Smols: parseStoredSmolIds(mixtape.Smols).filter((id) => publicSmolRows.has(id)),
-		}))
+		const mixtapes = results
+			.map((mixtape) => ({
+				...mixtape,
+				Smols: parseStoredSmolIds(mixtape.Smols).filter((id) => publicSmolRows.has(id)),
+			}))
+			.filter((mixtape) => mixtape.Smols.length > 0)
 
 		const response = c.json(mixtapes)
 
