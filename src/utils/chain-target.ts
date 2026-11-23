@@ -10,7 +10,7 @@ export type ChainTrackRow = {
 	Mint_Amm: string | null
 }
 
-export type MintPhase = 'queued' | 'submitting' | 'submitted' | 'confirmed' | 'persisted' | 'failed'
+export type MintPhase = 'unverified' | 'existing' | 'queued' | 'submitting' | 'submitted' | 'confirmed' | 'persisted' | 'failed'
 export type MintBatchRow = {
 	workflowId: string
 	ids: string[]
@@ -118,11 +118,13 @@ export async function readChainTarget(env: Env, target: TrackTarget | undefined,
 	const batches = JSON.parse(row.Batches) as MintBatchRow[]
 	let ordered: string[]
 	let revision: string
+	let canSeeStoredMembership = true
 	if (mix) {
 		const cohort = JSON.parse(row.Cohort!) as MixtapeVisibilityRow[]
 		const mixtape = cohort.find(({ Id }) => Id === mix.mixtapeId)
 		if (!mixtape) throw new HTTPException(404, { message: 'Mixtape not found' })
-		if (mixtape.Address !== sub) {
+		canSeeStoredMembership = mixtape.Address === sub
+		if (!canSeeStoredMembership) {
 			const publicIds = JSON.parse(row.PublicIds!) as string[]
 			const { decisions } = await deriveDecisions(cohort, new Set(publicIds))
 			if (mixtape.Visibility !== 'public' || decisions.get(mixtape.Id)?.visibility !== 'public') {
@@ -138,14 +140,16 @@ export async function readChainTarget(env: Env, target: TrackTarget | undefined,
 		ordered = target ? ids : JSON.parse(row.Requested!)
 		revision = Buffer.from(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(ordered)))).toString('hex')
 	}
-	if (ordered.length > MAX_TARGET_TRACKS) throw new HTTPException(400, { message: 'Max 100 distinct tracks per target' })
+	const tracks = ordered.flatMap((id) => {
+		const track = tracksById.get(id)
+		return track ? [track] : []
+	})
+	const count = canSeeStoredMembership ? ordered.length : tracks.length
+	if (count > MAX_TARGET_TRACKS) throw new HTTPException(400, { message: 'Max 100 distinct tracks per target' })
 
 	return {
 		revision,
-		tracks: ordered.flatMap((id) => {
-			const track = tracksById.get(id)
-			return track ? [track] : []
-		}),
+		tracks,
 		incompleteMembership: ordered.some((id) => !tracksById.has(id)),
 		batches,
 	}

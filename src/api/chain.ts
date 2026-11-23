@@ -1,7 +1,7 @@
 import { StrKey } from '@stellar/stellar-sdk/minimal'
 import { Hono } from 'hono'
 import { HTTPException } from 'hono/http-exception'
-import { optionalAuth } from '../middleware/auth'
+import { parseAuth } from '../middleware/auth'
 import type { HonoEnv } from '../types'
 import {
 	balanceKey, cometInstance, deriveMintPair, instanceKey, isLedgerSequence, isSacInstance,
@@ -34,7 +34,11 @@ function trackKeys(pair: ReturnType<typeof deriveMintPair>, holder?: string) {
 
 const UNKNOWN_BALANCE = { state: 'unknown', reason: 'unavailable' } satisfies Balance
 
-chain.post('/snapshot', privateNoStore, optionalAuth, async (c) => {
+chain.post('/snapshot', privateNoStore, parseAuth, async (c) => {
+	const sub = c.get('jwtPayload')?.sub
+	if (typeof sub !== 'string' || !sub) {
+		throw new HTTPException(401, { message: 'User session required' })
+	}
 	const body = await readJsonBody(c)
 	const target = parseTrackTarget(body.target)
 	const quote = parseQuote(body.quote)
@@ -45,12 +49,7 @@ chain.post('/snapshot', privateNoStore, optionalAuth, async (c) => {
 	if (minLedger !== undefined && !isLedgerSequence(minLedger)) {
 		throw new HTTPException(400, { message: 'Invalid minLedger' })
 	}
-	const claim = c.get('jwtPayload')?.sub
-	const sub = typeof claim === 'string' && claim ? claim : undefined
-	if (includeWallet && !sub) {
-		throw new HTTPException(401, { message: 'User session required' })
-	}
-	if (includeWallet && !StrKey.isValidContract(sub!)) {
+	if (includeWallet && !StrKey.isValidContract(sub)) {
 		throw new HTTPException(400, { message: 'Wallet snapshots require a contract account' })
 	}
 

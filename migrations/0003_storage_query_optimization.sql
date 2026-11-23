@@ -1,6 +1,9 @@
--- Apply once through D1's migration ledger. SQLite has no ADD COLUMN IF NOT EXISTS.
--- For a manual rehearsal on a provisioned schema, skip the ALTER if pragma_table_info('Smols')
--- already contains Tags. The remaining statements can be replayed.
+-- Live smol-d1: apply this file exactly once, using ONLY:
+-- npx wrangler d1 execute smol-d1 --remote --file=migrations/0003_storage_query_optimization.sql
+-- Precheck: SELECT 1 FROM pragma_table_info('Smols') WHERE name = 'Tags';
+-- Proceed only if no row is returned. SQLite has no ADD COLUMN IF NOT EXISTS.
+-- Never run wrangler d1 migrations apply on live smol-d1. Its d1_migrations ledger
+-- is unseeded. Replaying 0001 clears provider provenance and drops Smols triggers.
 ALTER TABLE Smols ADD COLUMN Tags TEXT DEFAULT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_smols_minted_created
@@ -73,8 +76,8 @@ CREATE TABLE IF NOT EXISTS MintBatchStatus (
     Workflow_Id TEXT PRIMARY KEY,
     "Address" TEXT NOT NULL,
     Ids TEXT NOT NULL,
-    Phase TEXT NOT NULL DEFAULT 'queued'
-        CHECK (Phase IN ('queued', 'submitting', 'submitted', 'confirmed', 'persisted', 'failed')),
+    Phase TEXT NOT NULL DEFAULT 'unverified'
+        CHECK (Phase IN ('unverified', 'existing', 'queued', 'submitting', 'submitted', 'confirmed', 'persisted', 'failed')),
     Tx_Hash TEXT,
     Confirmed_Ledger INTEGER
 );

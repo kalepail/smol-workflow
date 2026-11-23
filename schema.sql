@@ -209,8 +209,8 @@ CREATE TABLE IF NOT EXISTS MintBatchStatus (
     Workflow_Id TEXT PRIMARY KEY,
     "Address" TEXT NOT NULL,
     Ids TEXT NOT NULL,
-    Phase TEXT NOT NULL DEFAULT 'queued'
-        CHECK (Phase IN ('queued', 'submitting', 'submitted', 'confirmed', 'persisted', 'failed')),
+    Phase TEXT NOT NULL DEFAULT 'unverified'
+        CHECK (Phase IN ('unverified', 'existing', 'queued', 'submitting', 'submitted', 'confirmed', 'persisted', 'failed')),
     Tx_Hash TEXT,
     Confirmed_Ledger INTEGER
 );

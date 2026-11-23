@@ -110,7 +110,7 @@ function decodeLedgerValue(entry: LedgerEntryWire, ledger: number): LedgerValue 
 	try {
 		const ttl = entry.liveUntilLedgerSeq
 		if (!isLedgerSequence(entry.lastModifiedLedgerSeq) || entry.lastModifiedLedgerSeq > ledger
-			|| (ttl !== undefined && ttl !== 0 && (!isLedgerSequence(ttl) || ttl < ledger))) {
+			|| (ttl !== undefined && ttl !== 0 && !isLedgerSequence(ttl))) {
 			return { state: 'unknown' }
 		}
 		const data = xdr.LedgerEntryData.fromXDR(entry.xdr, 'base64').contractData()
@@ -120,7 +120,7 @@ function decodeLedgerValue(entry: LedgerEntryWire, ledger: number): LedgerValue 
 			durability: data.durability(),
 		}))
 		if (key.toXDR('base64') !== entry.key) return { state: 'unknown' }
-		const life = ttl === undefined ? undefined : ttl === 0 ? 'archived' : 'live'
+		const life = ttl === undefined ? undefined : ttl < ledger ? 'archived' : 'live'
 		return { state: 'present', value: data.val(), life }
 	} catch {
 		return { state: 'unknown' }

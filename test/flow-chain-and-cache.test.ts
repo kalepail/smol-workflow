@@ -187,13 +187,13 @@ test('chain snapshot uses the audited identity and quote, distinguishes archived
 	assert.equal(result.ownership, 'unknown')
 	assert.deepEqual(result.tracks.map(({ mint }: { mint: string }) => mint), ['unresolved', 'unresolved'])
 	assert.equal(keys.length, 1)
-	const invalid = await send('/chain/snapshot', { target: { trackIds: [TRACK] }, quote: { ...quote, amountIn: '033' } })
+	const invalid = await send('/chain/snapshot', { target: { trackIds: [TRACK] }, quote: { ...quote, amountIn: '033' } }, WALLET)
 	assert.equal(invalid.status, 400)
 	db.close()
 })
 
 test('chain snapshot checks live mixtape visibility, hides private members and retries older chunks once', async () => {
-	const { env, db, send, track } = harness()
+	const { env, db, send, stats, track } = harness()
 	track(TRACK)
 	track(SECOND)
 	track(PRIVATE, { public: 0 })
@@ -207,14 +207,18 @@ test('chain snapshot checks live mixtape visibility, hides private members and r
 		return { latestLedger, archiveAware: true, entries: [] }
 	} } as KaleWorkerBinding
 	const target = { mixtapeId: 'hidden' }
-	let response = await send('/chain/snapshot', { target })
-	assert.equal(response.status, 404)
+	let response = await send('/chain/snapshot', { target: { trackIds: [TRACK] } })
+	assert.equal(response.status, 401)
 	assert.equal(response.headers.get('Cache-Control'), 'private, no-store')
-	assert.equal((await send('/chain/snapshot', { target }, OTHER)).status, 404)
 	assert.equal((await send('/chain/snapshot', { target, includeWallet: true })).status, 401)
+	assert.equal((await send('/chain/snapshot', { target }, undefined, { Authorization: `Bearer ${SECRET}` })).status, 401)
+	assert.equal((await send('/chain/snapshot', { target }, undefined, { Cookie: 'smol_token=invalid' })).status, 401)
+	assert.equal(stats.statements.length, 0)
+	assert.equal((await send('/chain/snapshot', { target }, OTHER)).status, 404)
 	assert.equal((await send('/chain/snapshot', { target: { ...target, revision: '2' } }, WALLET)).status, 409)
 	assert.equal(requests.length, 0)
-	response = await send('/chain/snapshot', { target, includeWallet: true }, WALLET)
+	const cookie = `smol_token=${await createAuthToken(WALLET, SECRET)}`
+	response = await send('/chain/snapshot', { target, includeWallet: true }, undefined, { Cookie: cookie })
 	assert.equal(response.status, 200)
 	const payload = await response.text()
 	assert.equal(payload.includes(PRIVATE), false)
@@ -224,8 +228,8 @@ test('chain snapshot checks live mixtape visibility, hides private members and r
 	const insertMix = db.prepare('INSERT INTO Mixtapes (Id, Title, Desc, Smols, Address, Created_At) VALUES (?, ?, ?, ?, ?, ?)')
 	insertMix.run('live-public', 'Public', '', `${TRACK},${SECOND},${PRIVATE}`, OTHER, '2026-01-01')
 	insertMix.run('stale-public', 'Public', '', `${TRACK},${SECOND},${PRIVATE}`, OTHER, '2026-01-02')
-	assert.equal((await send('/chain/snapshot', { target: { mixtapeId: 'live-public' } })).status, 200)
-	assert.equal((await send('/chain/snapshot', { target: { mixtapeId: 'stale-public' } })).status, 404)
+	assert.equal((await send('/chain/snapshot', { target: { mixtapeId: 'live-public' } }, WALLET)).status, 200)
+	assert.equal((await send('/chain/snapshot', { target: { mixtapeId: 'stale-public' } }, WALLET)).status, 404)
 
 	const ids = Array.from({ length: 100 }, (_, i) => createHash('sha256').update(String(i)).digest('hex'))
 	for (const id of ids) track(id)
@@ -239,7 +243,17 @@ test('chain snapshot checks live mixtape visibility, hides private members and r
 	assert.equal(body.coherent, true)
 	assert.equal(body.oldestObservationLedger, LEDGER)
 	assert.equal(body.tracks.length, 100)
-	assert.equal((await send('/chain/snapshot', { target: { trackIds: [...ids, TRACK] } })).status, 400)
+	assert.equal((await send('/chain/snapshot', { target: { trackIds: [...ids, TRACK] } }, WALLET)).status, 400)
+
+	const privateSlots = Array.from({ length: 100 }, (_, i) => `private-slot-${i}`)
+	for (const id of privateSlots) track(id, { public: 0 })
+	insertMix.run('oversized', 'Another public mix', '', `${TRACK},${ids[0]},${privateSlots.join(',')}`, OTHER, '2026-01-03')
+	const oversized = await send('/chain/snapshot', { target: { mixtapeId: 'oversized' } }, WALLET)
+	assert.equal(oversized.status, 200)
+	const visible = await oversized.json() as any
+	assert.equal(visible.incompleteMembership, true)
+	assert.deepEqual(visible.tracks.map(({ id }: { id: string }) => id), [TRACK, ids[0]])
+	assert.equal((await send('/chain/snapshot', { target: { mixtapeId: 'oversized' } }, OTHER)).status, 400)
 	db.close()
 })
 
@@ -285,6 +299,69 @@ test('mint status routes before /:id, scopes batches to the submitter and polls 
 	const workflowOnly = await send('/mint/status', { workflowIds: ['our-batch'] }, WALLET)
 	assert.equal(workflowOnly.status, 200)
 	assert.deepEqual((await workflowOnly.json() as any).tracks, tracks)
+	db.close()
+})
+
+test('mint status separates legacy replay, missing creation, and confirmed persistence errors', async () => {
+	const { env, db, send, track } = harness()
+	track(TRACK)
+	track(SECOND)
+	const txHash = 'b'.repeat(64)
+	const source = Keypair.fromRawEd25519Seed(Buffer.alloc(32, 10)).publicKey()
+	const signedXdr = new TransactionBuilder(new Account(source, '1'),
+		{ fee: '100', networkPassphrase: Networks.PUBLIC })
+		.addOperation(Operation.bumpSequence({ bumpTo: '4' })).setTimeout(30).build().toXDR()
+	let lastId = ''
+	let create: (id: string) => void = () => { throw new Error('instance.already_exists') }
+	let lookup: () => InstanceStatus = () => ({ status: 'errored' })
+	env.TX_WORKFLOW = {
+		create: async ({ id }: WorkflowInstanceCreateOptions) => {
+			lastId = id!
+			create(lastId)
+			return { id }
+		},
+		get: async () => ({ status: async () => lookup() }),
+	} as Env['TX_WORKFLOW']
+	const poll = async (workflowId: string) => {
+		const response = await send('/mint/status', { workflowIds: [workflowId] }, WALLET)
+		assert.equal(response.status, 200)
+		return (await response.json() as any).batches[0]
+	}
+
+	const replay = await send('/mint', { ids: [TRACK], xdr: signedXdr }, WALLET)
+	assert.equal(replay.status, 202)
+	const { workflowId: legacyId } = await replay.json() as { workflowId: string }
+	assert.equal((await poll(legacyId)).phase, 'uncertain')
+	lookup = () => { throw new Error('instance.not_found') }
+	assert.equal((await poll(legacyId)).phase, 'uncertain', 'A known legacy workflow may have already submitted')
+
+	create = () => { throw new Error('Duplicate upstream proxy header') }
+	const single = () => send(`/mint/${SECOND}`, { xdr: signedXdr }, WALLET)
+	assert.equal((await single()).status, 503)
+	const newId = lastId
+	lookup = () => { throw new Error('HTTP 404 Not Found') }
+	assert.equal((await poll(newId)).phase, 'uncertain', 'A proxy error does not establish instance absence')
+	lookup = () => { throw Object.assign(new Error('Missing instance'), { code: 'instance.not_found' }) }
+	assert.equal((await poll(newId)).phase, 'failed')
+
+	create = () => {}
+	lookup = () => ({ status: 'queued' })
+	const retry = await single()
+	assert.equal(retry.status, 202)
+	assert.deepEqual(await retry.json(), { workflowId: newId })
+	assert.equal((await poll(newId)).phase, 'queued')
+	lookup = () => ({ status: 'errored' })
+	assert.equal((await poll(newId)).phase, 'failed', 'A new queued workflow has yet to submit')
+
+	// A fast execution can confirm before the submission route updates its D1 row.
+	create = (id) => {
+		db.prepare("UPDATE MintBatchStatus SET Phase = 'confirmed', Tx_Hash = ?, Confirmed_Ledger = ? WHERE Workflow_Id = ?")
+			.run(txHash, LEDGER, id)
+	}
+	assert.equal((await single()).status, 202)
+	assert.deepEqual(await poll(newId), {
+		workflowId: newId, phase: 'confirmed', ids: [SECOND], txHash, confirmedLedger: LEDGER,
+	})
 	db.close()
 })
 
@@ -410,7 +487,7 @@ test('a mainnet mint signs with a gateway tip, confirms the relay hash and purge
 	}
 })
 
-test('smart account login batches 201 signer rules on the mainnet binding and keeps testnet on its RPC URL', async () => {
+test('mainnet login accepts archived signers for both protocols and testnet retains sequential RPC reads', async () => {
 	const { env, db, send } = harness()
 	const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' })
 	const publicJwk = publicKey.export({ format: 'jwk' })
@@ -435,10 +512,17 @@ test('smart account login batches 201 signer rules on the mainnet binding and ke
 		},
 	}
 	const ids = contractDataKey(WALLET, storageKey('Ids', storageKey('Default')))
-	const lastRule = contractDataKey(WALLET, storageKey('Signers', xdr.ScVal.scvU32(200)))
+	const rule = (id: number) => contractDataKey(WALLET, storageKey('Signers', xdr.ScVal.scvU32(id)))
+	const externalSigner = xdr.ScVal.scvVec([storageKey('External', addr(OTHER), xdr.ScVal.scvBytes(Buffer.concat([rawKey, credentialId])))])
+	const legacy = contractDataKey(WALLET, storageKey('Secp256r1', xdr.ScVal.scvBytes(credentialId)))
 	const entries = [
 		entry(ids, xdr.ScVal.scvVec(Array.from({ length: 201 }, (_, n) => xdr.ScVal.scvU32(n)))),
-		entry(lastRule, xdr.ScVal.scvVec([storageKey('External', addr(OTHER), xdr.ScVal.scvBytes(Buffer.concat([rawKey, credentialId])))])),
+		entry(rule(200), externalSigner),
+		entry(legacy, xdr.ScVal.scvVec([xdr.ScVal.scvVoid(), xdr.ScVal.scvBytes(rawKey)])),
+	]
+	const testnetEntries = [
+		entry(ids, xdr.ScVal.scvVec([xdr.ScVal.scvU32(0), xdr.ScVal.scvU32(1), xdr.ScVal.scvU32(2)])),
+		entry(rule(1), externalSigner),
 	]
 	const mainnet: Array<[number, number | undefined]> = []
 	env.KALE_WORKER = { readEntries: async ({ keys, minLedger }) => {
@@ -455,7 +539,7 @@ test('smart account login batches 201 signer rules on the mainnet binding and ke
 		assert.equal(body.method, 'getLedgerEntries')
 		testnet.push(body.params.keys.length)
 		return Response.json({ jsonrpc: '2.0', id: body.id, result: {
-			latestLedger: LEDGER, entries: entries.filter(({ key }) => body.params.keys.includes(key)),
+			latestLedger: LEDGER, entries: testnetEntries.filter(({ key }) => body.params.keys.includes(key)),
 		} })
 	}) as typeof fetch
 	try {
@@ -464,12 +548,14 @@ test('smart account login batches 201 signer rules on the mainnet binding and ke
 		assert.deepEqual(mainnet, [[1, undefined], [200, LEDGER], [1, LEDGER]])
 		assert.equal(testnet.length, 0)
 
-		entries[1].liveUntilLedgerSeq = 0
-		assert.equal((await send('/login', authBody, undefined, { Origin: origin })).status, 400)
-		entries[1].liveUntilLedgerSeq = LEDGER + 500
+		for (const ttl of [0, LEDGER - 1]) {
+			for (const signer of entries) signer.liveUntilLedgerSeq = ttl
+			assert.equal((await send('/login', authBody, undefined, { Origin: origin })).status, 200)
+			assert.equal((await send('/login', { ...authBody, protocol: 'passkey-kit' }, undefined, { Origin: origin })).status, 200)
+		}
 		mainnet.length = 0
 		assert.equal((await send('/login', { ...authBody, network: 'testnet' }, undefined, { Origin: origin })).status, 200)
-		assert.deepEqual(testnet, [1, 200, 1])
+		assert.deepEqual(testnet, [1, 1, 1])
 		assert.equal(mainnet.length, 0)
 	} finally {
 		globalThis.fetch = fetchBefore
@@ -578,7 +664,7 @@ test('0003 rehearses on populated pre-0001 SQLite and keeps indexed probes and m
 	db.exec("UPDATE Mixtapes SET Smols = 'track-4, track-1' WHERE Id = 'existing'")
 	assert.equal(db.prepare("SELECT smol_id FROM MixtapeMember WHERE mix_id = 'existing' ORDER BY pos LIMIT 1").get()?.smol_id, 'track-4')
 	assert.equal(db.prepare("SELECT count(*) AS n FROM MixtapeMember WHERE smol_id = 'track-2'").get()?.n, 0)
-	// D1 tracks the one-time ALTER. Replay the idempotent statements after checking Tags exists.
+	// The live precheck guards the ALTER. Rehearse replay of the remaining statements once Tags exists.
 	assert.ok(db.prepare("SELECT 1 FROM pragma_table_info('Smols') WHERE name = 'Tags'").get())
 	db.exec(sql.replace('ALTER TABLE Smols ADD COLUMN Tags TEXT DEFAULT NULL;', ''))
 

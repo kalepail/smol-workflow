@@ -455,7 +455,7 @@ test('Gate 3c: POST /mint/:id and POST /mint deduplicate identical submissions a
 		})
 	).toXDR('base64')
 
-	// Duplicate single mint requests both return 202 empty body, but only 1 workflow is created
+	// Duplicate single mint requests return the same workflow ID and create one instance
 	const s1 = await appModule.app.fetch(
 		new Request(`https://api.smol.xyz/mint/${SINGLE_ID}`, {
 			method: 'POST',
@@ -476,6 +476,9 @@ test('Gate 3c: POST /mint/:id and POST /mint deduplicate identical submissions a
 	)
 	assert.equal(s1.status, 202)
 	assert.equal(s2.status, 202)
+	const single = await s1.json() as { workflowId: string }
+	assert.match(single.workflowId, /^mint-[0-9a-f]{48}$/)
+	assert.deepEqual(await s2.json(), single)
 	assert.equal(harness.txWorkflowCreates.length, 1, 'Duplicate identical mint request must deduplicate')
 
 	// Batch mint skips already-minted m2, returns 202 JSON, and deduplicates repeat calls

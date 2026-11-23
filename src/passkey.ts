@@ -143,12 +143,13 @@ type SignerReader = (keys: xdr.LedgerKey[], minLedger?: number) => Promise<{
 }>;
 
 function getSignerReader(rpcUrl: string, binding?: MainnetChainReads): SignerReader {
-    if (typeof binding?.readEntries === 'function') {
+    if (binding) {
         return async (ledgerKeys, minLedger) => {
             const keys = ledgerKeys.map((key) => key.toXDR('base64'));
             const { ledger, values } = decodeLedgerPage(await binding.readEntries({ keys, minLedger }), keys, minLedger);
+            // A stored signer key still verifies assertions after its storage TTL expires.
             return { ledger, values: new Map([...values].flatMap(([key, entry]) =>
-                entry.state === 'present' && entry.life !== 'archived' ? [[key, entry.value] as const] : [],
+                entry.state === 'present' ? [[key, entry.value] as const] : [],
             )) };
         };
     }
@@ -172,7 +173,7 @@ async function getPublicKeyFromPasskeyKit(read: SignerReader, contractId: string
 
 /** Read Default context-rule IDs, then read their Signers vectors in bounded pages. */
 async function getPublicKeyFromSmartAccountKit(
-    read: SignerReader, contractId: string, keyId: string,
+    read: SignerReader, contractId: string, keyId: string, batchRules: boolean,
 ): Promise<Buffer> {
     const credential = base64url.toBuffer(keyId);
     const idsKey = contractDataKey(contractId, storageKey('Ids', storageKey('Default')));
@@ -182,21 +183,23 @@ async function getPublicKeyFromSmartAccountKit(
 
     const ruleIds = [...new Set(ids.map((id) => id.u32()))];
     const keys = ruleIds.map((id) => contractDataKey(contractId, storageKey('Signers', xdr.ScVal.scvU32(id))));
-    const pages = [];
-    for (let i = 0; i < keys.length; i += LEDGER_KEY_LIMIT) {
-        pages.push(read(keys.slice(i, i + LEDGER_KEY_LIMIT), ledger));
-    }
-    const signerValues = new Map((await Promise.all(pages)).flatMap((page) => [...page.values]));
+    const pageSize = batchRules ? LEDGER_KEY_LIMIT : 1;
+    const pages: xdr.LedgerKey[][] = [];
+    for (let i = 0; i < keys.length; i += pageSize) pages.push(keys.slice(i, i + pageSize));
+    const observations = batchRules ? await Promise.all(pages.map((page) => read(page, ledger))) : [];
 
-    for (const key of keys) {
-        const signers = signerValues.get(key.toXDR('base64'))?.vec() ?? [];
-        for (const signer of signers) {
-            const fields = signer.vec();
-            if (!fields || fields.length < 3 || fields[0].sym().toString() !== 'External') continue;
-            const keyData = Buffer.from(fields[2].bytes());
-            if (keyData.length > SECP256R1_PUBLIC_KEY_SIZE
-                && keyData.subarray(SECP256R1_PUBLIC_KEY_SIZE).equals(credential)) {
-                return keyData.subarray(0, SECP256R1_PUBLIC_KEY_SIZE);
+    for (const [index, page] of pages.entries()) {
+        const { values: signersByKey } = observations[index] ?? await read(page);
+        for (const key of page) {
+            const signers = signersByKey.get(key.toXDR('base64'))?.vec() ?? [];
+            for (const signer of signers) {
+                const fields = signer.vec();
+                if (!fields || fields.length < 3 || fields[0].sym().toString() !== 'External') continue;
+                const keyData = Buffer.from(fields[2].bytes());
+                if (keyData.length > SECP256R1_PUBLIC_KEY_SIZE
+                    && keyData.subarray(SECP256R1_PUBLIC_KEY_SIZE).equals(credential)) {
+                    return keyData.subarray(0, SECP256R1_PUBLIC_KEY_SIZE);
+                }
             }
         }
     }
@@ -215,11 +218,12 @@ export async function verifyAuthentication(
     const { expectedOrigin, expectedRPID } = resolvePasskeyVerificationTarget(host);
 
     try {
-        const read = getSignerReader(rpcUrl, binding);
+        const gateway = typeof binding?.readEntries === 'function' ? binding : undefined;
+        const read = getSignerReader(rpcUrl, gateway);
 
         // Get raw public key based on protocol
         const rawpk = protocol === 'smart-account-kit'
-            ? await getPublicKeyFromSmartAccountKit(read, contractId, keyId)
+            ? await getPublicKeyFromSmartAccountKit(read, contractId, keyId, Boolean(gateway))
             : await getPublicKeyFromPasskeyKit(read, contractId, keyId);
 
         // Build COSE key from raw public key

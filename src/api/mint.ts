@@ -5,6 +5,7 @@ import type { HonoEnv } from '../types'
 import { parseAuth } from '../middleware/auth'
 import { deriveMintPair, isLedgerSequence } from '../utils/chain'
 import { parseIdList, parseTrackTarget, readChainTarget, type MintBatchRow } from '../utils/chain-target'
+import { isWorkflowAlreadyExistsError, isWorkflowNotFoundError } from '../utils/workflow-errors'
 import { privateNoStore, readJsonBody } from './mixtapes'
 
 const mint = new Hono<HonoEnv>()
@@ -67,11 +68,6 @@ async function computeMintWorkflowId(prefix: string, parts: string[]): Promise<s
 	return `${prefix}-${hex.slice(0, 48)}`
 }
 
-function isDuplicateWorkflowError(error: unknown): boolean {
-	const msg = error instanceof Error ? error.message : String(error)
-	return /already\s*exists|duplicate|instance.*exists/i.test(msg)
-}
-
 async function createDedupedTxWorkflow(
 	env: Env,
 	id: string,
@@ -86,13 +82,23 @@ async function createDedupedTxWorkflow(
 	`).bind(id, params.sub, JSON.stringify(ids)).first()
 	if (!claim) throw new HTTPException(409, { message: 'Mint workflow already exists' })
 
+	let phase: 'queued' | 'existing' = 'queued'
 	try {
 		await env.TX_WORKFLOW.create({ id, params: { ...params, trackStatus: true } })
-	} catch (err) {
-		if (!isDuplicateWorkflowError(err)) {
+	} catch (error) {
+		if (!isWorkflowAlreadyExistsError(error)) {
 			throw new HTTPException(503, { message: 'Mint workflow creation unavailable' })
 		}
+		// The duplicate can predate status checkpoints. Its submission history is unknown.
+		phase = 'existing'
 	}
+
+	// A fast workflow or another accepted request may already have advanced the phase.
+	await env.SMOL_D1.prepare(`
+		UPDATE MintBatchStatus SET Phase = ?1
+		WHERE Workflow_Id = ?2 AND "Address" = ?3
+			AND (Phase = 'unverified' OR (Phase = 'existing' AND ?1 = 'queued'))
+	`).bind(phase, id, params.sub).run()
 }
 
 mint.post('/', parseAuth, async (c) => {
@@ -186,7 +192,7 @@ mint.post('/', parseAuth, async (c) => {
 async function batchProgress(env: Env, batch: MintBatchRow) {
 	const { phase, txHash, confirmedLedger } = batch
 	const progress = {
-		phase: phase === 'submitting' ? 'queued' : phase,
+		phase: phase === 'submitting' || phase === 'unverified' || phase === 'existing' ? 'queued' : phase,
 		...(txHash ? { txHash } : {}),
 		...(confirmedLedger ? { confirmedLedger } : {}),
 	}
@@ -200,11 +206,17 @@ async function batchProgress(env: Env, batch: MintBatchRow) {
 			const ledger = 'ledger' in output && isLedgerSequence(output.ledger) ? output.ledger : confirmedLedger
 			return { phase: 'persisted', txHash: output.hash, ...(ledger ? { confirmedLedger: ledger } : {}) }
 		}
+		// A confirmed receipt remains authoritative if metadata persistence errors.
+		if (phase === 'confirmed') return progress
 		if (status === 'errored' || status === 'terminated') {
 			return { ...progress, phase: phase === 'queued' ? 'failed' : 'uncertain' }
 		}
 		if (status === 'unknown' || status === 'complete') return { ...progress, phase: 'uncertain' }
-	} catch {
+	} catch (error) {
+		if (phase === 'unverified' || phase === 'existing') {
+			const missing = phase === 'unverified' && isWorkflowNotFoundError(error)
+			return { ...progress, phase: missing ? 'failed' : 'uncertain' }
+		}
 		// A transient Workflow lookup failure leaves the durable D1 checkpoint usable.
 	}
 	return progress
@@ -283,7 +295,7 @@ mint.post('/:id', parseAuth, async (c) => {
 		ownerSub: smolRecord.Address,
 	})
 
-	return c.body(null, 202)
+	return c.json({ workflowId }, 202)
 })
 
 export default mint
