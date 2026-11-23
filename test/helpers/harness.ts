@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import Module from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { sign } from 'hono/jwt'
 
 type ResolveFilename = (request: string, ...rest: unknown[]) => string
@@ -406,13 +407,24 @@ export function createMockDoNamespace(r2Bucket?: ReturnType<typeof createMockR2B
 				if (retrySeedPending && !hasExecutionArtifacts) {
 					const seededPayload = storage.get('payload') as WorkflowParams | undefined
 					const seededOverride = storage.get('retry_override_provider') as MusicProvider | undefined
+					const quotaNeedsReservation = storage.get('quota_needs_reservation')
+					const quotaProvider = storage.get('quota_provider') as MusicProvider | undefined
+					const quotaReservationId = storage.get('quota_reservation_id')
+					const quotaDayKey = storage.get('quota_day_key')
 					return {
 						state: 'seeded_unstarted',
 						retrySourceId: typeof storage.get('retry_source_id') === 'string'
 							? storage.get('retry_source_id') as string
 							: undefined,
+						ownerAddress: typeof seededPayload?.address === 'string'
+							? seededPayload.address
+							: undefined,
 						provider: seededPayload?.provider,
 						overrideProvider: seededOverride,
+						...(typeof quotaNeedsReservation === 'boolean' ? { quotaNeedsReservation } : {}),
+						...(quotaProvider ? { quotaProvider } : {}),
+						...(typeof quotaReservationId === 'string' ? { quotaReservationId } : {}),
+						...(typeof quotaDayKey === 'string' ? { quotaDayKey } : {}),
 						...(existingAttempt ? { existingAttempt: structuredClone(existingAttempt) } : {}),
 					}
 				}
@@ -534,6 +546,176 @@ export function createMockDoNamespace(r2Bucket?: ReturnType<typeof createMockR2B
 	}
 
 	return { namespace, instances, flushedIds, getStorage }
+}
+
+export function createSqliteBackedStorage(db: DatabaseSync) {
+	let inTransaction = false
+	let scheduledAlarm: number | null = null
+
+	const sql = {
+		exec<T extends Record<string, SqlStorageValue>>(query: string, ...bindings: unknown[]) {
+			const stmt = db.prepare(query)
+			const trimmed = query.trim().toUpperCase()
+			const isRead = trimmed.startsWith('SELECT') || trimmed.startsWith('WITH') || trimmed.startsWith('PRAGMA')
+			const rows: T[] = isRead
+				? (stmt.all(...(bindings as never[])) as T[])
+				: (stmt.run(...(bindings as never[])), [])
+			let idx = 0
+
+			const cursor = {
+				next() {
+					if (idx < rows.length) {
+						return { done: false as const, value: rows[idx++] }
+					}
+					return { done: true as const, value: undefined }
+				},
+				toArray() {
+					const rest = rows.slice(idx)
+					idx = rows.length
+					return rest
+				},
+				one() {
+					if (rows.length !== 1) {
+						throw new Error(`Expected exactly 1 row, got ${rows.length}`)
+					}
+					idx = rows.length
+					return rows[0]
+				},
+				raw() {
+					return (function* () {
+						while (idx < rows.length) {
+							yield Object.values(rows[idx++])
+						}
+					})()
+				},
+				columnNames: rows[0] ? Object.keys(rows[0]) : [],
+				get rowsRead() {
+					return rows.length
+				},
+				get rowsWritten() {
+					return isRead ? 0 : 1
+				},
+				[Symbol.iterator]() {
+					return {
+						next: () => cursor.next(),
+					}
+				},
+			}
+
+			return cursor as unknown as SqlStorageCursor<T>
+		},
+		get databaseSize() {
+			return 0
+		},
+	} as unknown as SqlStorage
+
+	const storage = {
+		sql,
+		async getAlarm() {
+			return scheduledAlarm
+		},
+		async setAlarm(scheduledTime: number | Date) {
+			scheduledAlarm = scheduledTime instanceof Date ? scheduledTime.getTime() : scheduledTime
+		},
+		async deleteAlarm() {
+			scheduledAlarm = null
+		},
+		transactionSync<T>(closure: () => T): T {
+			if (inTransaction) {
+				return closure()
+			}
+			inTransaction = true
+			db.exec('BEGIN IMMEDIATE')
+			try {
+				const result = closure()
+				db.exec('COMMIT')
+				return result
+			} catch (err) {
+				db.exec('ROLLBACK')
+				throw err
+			} finally {
+				inTransaction = false
+			}
+		},
+	} as unknown as DurableObjectStorage
+
+	return {
+		storage,
+		getScheduledAlarm: () => scheduledAlarm,
+		clearAlarm: () => {
+			scheduledAlarm = null
+		},
+	}
+}
+
+/**
+ * Creates a real SQLite-backed Durable Object namespace (`node:sqlite` in-memory DB per named DO instance)
+ * that instantiates the real `UserQuotaDO` class and executes its exact SQL schema, migrations, transactions, and alarms.
+ */
+export function createMockUserQuotaNamespace<T extends object>(
+	QuotaDoClass: new (ctx: DurableObjectState, env: Env) => T,
+	envRef?: Env
+) {
+	const instances = new Map<string, { instance: T; db: DatabaseSync; getScheduledAlarm: () => number | null }>()
+	const runtimeEnv = (envRef ?? {}) as Record<string, unknown>
+
+	function makeMockDoId(name: string) {
+		return {
+			toString: () => name,
+			equals(other: { toString(): string }) {
+				return Boolean(other) && other.toString() === name
+			},
+		}
+	}
+
+	function getOrCreate(name: string): T {
+		const existing = instances.get(name)
+		if (existing) {
+			return existing.instance
+		}
+		const db = new DatabaseSync(':memory:')
+		const backed = createSqliteBackedStorage(db)
+		const state = {
+			id: makeMockDoId(name),
+			storage: backed.storage,
+			blockConcurrencyWhile<R>(fn: () => Promise<R>): Promise<R> {
+				return fn()
+			},
+		} as unknown as DurableObjectState
+		const instance = new QuotaDoClass(state, runtimeEnv as unknown as Env)
+		instances.set(name, { instance, db, getScheduledAlarm: backed.getScheduledAlarm })
+		return instance
+	}
+
+	const namespace = {
+		idFromName(name: string) {
+			return makeMockDoId(name)
+		},
+		idFromString(id: string) {
+			return makeMockDoId(id)
+		},
+		get(id: { toString: () => string }) {
+			return getOrCreate(id.toString())
+		},
+	} as unknown as DurableObjectNamespace<import('../../src/quota-do').UserQuotaDO>
+
+	if (!runtimeEnv.USER_QUOTA) {
+		runtimeEnv.USER_QUOTA = namespace
+	}
+
+	return {
+		namespace,
+		instances,
+		getInstance(name: string) {
+			return instances.get(name)?.instance
+		},
+		getAlarm(name: string) {
+			return instances.get(name)?.getScheduledAlarm() ?? null
+		},
+		getNames() {
+			return [...instances.keys()]
+		},
+	}
 }
 
 export async function createAuthToken(sub: string, secret: string, usr = 'tester') {

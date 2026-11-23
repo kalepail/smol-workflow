@@ -3,6 +3,7 @@ import { HTTPException } from 'hono/http-exception'
 import { Jimp, ResizeStrategy } from 'jimp'
 import type { HonoEnv } from '../types'
 import { parseByteRange, type ParsedByteRange } from '../utils'
+import { getPlayCountMode } from './plays'
 
 const media = new Hono<HonoEnv>()
 export const MEDIA_CACHE_CONTROL = 'public, max-age=2592000, stale-while-revalidate=86400'
@@ -333,7 +334,7 @@ media.get('/:id{.+\\.mp3}', async (c) => {
 							headers.set('Content-Range', `bytes ${parsed.offset}-${parsed.end}/${size}`)
 							headers.set('Content-Length', String(parsed.length))
 
-							if (shouldIncrementSongPlays(req.method, originalParsedRange, size)) {
+							if (getPlayCountMode(env) === 'server' && shouldIncrementSongPlays(req.method, originalParsedRange, size)) {
 								recordSongPlay(c, musicId)
 							}
 
@@ -345,7 +346,7 @@ media.get('/:id{.+\\.mp3}', async (c) => {
 
 				headers.set('Content-Length', String(size))
 				// Use originalParsedRange so e.g. stale If-Range on bytes=0-1 probe still counts 0 plays!
-				if (shouldIncrementSongPlays(req.method, originalParsedRange, size)) {
+				if (getPlayCountMode(env) === 'server' && shouldIncrementSongPlays(req.method, originalParsedRange, size)) {
 					recordSongPlay(c, musicId)
 				}
 
@@ -397,7 +398,7 @@ media.get('/:id{.+\\.mp3}', async (c) => {
 			headers.set('Content-Range', `bytes ${resolved.offset}-${resolved.end}/${size}`)
 			headers.set('Content-Length', String(resolved.length))
 
-			if (shouldIncrementSongPlays(req.method, originalParsedRange, size)) {
+			if (getPlayCountMode(env) === 'server' && shouldIncrementSongPlays(req.method, originalParsedRange, size)) {
 				recordSongPlay(c, musicId)
 			}
 
@@ -433,7 +434,7 @@ media.get('/:id{.+\\.mp3}', async (c) => {
 	}
 
 	// Preserve originalParsedRange so stale If-Range on a bytes=0-1 probe counts 0 plays!
-	if (shouldIncrementSongPlays(req.method, originalParsedRange, object.size)) {
+	if (getPlayCountMode(env) === 'server' && shouldIncrementSongPlays(req.method, originalParsedRange, object.size)) {
 		recordSongPlay(c, musicId)
 	}
 

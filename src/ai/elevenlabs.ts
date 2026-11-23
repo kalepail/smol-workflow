@@ -465,7 +465,21 @@ export async function generateElevenLabsSong(params: {
 	const musicLengthMs = resolveElevenLabsMusicLengthMs(env);
 
 	// 1. Check R2 first: if this generation instance already committed audio, reuse without paying again.
-	const existing = await env.SMOL_BUCKET.head(r2Key);
+	// Any R2 lookup failure happens strictly BEFORE ElevenLabs dispatch, so classify as rejected/retryable
+	// rather than letting callers treat it as an ambiguous paid dispatch.
+	let existing: R2Object | null = null;
+	if (typeof env.SMOL_BUCKET.head === 'function') {
+		try {
+			existing = await env.SMOL_BUCKET.head(r2Key);
+		} catch (err) {
+			throw new ElevenLabsProviderError({
+				message: `R2 pre-dispatch lookup failed for ${r2Key}: ${err instanceof Error ? err.message : String(err)}`,
+				code: 'provider_unavailable',
+				retryable: true,
+				outcome: 'rejected',
+			});
+		}
+	}
 	if (existing && existing.size > 0 && (!existing.customMetadata?.smolId || existing.customMetadata.smolId === smolId)) {
 		return {
 			song: {

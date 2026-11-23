@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { SmolDurableObject, SmolState } from './do'
+import { UserQuotaDO } from './quota-do'
 import { Workflow } from './workflow'
 import { TxWorkflow } from './tx-workflow'
 import type { HonoEnv } from './types'
@@ -15,6 +16,8 @@ import mint from './api/mint'
 import media from './api/media'
 import search from './api/search'
 import artists from './api/artists'
+import quota from './api/quota'
+import plays from './api/plays'
 import { processSearchQueue, processSearchDLQ, runSearchBackfillCron } from './utils/search'
 
 export const app = new Hono<HonoEnv>()
@@ -51,7 +54,7 @@ app.use(
 	cors({
 		origin: (origin) => allowedCorsOrigin(origin),
 		credentials: true,
-		exposeHeaders: ['Content-Range', 'Accept-Ranges', 'Content-Length', 'ETag'],
+		exposeHeaders: ['Content-Range', 'Accept-Ranges', 'Content-Length', 'ETag', 'Retry-After'],
 	})
 )
 
@@ -70,6 +73,8 @@ app.route('/song', media)
 app.route('/image', media)
 app.route('/search', search)
 app.route('/artists', artists)
+app.route('/quota', quota)
+app.route('/plays', plays)
 app.route('/', smols)
 
 // 404 handler
@@ -91,4 +96,4 @@ const handler = {
 	},
 } satisfies ExportedHandler<Env>
 
-export { Workflow, TxWorkflow, SmolDurableObject, SmolState, handler as default }
+export { Workflow, TxWorkflow, SmolDurableObject, SmolState, UserQuotaDO, handler as default }

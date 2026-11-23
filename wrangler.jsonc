@@ -70,6 +70,10 @@
             {
                 "name": "DO_STATE",
                 "class_name": "SmolState"
+            },
+            {
+                "name": "USER_QUOTA",
+                "class_name": "UserQuotaDO"
             }
         ]
     },
@@ -112,6 +116,12 @@
         "ELEVENLABS_MUSIC_LENGTH_MS": "120000",
         "ELEVENLABS_OUTPUT_FORMAT": "mp3_44100_128",
         "ELEVENLABS_FALLBACK_ENABLED": "true",
+        "DAILY_LIMIT_CLASSIC": "10",
+        "DAILY_LIMIT_ELEVENLABS": "3",
+        "BURST_LIMIT_PER_MINUTE": "5",
+        "GLOBAL_DAILY_LIMIT_CLASSIC": "500",
+        "GLOBAL_DAILY_LIMIT_ELEVENLABS": "50",
+        "PLAY_COUNT_MODE": "server",
         "SEARCH_BACKFILL_CRON_ENABLED": "true",
         "SEARCH_BACKFILL_CRON_PAGE_LIMIT": "20",
         "SEARCH_BACKFILL_CRON_STALL_RUNS": "6",
@@ -152,6 +162,12 @@
             "tag": "v2",
             "new_classes": [
                 "SmolState"
+            ]
+        },
+        {
+            "tag": "v3",
+            "new_sqlite_classes": [
+                "UserQuotaDO"
             ]
         }
     ],

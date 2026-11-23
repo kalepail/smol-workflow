@@ -10,6 +10,7 @@ import { artistSmolsCacheTag } from './utils/cache-tags';
 import { generateOrReuseSongs, isValidMusicProvider, normalizeMusicProvider } from './utils/songs';
 import { isDurableObjectId } from './utils/durable-object-id';
 import { createHiddenSearchState, createQueuedSearchState, queueSearchIndexingById } from './utils/search';
+import { refundGenerationQuota } from './utils/quota';
 
 /**
  * Smol Generation Workflow
@@ -66,6 +67,9 @@ export function toRetrySnapshot(restored: WorkflowSteps | null | undefined, retr
 		generation_meta: restored.generation_meta,
 		provider_attempt: restored.provider_attempt,
 		original_fingerprints: restored.original_fingerprints,
+		quota_reservation_id: restored.quota_reservation_id,
+		quota_day_key: restored.quota_day_key,
+		quota_provider: restored.quota_provider,
 	})) as WorkflowSteps;
 
 	if (new TextEncoder().encode(JSON.stringify(snapshot)).byteLength > MAX_RETRY_SNAPSHOT_BYTES) {
@@ -234,6 +238,15 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 			instrumental: is_instrumental = false,
 		} = payload;
 		const requested_provider = normalizeMusicProvider(payload.provider);
+		const quota_reservation_id = initialPayload.quota_reservation_id ?? retry_steps?.quota_reservation_id;
+		const quota_day_key = initialPayload.quota_day_key ?? retry_steps?.quota_day_key;
+		const quota_provider = initialPayload.quota_provider ?? retry_steps?.quota_provider;
+		const quota_reuse_only = initialPayload.quota_reuse_only === true;
+		const ownsFreshReservation = Boolean(
+			quota_reservation_id
+			&& quota_reservation_id === event.instanceId
+			&& !quota_reuse_only
+		);
 
 		if (!address) {
 			throw new NonRetryableError('Missing address: unable to start workflow without user authentication');
@@ -262,75 +275,106 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 
 		await step.do('save payload', config, async () => {
 			await stub.saveStep('payload', persistedPayload);
-		});
-
-		// =====================================================================
-		// STEP 2: Generate image (or reuse from retry)
-		// =====================================================================
-		const image_base64 = retry_steps?.image_base64 || await step.do(
-			'generate image',
-			{
-				...config,
-				retries: {
-					...config.retries,
-					limit: 6, // ~10 min with exponential backoff
-				},
-			} as WorkflowStepConfig,
-			async () => {
-				return await pixellab(this.env, prompt, 'pixflux');
-			}
-		);
-
-		await step.do('save generated image', config, () => stub.saveStep('image_base64', image_base64));
-
-		// =====================================================================
-		// STEP 3: Describe image (or reuse from retry)
-		// =====================================================================
-		const description = retry_steps?.description || await step.do('describe image', config, async () => {
-			return await imageDescribe(this.env, image_base64, prompt);
-		});
-
-		await step.do('save image description', config, () => stub.saveStep('description', description));
-
-		// =====================================================================
-		// STEP 4: Generate lyrics / title / style (or reuse from retry)
-		// =====================================================================
-		const lyrics = retry_steps?.lyrics || await step.do('generate lyrics', config, async () => {
-			const generated = await generateLyrics(this.env, prompt, description);
-
-			const missingLyrics = !is_instrumental && !generated.lyrics?.trim();
-			if (
-				!generated.title?.trim()
-				|| missingLyrics
-				|| (generated.style?.length ?? 0) < 2
-			) {
-				const missing = [
-					!generated.title?.trim() && 'title',
-					missingLyrics && 'lyrics',
-					(generated.style?.length ?? 0) < 2 && 'style',
-				].filter(Boolean).join(', ');
-				throw new Error(`Lyrics generation incomplete (missing: ${missing}). Try a different prompt.`);
-			}
-
-			return {
-				title: generated.title.trim(),
-				style: generated.style,
-				lyrics: generated.lyrics ?? '',
+			const doStub = stub as unknown as {
+				saveSteps?: (entries: Record<string, unknown>) => Promise<void>;
 			};
+			if ((quota_reservation_id || quota_day_key || quota_provider) && typeof doStub.saveSteps === 'function') {
+				await doStub.saveSteps({
+					...(quota_reservation_id ? { quota_reservation_id } : {}),
+					...(quota_day_key ? { quota_day_key } : {}),
+					...(quota_provider ? { quota_provider } : {}),
+				});
+			}
 		});
 
-		await step.do('save generated lyrics', config, () => stub.saveStep('lyrics', lyrics));
+		let image_base64: string;
+		let description: string;
+		let lyrics: AiSongGeneratorLyrics;
+		let nsfw: NormalizedNsfwResult;
 
-		// =====================================================================
-		// STEP 5: Check NSFW (or reuse from retry), always normalized fail-closed
-		// =====================================================================
-		const nsfw = retry_steps?.nsfw !== undefined
-			? normalizeNsfwResult(retry_steps.nsfw)
-			: await step.do('check nsfw', config, async () => {
-				return await checkNSFW(this.env, prompt, description, JSON.stringify(lyrics.lyrics ?? ''));
+		try {
+			// =====================================================================
+			// STEP 2: Generate image (or reuse from retry)
+			// =====================================================================
+			image_base64 = retry_steps?.image_base64 || await step.do(
+				'generate image',
+				{
+					...config,
+					retries: {
+						...config.retries,
+						limit: 6, // ~10 min with exponential backoff
+					},
+				} as WorkflowStepConfig,
+				async () => {
+					return await pixellab(this.env, prompt, 'pixflux');
+				}
+			);
+
+			await step.do('save generated image', config, () => stub.saveStep('image_base64', image_base64));
+
+			// =====================================================================
+			// STEP 3: Describe image (or reuse from retry)
+			// =====================================================================
+			description = retry_steps?.description || await step.do('describe image', config, async () => {
+				return await imageDescribe(this.env, image_base64, prompt);
 			});
 
-		await step.do('save nsfw check', config, () => stub.saveStep('nsfw', nsfw));
+			await step.do('save image description', config, () => stub.saveStep('description', description));
+
+			// =====================================================================
+			// STEP 4: Generate lyrics / title / style (or reuse from retry)
+			// =====================================================================
+			lyrics = retry_steps?.lyrics || await step.do('generate lyrics', config, async () => {
+				const generated = await generateLyrics(this.env, prompt, description);
+
+				const missingLyrics = !is_instrumental && !generated.lyrics?.trim();
+				if (
+					!generated.title?.trim()
+					|| missingLyrics
+					|| (generated.style?.length ?? 0) < 2
+				) {
+					const missing = [
+						!generated.title?.trim() && 'title',
+						missingLyrics && 'lyrics',
+						(generated.style?.length ?? 0) < 2 && 'style',
+					].filter(Boolean).join(', ');
+					throw new Error(`Lyrics generation incomplete (missing: ${missing}). Try a different prompt.`);
+				}
+
+				return {
+					title: generated.title.trim(),
+					style: generated.style,
+					lyrics: generated.lyrics ?? '',
+				};
+			});
+
+			await step.do('save generated lyrics', config, () => stub.saveStep('lyrics', lyrics));
+
+			// =====================================================================
+			// STEP 5: Check NSFW (or reuse from retry), always normalized fail-closed
+			// =====================================================================
+			nsfw = retry_steps?.nsfw !== undefined
+				? normalizeNsfwResult(retry_steps.nsfw)
+				: await step.do('check nsfw', config, async () => {
+					return await checkNSFW(this.env, prompt, description, JSON.stringify(lyrics.lyrics ?? ''));
+				});
+
+			await step.do('save nsfw check', config, () => stub.saveStep('nsfw', nsfw));
+		} catch (err) {
+			// Refund a fresh reservation ONLY if a pre-music step failed permanently before
+			// any music provider call was dispatched (never on test SuspendSignal or inherited claims).
+			if (ownsFreshReservation && !(err instanceof Error && err.name === 'SuspendSignal')) {
+				await step.do('refund quota on pre-music failure', config, async () => {
+					await refundGenerationQuota(this.env, {
+						address,
+						reservationId: quota_reservation_id!,
+						dayKey: quota_day_key,
+						reason: 'pre_music_step_failed',
+					});
+				}).catch(() => {});
+			}
+			throw err;
+		}
 
 		// =====================================================================
 		// STEP 6: Generate or reuse songs (AISG v6 2-track / ElevenLabs 1-track)
@@ -341,6 +385,11 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 			step,
 			config,
 			smolId: event.instanceId,
+			address,
+			quotaReservationId: quota_reservation_id,
+			quotaDayKey: quota_day_key,
+			quotaProvider: quota_provider,
+			quotaReuseOnly: quota_reuse_only,
 			retry_id,
 			retry_steps,
 			prompt,

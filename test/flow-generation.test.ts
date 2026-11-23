@@ -5,6 +5,7 @@ import {
 	createMockDoNamespace,
 	createMockExecutionContext,
 	createMockR2Bucket,
+	createMockUserQuotaNamespace,
 	createWorkflowStep,
 	installCloudflareStubs,
 	SuspendSignal,
@@ -43,6 +44,7 @@ function buildMockEnv(options: {
 } = {}) {
 	const r2 = createMockR2Bucket()
 	const doNs = createMockDoNamespace(r2.bucket)
+	const quotaNs = createMockUserQuotaNamespace(appModule.UserQuotaDO)
 	const kv = new Map<string, string>()
 	const d1Smols = new Map<string, Record<string, unknown>>()
 	const d1Playlists: Array<{ Id: string; Title: string }> = []
@@ -150,7 +152,10 @@ function buildMockEnv(options: {
 		ELEVENLABS_MUSIC_LENGTH_MS: '120000',
 		ELEVENLABS_OUTPUT_FORMAT: 'mp3_44100_128',
 		ELEVENLABS_FALLBACK_ENABLED: options.fallbackEnabled ?? 'true',
+		DAILY_LIMIT_CLASSIC: '20',
+		DAILY_LIMIT_ELEVENLABS: '10',
 		DURABLE_OBJECT: doNs.namespace,
+		USER_QUOTA: quotaNs.namespace,
 		SMOL_BUCKET: r2.bucket,
 		SMOL_D1: d1,
 		SMOL_KV: {

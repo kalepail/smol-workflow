@@ -22,6 +22,15 @@ declare namespace Cloudflare {
 		ELEVENLABS_MUSIC_LENGTH_MS?: string
 		ELEVENLABS_OUTPUT_FORMAT?: string
 		ELEVENLABS_FALLBACK_ENABLED?: string
+		DAILY_LIMIT_CLASSIC?: string
+		DAILY_LIMIT_ELEVENLABS?: string
+		BURST_LIMIT_PER_MINUTE?: string
+		GLOBAL_DAILY_LIMIT_CLASSIC?: string
+		GLOBAL_DAILY_LIMIT_ELEVENLABS?: string
+		PLAY_COUNT_MODE?: string
+		PLAY_BEACON_COOLDOWN_SECONDS?: string
+		PLAY_BEACON_RATE_LIMIT_PER_MINUTE?: string
+		USER_QUOTA: DurableObjectNamespace<import('../src/quota-do').UserQuotaDO>
 		SEARCH_BACKFILL_CRON_ENABLED: string
 		SEARCH_BACKFILL_CRON_PAGE_LIMIT: string
 		SEARCH_BACKFILL_CRON_STALL_RUNS: string
@@ -135,8 +144,13 @@ interface RetryReservation {
 interface RetrySuccessorInspection {
 	state: 'empty' | 'seeded_unstarted' | 'executed'
 	retrySourceId?: string
+	ownerAddress?: string
 	provider?: MusicProvider
 	overrideProvider?: MusicProvider
+	quotaNeedsReservation?: boolean
+	quotaProvider?: MusicProvider
+	quotaReservationId?: string
+	quotaDayKey?: string
 	existingAttempt?: ProviderAttemptState
 }
 
@@ -165,6 +179,11 @@ interface WorkflowSteps {
 	retry_source_id?: string
 	retry_seed_pending?: boolean
 	workflow_executed?: boolean
+	quota_reservation_id?: string
+	quota_day_key?: string
+	quota_needs_reservation?: boolean
+	quota_provider?: MusicProvider
+	quota_reuse_only?: boolean
 	streaming_fingerprints?: Record<string, {
 		hash: string
 		byteLength: number
@@ -200,6 +219,10 @@ type WorkflowParams = {
 	playlist?: string
 	provider?: MusicProvider
 	override_provider?: MusicProvider
+	quota_reservation_id?: string
+	quota_day_key?: string
+	quota_provider?: MusicProvider
+	quota_reuse_only?: boolean
 	workflow_version?: number
 }
 

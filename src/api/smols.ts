@@ -19,9 +19,16 @@ import { requireOwnedVisibilityToggle, syncSearchVisibilityAfterToggle } from '.
 import { isNsfwBlocked } from '../ai/nsfw'
 import { isContentPolicyMessage } from '../ai/aisonggenerator'
 import {
+	classifyRetryAdmission,
 	DEFAULT_MUSIC_PROVIDER,
 	isValidMusicProvider,
+	resolveRetryTargetProvider,
 } from '../utils/songs'
+import {
+	buildQuotaExceededResponse,
+	refundGenerationQuota,
+	reserveGenerationQuota,
+} from '../utils/quota'
 
 const smols = new Hono<HonoEnv>()
 // Keep these in sync with smol-fe generation controls and provider payload limits.
@@ -82,6 +89,11 @@ function sanitizeKvDoForDetail(raw: Record<string, any> | null | undefined, fail
 		retry_seed_pending: _retrySeedPending,
 		retry_override_provider: _retryOverrideProvider,
 		workflow_executed: _workflowExecuted,
+		quota_reservation_id: _quotaReservationId,
+		quota_day_key: _quotaDayKey,
+		quota_needs_reservation: _quotaNeedsReservation,
+		quota_provider: _quotaProvider,
+		quota_reuse_only: _quotaReuseOnly,
 		original_fingerprints: _originalFingerprints,
 		last_known_urls: _lastKnownUrls,
 		fingerprint_attempts: _fingerprintAttempts,
@@ -215,20 +227,65 @@ async function getPublishedSmolRow(env: Env, id: string): Promise<SmolD1Record |
 		.first<SmolD1Record>()
 }
 
+/**
+ * Strict matcher for recognized Cloudflare Workflows instance-specific absence errors.
+ * Matches ONLY exact Workflows error codes, error class names, or narrowly anchored binding
+ * formats — NEVER loose substring pairs like "Instance lookup failed: upstream route not found"
+ * or generic HTTP 404/not-found text — so indeterminate errors preserve quota and return 503.
+ */
 export function isWorkflowNotFoundError(error: unknown): boolean {
-	const msg = error instanceof Error ? `${error.name} ${error.message}` : String(error)
-	return /instance\.not_found|not[\s_-]*found|does\s*not\s*exist|unknown\s*instance|\b404\b/i.test(msg)
+	const name = error instanceof Error ? error.name.trim() : ''
+	const message = error instanceof Error ? error.message.trim() : String(error).trim()
+	const code = typeof (error as { code?: unknown })?.code === 'string'
+		? (error as { code: string }).code.trim()
+		: ''
+
+	const normalizedCode = code.toLowerCase()
+	if (normalizedCode === 'instance.not_found' || normalizedCode === 'workflow.instance_not_found') {
+		return true
+	}
+	if (/^(?:Workflow|Instance|WorkflowInstance)NotFound(?:Error)?$/.test(name)) {
+		return true
+	}
+	return (
+		/(?:^|[\s:(])(?:instance\.not_found|workflow\.instance_not_found)(?:$|[\s:),])/i.test(message)
+		|| /^(?:error:\s*)?(?:workflow\s+)?instance\s+(?:not\s+found|does\s+not\s+exist)(?:\s*[:.]|$)/i.test(message)
+		|| /^(?:error:\s*)?(?:workflow\s+)?instance\s+(?:with\s+(?:the\s+)?id\s+["'`]?[A-Za-z0-9_.:-]+["'`]?|["'`][A-Za-z0-9_.:-]+["'`]|(?=[A-Za-z0-9_.:-]*\d)[A-Za-z0-9_.:-]+)\s+(?:not\s+found|does\s+not\s+exist)(?:\s*[:.]|$)/i.test(message)
+		|| /^(?:error:\s*)?unknown\s+(?:workflow\s+)?instance(?:\s+(?:["'`][A-Za-z0-9_.:-]+["'`]|(?=[A-Za-z0-9_.:-]*\d)[A-Za-z0-9_.:-]+))?(?:\s*[:.]|$)/i.test(message)
+	)
 }
 
+/**
+ * Strict matcher for recognized Cloudflare Workflows instance-already-exists errors.
+ * Matches ONLY exact Workflows error codes, error class names, or narrowly anchored binding
+ * formats — NEVER loose substring pairs like "Could not determine whether the instance exists"
+ * — so uncertain create errors always reconcile or return 503 instead of silently returning 200.
+ */
 export function isWorkflowAlreadyExistsError(error: unknown): boolean {
-	const msg = error instanceof Error ? `${error.name} ${error.message}` : String(error)
-	return /instance\.already_exists|already[\s_-]*exists|duplicate|instance.*exists/i.test(msg)
+	const name = error instanceof Error ? error.name.trim() : ''
+	const message = error instanceof Error ? error.message.trim() : String(error).trim()
+	const code = typeof (error as { code?: unknown })?.code === 'string'
+		? (error as { code: string }).code.trim()
+		: ''
+
+	const normalizedCode = code.toLowerCase()
+	if (normalizedCode === 'instance.already_exists' || normalizedCode === 'workflow.instance_already_exists') {
+		return true
+	}
+	if (/^(?:Workflow|Instance|WorkflowInstance)AlreadyExists(?:Error)?$/.test(name)) {
+		return true
+	}
+	return (
+		/(?:^|[\s:(])(?:instance\.already_exists|workflow\.instance_already_exists)(?:$|[\s:),])/i.test(message)
+		|| /^(?:error:\s*)?(?:a\s+|an\s+)?(?:workflow\s+)?instance\s+already\s+exists(?:\s*[:.]|$)/i.test(message)
+		|| /^(?:error:\s*)?(?:a\s+|an\s+)?(?:workflow\s+)?instance\s+(?:with\s+(?:the\s+)?id\s+["'`]?[A-Za-z0-9_.:-]+["'`]?|["'`][A-Za-z0-9_.:-]+["'`]|(?=[A-Za-z0-9_.:-]*\d)[A-Za-z0-9_.:-]+)\s+already\s+exists(?:\s*[:.]|$)/i.test(message)
+	)
 }
 
 async function inspectWorkflowInstanceState(
 	env: Env,
 	instanceId: string
-): Promise<'active' | 'complete' | 'terminal' | 'missing'> {
+): Promise<'active' | 'complete' | 'terminal' | 'missing' | 'unknown'> {
 	try {
 		const instance = await env.WORKFLOW.get(instanceId)
 		const status = await instance.status()
@@ -238,7 +295,17 @@ async function inspectWorkflowInstanceState(
 		if (status.status === 'errored' || status.status === 'terminated') {
 			return 'terminal'
 		}
-		return 'active'
+		if (
+			status.status === 'queued'
+			|| status.status === 'running'
+			|| status.status === 'paused'
+			|| status.status === 'waiting'
+			|| status.status === 'waitingForPause'
+		) {
+			return 'active'
+		}
+		// Explicitly propagate Cloudflare Workflows' 'unknown' (or unrecognized) status as indeterminate
+		return 'unknown'
 	} catch (err) {
 		if (isWorkflowNotFoundError(err)) {
 			return 'missing'
@@ -531,7 +598,10 @@ smols.get(
 // Create new smol
 smols.post('/', parseAuth, async (c) => {
 	const { env, req } = c
-	const payload = c.get('jwtPayload')!
+	const payload = c.get('jwtPayload')
+	if (!payload?.sub) {
+		throw new HTTPException(401, { message: 'User authentication required' })
+	}
 	let body: {
 		prompt?: unknown
 		public?: unknown
@@ -568,6 +638,27 @@ smols.post('/', parseAuth, async (c) => {
 		? body.playlist.trim()
 		: undefined
 
+	const instanceId = env.DURABLE_OBJECT.newUniqueId().toString()
+
+	// Enforce per-user UTC-day quota (+ optional burst guard & soft daily global circuit breaker)
+	let reserveResult: Awaited<ReturnType<typeof reserveGenerationQuota>>
+	try {
+		reserveResult = await reserveGenerationQuota(env, {
+			address: payload.sub,
+			reservationId: instanceId,
+			provider,
+		})
+	} catch {
+		throw new HTTPException(503, { message: 'Unable to verify generation quota right now; please try again' })
+	}
+
+	if (!reserveResult.ok) {
+		if (reserveResult.code === 'quota_exceeded') {
+			return buildQuotaExceededResponse(reserveResult.payload)
+		}
+		throw new HTTPException(409, { message: 'Generation quota conflict; please try again' })
+	}
+
 	const workflowParams: WorkflowParams = {
 		address: payload.sub,
 		prompt: body.prompt,
@@ -575,10 +666,13 @@ smols.post('/', parseAuth, async (c) => {
 		instrumental: isInstrumental,
 		...(normalizedPlaylist ? { playlist: normalizedPlaylist } : {}),
 		provider,
+		quota_reservation_id: instanceId,
+		quota_day_key: reserveResult.dayKey,
+		quota_provider: provider,
+		quota_reuse_only: false,
 		workflow_version: CURRENT_WORKFLOW_VERSION,
 	}
 
-	const instanceId = env.DURABLE_OBJECT.newUniqueId().toString()
 	const doid = env.DURABLE_OBJECT.idFromString(instanceId)
 	const stub = env.DURABLE_OBJECT.get(doid)
 
@@ -591,25 +685,101 @@ smols.post('/', parseAuth, async (c) => {
 		actual_provider: null,
 	}
 
-	if (typeof doStub.saveSteps === 'function') {
-		await doStub.saveSteps({
-			payload: workflowParams,
-			requested_provider: provider,
-			active_provider: provider,
-			actual_provider: null,
-			generation_meta: generationMeta,
-		})
-	} else {
-		await doStub.saveStep('payload', workflowParams)
+	try {
+		if (typeof doStub.saveSteps === 'function') {
+			await doStub.saveSteps({
+				payload: {
+					address: workflowParams.address,
+					prompt: workflowParams.prompt,
+					public: workflowParams.public,
+					instrumental: workflowParams.instrumental,
+					...(workflowParams.playlist ? { playlist: workflowParams.playlist } : {}),
+					provider: workflowParams.provider,
+					workflow_version: workflowParams.workflow_version,
+				},
+				requested_provider: provider,
+				active_provider: provider,
+				actual_provider: null,
+				generation_meta: generationMeta,
+				quota_reservation_id: instanceId,
+				quota_day_key: reserveResult.dayKey,
+				quota_provider: provider,
+			})
+		} else {
+			await doStub.saveStep('payload', workflowParams)
+		}
+	} catch (err) {
+		// WORKFLOW.create was never called -> confirmed unstarted, safe to refund unshared reservation
+		await refundGenerationQuota(env, {
+			address: payload.sub,
+			reservationId: instanceId,
+			dayKey: reserveResult.dayKey,
+			reason: 'do_seed_failed',
+			options: { onlyIfUnshared: true },
+		}).catch(() => {})
+		throw err
 	}
 
-	const instance = await env.WORKFLOW.create({
-		id: instanceId,
-		params: workflowParams,
-	})
+	let instance: WorkflowInstance | null = null
+	try {
+		instance = await env.WORKFLOW.create({
+			id: instanceId,
+			params: workflowParams,
+		})
+	} catch (err) {
+		if (!isWorkflowAlreadyExistsError(err)) {
+			// Reconcile uncertain creation outcome BEFORE refunding:
+			// - 'active' | 'complete' -> confirmed accepted, return 200 and keep reservation
+			// - 'missing' (recognized instance-specific absence error) -> confirmed unstarted, refund and rethrow
+			// - 'unknown' | 'terminal' | lookup error -> indeterminate/unconfirmed: preserve quota and return 503!
+			if (typeof env.WORKFLOW?.get === 'function') {
+				let state: 'active' | 'complete' | 'terminal' | 'missing' | 'unknown'
+				try {
+					state = await inspectWorkflowInstanceState(env, instanceId)
+				} catch {
+					throw new HTTPException(503, {
+						message: 'Unable to confirm workflow creation status; please refresh before retrying',
+					})
+				}
 
-	const wfStatus = await instance.status()
-	console.log('Workflow started', { instanceId, status: wfStatus.status })
+				if (state === 'active' || state === 'complete') {
+					console.log('Workflow started (reconciled after create error)', { instanceId, status: state })
+					return c.text(instanceId)
+				}
+
+				if (state === 'missing') {
+					await refundGenerationQuota(env, {
+						address: payload.sub,
+						reservationId: instanceId,
+						dayKey: reserveResult.dayKey,
+						reason: 'workflow_create_confirmed_missing',
+						options: { onlyIfUnshared: true },
+					}).catch(() => {})
+					throw err
+				}
+
+				throw new HTTPException(503, {
+					message: 'Workflow creation status is indeterminate; please refresh before retrying',
+				})
+			}
+
+			throw new HTTPException(503, {
+				message: 'Unable to confirm workflow creation status; please refresh before retrying',
+			})
+		}
+	}
+
+	// Read status purely for observability; NEVER refund or fail an accepted Workflow if status() throws
+	let wfStatusText = 'running'
+	if (instance) {
+		try {
+			const wfStatus = await instance.status()
+			wfStatusText = wfStatus.status
+		} catch {
+			wfStatusText = 'unknown'
+		}
+	}
+	console.log('Workflow started', { instanceId, status: wfStatusText })
 
 	return c.text(instanceId)
 })
@@ -666,11 +836,15 @@ smols.post('/retry/:id', async (c) => {
 	// Active source work returns the existing ID immediately so a retry can never fork a running job
 	// or retire its assets while it is still executing. Fail closed (503) on indeterminate errors.
 	if (typeof env.WORKFLOW?.get === 'function') {
-		let sourceState: 'active' | 'complete' | 'terminal' | 'missing'
+		let sourceState: 'active' | 'complete' | 'terminal' | 'missing' | 'unknown'
 		try {
 			sourceState = await inspectWorkflowInstanceState(env, id)
 		} catch {
 			throw new HTTPException(503, { message: 'Unable to verify source workflow status; please try again' })
+		}
+
+		if (sourceState === 'unknown') {
+			throw new HTTPException(503, { message: 'Source workflow status is currently indeterminate; please try again' })
 		}
 
 		if (sourceState === 'complete') {
@@ -740,8 +914,14 @@ smols.post('/retry/:id', async (c) => {
 	// authoritative predecessor ID with every reservation so crash recovery restores its paid state.
 	let targetInstanceId = env.DURABLE_OBJECT.newUniqueId().toString()
 	let skipSuccessorSeed = false
+	let useSeededOverride = false
 	let recoveredSeededProvider: MusicProvider | undefined
 	let recoveredSeededOverride: MusicProvider | undefined
+	let recoveredOwnerAddress: string | undefined
+	let recoveredQuotaNeedsReservation: boolean | undefined
+	let recoveredQuotaProvider: MusicProvider | undefined
+	let recoveredQuotaReservationId: string | undefined
+	let recoveredQuotaDayKey: string | undefined
 	if (isDurableObjectId(chainRootId)) {
 		const MAX_RETRY_CHAIN_HOPS = 32
 		let coordinatorId = chainRootId
@@ -792,11 +972,15 @@ smols.post('/retry/:id', async (c) => {
 				return c.text(existingSuccessorId)
 			}
 
-			let existingState: 'active' | 'complete' | 'terminal' | 'missing'
+			let existingState: 'active' | 'complete' | 'terminal' | 'missing' | 'unknown'
 			try {
 				existingState = await inspectWorkflowInstanceState(env, existingSuccessorId)
 			} catch {
 				throw new HTTPException(503, { message: 'Unable to inspect existing retry status; please try again' })
+			}
+
+			if (existingState === 'unknown') {
+				throw new HTTPException(503, { message: 'Existing retry workflow status is indeterminate; please try again' })
 			}
 
 			if (existingState === 'complete') {
@@ -853,7 +1037,13 @@ smols.post('/retry/:id', async (c) => {
 					effectiveRetryId = successorInspection.retrySourceId || reservationPredecessorId
 					recoveredSeededProvider = successorInspection.provider
 					recoveredSeededOverride = successorInspection.overrideProvider
+					recoveredOwnerAddress = successorInspection.ownerAddress
+					recoveredQuotaNeedsReservation = successorInspection.quotaNeedsReservation
+					recoveredQuotaProvider = successorInspection.quotaProvider
+					recoveredQuotaReservationId = successorInspection.quotaReservationId
+					recoveredQuotaDayKey = successorInspection.quotaDayKey
 					skipSuccessorSeed = true
+					useSeededOverride = true
 					resolved = true
 					break
 				}
@@ -962,6 +1152,7 @@ smols.post('/retry/:id', async (c) => {
 	const effectiveProvider = overrideProvider ?? originalProvider
 	const effectiveActiveProvider: MusicProvider = overrideProvider
 		?? (isValidMusicProvider(retrySteps.active_provider) ? retrySteps.active_provider : effectiveProvider)
+	const ownerAddress = recoveredOwnerAddress || retrySteps.payload!.address!
 
 	const { retry_id: _oldRetryId, override_provider: _oldOverride, ...cleanOriginalPayload } = retrySteps.payload!
 	const seededPayload: WorkflowParams = {
@@ -974,9 +1165,99 @@ smols.post('/retry/:id', async (c) => {
 		workflow_version: CURRENT_WORKFLOW_VERSION,
 	}
 
+	let quotaReservationId: string | undefined
+	let quotaDayKey: string | undefined
+	let quotaProvider: MusicProvider | undefined
+	let quotaReuseOnly = false
+	let didNewlyReserveQuota = false
+
+	async function canSafelyRefundUnstartedRetry(reservationId: string): Promise<boolean> {
+		if (!didNewlyReserveQuota || reservationId !== targetInstanceId) {
+			return false
+		}
+		if (typeof env.WORKFLOW?.get === 'function') {
+			try {
+				const wfState = await inspectWorkflowInstanceState(env, targetInstanceId)
+				if (wfState !== 'missing') {
+					return false
+				}
+			} catch {
+				return false
+			}
+		}
+		if (isDurableObjectId(targetInstanceId)) {
+			try {
+				const succDoid = env.DURABLE_OBJECT.idFromString(targetInstanceId)
+				const succStub = env.DURABLE_OBJECT.get(succDoid) as unknown as RetryCoordinatorStub
+				if (typeof succStub.inspectRetrySuccessorState === 'function') {
+					const insp = await succStub.inspectRetrySuccessorState()
+					if (insp.state === 'executed') {
+						return false
+					}
+				}
+			} catch {
+				return false
+			}
+		}
+		return true
+	}
+
 	// Conditionally and atomically initialize the new DO BEFORE WORKFLOW.create ONLY if it is empty.
 	// Never overwrite a DO that already contains prior execution/payment state!
 	if (!skipSuccessorSeed) {
+		let admissionPlan: Awaited<ReturnType<typeof classifyRetryAdmission>>
+		try {
+			admissionPlan = await classifyRetryAdmission(
+				env,
+				effectiveRetryId,
+				retrySteps,
+				overrideProvider
+			)
+		} catch {
+			throw new HTTPException(503, { message: 'Unable to verify existing audio artifact; please try again' })
+		}
+
+		const reusesExistingAttempt = admissionPlan.kind === 'reuse'
+		const retryTargetProvider = admissionPlan.kind === 'fresh'
+			? admissionPlan.targetProvider
+			: resolveRetryTargetProvider(retrySteps, overrideProvider)
+
+		if (!reusesExistingAttempt) {
+			// Fresh paid call will be made -> enforce creator quota BEFORE seeding DO & creating workflow!
+			// If denied (429), targetInstanceId remains empty so future retries can recover cleanly.
+			let reserveResult: Awaited<ReturnType<typeof reserveGenerationQuota>>
+			try {
+				reserveResult = await reserveGenerationQuota(env, {
+					address: ownerAddress,
+					reservationId: targetInstanceId,
+					provider: retryTargetProvider,
+				})
+			} catch {
+				throw new HTTPException(503, { message: 'Unable to verify generation quota right now; please try again' })
+			}
+
+			if (!reserveResult.ok) {
+				if (reserveResult.code === 'quota_exceeded') {
+					return buildQuotaExceededResponse(reserveResult.payload)
+				}
+				throw new HTTPException(409, {
+					message: 'A concurrent retry already reserved this generation with a different model; please refresh',
+				})
+			}
+
+			quotaReservationId = targetInstanceId
+			quotaDayKey = reserveResult.dayKey
+			quotaProvider = retryTargetProvider
+			quotaReuseOnly = false
+			didNewlyReserveQuota = !reserveResult.idempotent
+		} else {
+			// Reusing/reconciling already-paid or pending attempt -> DO NOT double-charge quota!
+			quotaReservationId = retrySteps.quota_reservation_id
+			quotaDayKey = retrySteps.quota_day_key
+			quotaProvider = retrySteps.quota_provider
+			quotaReuseOnly = true
+		}
+
 		const newDoid = env.DURABLE_OBJECT.idFromString(targetInstanceId)
 		const newStub = env.DURABLE_OBJECT.get(newDoid) as unknown as {
 			seedRetrySuccessorIfEmpty?: (entries: Record<string, unknown>) => Promise<{
@@ -1000,6 +1281,11 @@ smols.post('/retry/:id', async (c) => {
 			generation_meta: generationMeta,
 			retry_chain_root_id: chainRootId,
 			retry_source_id: effectiveRetryId,
+			quota_needs_reservation: !reusesExistingAttempt,
+			quota_reuse_only: reusesExistingAttempt,
+			...(!reusesExistingAttempt ? { quota_provider: retryTargetProvider } : quotaProvider ? { quota_provider: quotaProvider } : {}),
+			...(quotaReservationId ? { quota_reservation_id: quotaReservationId } : {}),
+			...(quotaDayKey ? { quota_day_key: quotaDayKey } : {}),
 			...(overrideProvider ? { retry_override_provider: overrideProvider } : {}),
 			...(!overrideProvider && retrySteps.fallback_from ? { fallback_from: retrySteps.fallback_from } : {}),
 			...(!overrideProvider && retrySteps.fallback_reason ? { fallback_reason: retrySteps.fallback_reason } : {}),
@@ -1008,48 +1294,222 @@ smols.post('/retry/:id', async (c) => {
 			...(!overrideProvider && retrySteps.songs ? { songs: retrySteps.songs } : {}),
 		}
 
-		if (typeof newStub.seedRetrySuccessorIfEmpty === 'function') {
-			const seedResult = await newStub.seedRetrySuccessorIfEmpty(seededEntries)
-			if (!seedResult.seeded) {
-				if (seedResult.inspection.state === 'executed') {
-					throw new HTTPException(503, {
-						message: 'Reserved retry successor already has prior execution state; refusing to overwrite',
-					})
+		let seedSucceeded = false
+		try {
+			if (typeof newStub.seedRetrySuccessorIfEmpty === 'function') {
+				const seedResult = await newStub.seedRetrySuccessorIfEmpty(seededEntries)
+				if (!seedResult.seeded) {
+					if (seedResult.inspection.state === 'executed') {
+						// NEVER refund targetInstanceId when a concurrent winner has already executed it!
+						if (typeof env.WORKFLOW?.get === 'function') {
+							try {
+								const wfState = await inspectWorkflowInstanceState(env, targetInstanceId)
+								if (wfState === 'active' || wfState === 'complete') {
+									return c.text(targetInstanceId)
+								}
+							} catch {
+								// Fall through to 503 without refunding
+							}
+						}
+						throw new HTTPException(503, {
+							message: 'Reserved retry successor already has prior execution state; refusing to overwrite',
+						})
+					}
+					// Concurrent caller already seeded this unstarted reservation; adopt the winning seed
+					// (including when its overrideProvider is absent!)
+					if (seedResult.inspection.retrySourceId) {
+						effectiveRetryId = seedResult.inspection.retrySourceId
+					}
+					recoveredSeededProvider = seedResult.inspection.provider
+					recoveredSeededOverride = seedResult.inspection.overrideProvider
+					useSeededOverride = true
+					if (
+						didNewlyReserveQuota
+						&& seedResult.inspection.quotaNeedsReservation === false
+						&& seedResult.inspection.quotaReservationId !== targetInstanceId
+						&& await canSafelyRefundUnstartedRetry(targetInstanceId)
+					) {
+						await refundGenerationQuota(env, {
+							address: ownerAddress,
+							reservationId: targetInstanceId,
+							dayKey: quotaDayKey,
+							reason: 'concurrent_seed_reused_attempt',
+							options: { onlyIfUnshared: true },
+						}).catch(() => {})
+						didNewlyReserveQuota = false
+					}
+					if (seedResult.inspection.quotaNeedsReservation === false) {
+						quotaReuseOnly = true
+					}
+					if (seedResult.inspection.quotaProvider !== undefined) {
+						quotaProvider = seedResult.inspection.quotaProvider
+					}
+					if (seedResult.inspection.quotaReservationId !== undefined) {
+						quotaReservationId = seedResult.inspection.quotaReservationId
+					}
+					if (seedResult.inspection.quotaDayKey !== undefined) {
+						quotaDayKey = seedResult.inspection.quotaDayKey
+					}
 				}
-				// Concurrent caller already seeded this unstarted reservation; preserve its seed
-				if (seedResult.inspection.retrySourceId) {
-					effectiveRetryId = seedResult.inspection.retrySourceId
-				}
-				recoveredSeededProvider = seedResult.inspection.provider
-				recoveredSeededOverride = seedResult.inspection.overrideProvider
+				seedSucceeded = true
+			} else if (typeof newStub.saveSteps === 'function') {
+				await newStub.saveSteps(seededEntries)
+				seedSucceeded = true
+			} else {
+				await newStub.saveStep('payload', seededPayload)
+				seedSucceeded = true
 			}
-		} else if (typeof newStub.saveSteps === 'function') {
-			await newStub.saveSteps(seededEntries)
+		} catch (err) {
+			if (!seedSucceeded && !(err instanceof HTTPException) && await canSafelyRefundUnstartedRetry(targetInstanceId)) {
+				await refundGenerationQuota(env, {
+					address: ownerAddress,
+					reservationId: targetInstanceId,
+					dayKey: quotaDayKey,
+					reason: 'retry_seed_failed',
+					options: { onlyIfUnshared: true },
+				}).catch(() => {})
+			}
+			throw err
+		}
+	} else {
+		// Crash recovery of a seeded_unstarted successor:
+		// For pre-Wave-5 seeds missing `quota_needs_reservation`, load and classify the authoritative
+		// predecessor with the saved override BEFORE deciding whether a fresh reservation is required!
+		let needsReservation = recoveredQuotaNeedsReservation
+		let targetReserveProvider = recoveredQuotaProvider
+
+		if (needsReservation === undefined) {
+			const pred = await loadAuthoritativePredecessor(effectiveRetryId)
+			if (pred.kind === 'published') {
+				if (recoveredSeededOverride) {
+					throw new HTTPException(409, { message: 'Published smols cannot be retried with a different provider' })
+				}
+				return c.text(pred.id)
+			}
+			retrySteps = pred.steps
+			let legacyPlan: Awaited<ReturnType<typeof classifyRetryAdmission>>
+			try {
+				legacyPlan = await classifyRetryAdmission(env, effectiveRetryId, pred.steps, recoveredSeededOverride)
+			} catch {
+				throw new HTTPException(503, { message: 'Unable to verify existing audio artifact; please try again' })
+			}
+			if (legacyPlan.kind === 'fresh') {
+				needsReservation = true
+				targetReserveProvider = legacyPlan.targetProvider
+			} else {
+				needsReservation = false
+			}
+		}
+
+		if (needsReservation === true) {
+			const recoveredProvider = targetReserveProvider
+				?? recoveredSeededProvider
+				?? resolveRetryTargetProvider(retrySteps, recoveredSeededOverride)
+			let reserveResult: Awaited<ReturnType<typeof reserveGenerationQuota>>
+			try {
+				reserveResult = await reserveGenerationQuota(env, {
+					address: ownerAddress,
+					reservationId: targetInstanceId,
+					provider: recoveredProvider,
+				})
+			} catch {
+				throw new HTTPException(503, { message: 'Unable to verify generation quota right now; please try again' })
+			}
+
+			if (!reserveResult.ok) {
+				if (reserveResult.code === 'quota_exceeded') {
+					return buildQuotaExceededResponse(reserveResult.payload)
+				}
+				throw new HTTPException(409, {
+					message: 'A concurrent retry already reserved this generation with a different model; please refresh',
+				})
+			}
+
+			quotaReservationId = targetInstanceId
+			quotaDayKey = reserveResult.dayKey
+			quotaProvider = recoveredProvider
+			quotaReuseOnly = false
+			didNewlyReserveQuota = !reserveResult.idempotent
 		} else {
-			await newStub.saveStep('payload', seededPayload)
+			quotaReservationId = recoveredQuotaReservationId ?? retrySteps.quota_reservation_id
+			quotaDayKey = recoveredQuotaDayKey ?? retrySteps.quota_day_key
+			quotaProvider = recoveredQuotaProvider ?? retrySteps.quota_provider
+			quotaReuseOnly = true
 		}
 	}
 
 	const finalProvider = recoveredSeededProvider ?? effectiveProvider
-	const finalOverride = skipSuccessorSeed ? recoveredSeededOverride : overrideProvider
+	const finalOverride = useSeededOverride ? recoveredSeededOverride : overrideProvider
 	const workflowParams: WorkflowParams = {
 		retry_id: effectiveRetryId,
 		provider: finalProvider,
 		...(finalOverride ? { override_provider: finalOverride } : {}),
+		...(quotaReservationId ? { quota_reservation_id: quotaReservationId } : {}),
+		...(quotaDayKey ? { quota_day_key: quotaDayKey } : {}),
+		...(quotaProvider ? { quota_provider: quotaProvider } : {}),
+		quota_reuse_only: quotaReuseOnly,
 		workflow_version: CURRENT_WORKFLOW_VERSION,
 	}
 
-	let wfStatusValue = 'running'
+	let createdInstance: WorkflowInstance | null = null
 	try {
-		const instance = await env.WORKFLOW.create({
+		createdInstance = await env.WORKFLOW.create({
 			id: targetInstanceId,
 			params: workflowParams,
 		})
-		const status = await instance.status()
-		wfStatusValue = status.status
 	} catch (err) {
 		if (!isWorkflowAlreadyExistsError(err)) {
+			// Reconcile uncertain creation before refunding:
+			// - 'active' | 'complete' -> confirmed accepted, return 200 and keep reservation
+			// - 'missing' (recognized instance-specific error) + DO unexecuted + unshared -> refund and rethrow
+			// - 'unknown' | 'terminal' | lookup error -> preserve quota and return 503!
+			if (typeof env.WORKFLOW?.get === 'function') {
+				let state: 'active' | 'complete' | 'terminal' | 'missing' | 'unknown'
+				try {
+					state = await inspectWorkflowInstanceState(env, targetInstanceId)
+				} catch {
+					throw new HTTPException(503, {
+						message: 'Unable to confirm retry workflow creation status; please refresh before retrying',
+					})
+				}
+
+				if (state === 'active' || state === 'complete') {
+					console.log('Workflow restarted (reconciled after create error)', { instanceId: targetInstanceId, status: state })
+					return c.text(targetInstanceId)
+				}
+
+				if (state !== 'missing') {
+					throw new HTTPException(503, {
+						message: 'Retry workflow creation status is indeterminate; please refresh before retrying',
+					})
+				}
+			} else {
+				throw new HTTPException(503, {
+					message: 'Unable to confirm retry workflow creation status; please refresh before retrying',
+				})
+			}
+
+			if (await canSafelyRefundUnstartedRetry(targetInstanceId)) {
+				await refundGenerationQuota(env, {
+					address: ownerAddress,
+					reservationId: targetInstanceId,
+					dayKey: quotaDayKey,
+					reason: 'retry_workflow_create_confirmed_missing',
+					options: { onlyIfUnshared: true },
+				}).catch(() => {})
+			}
 			throw err
+		}
+	}
+
+	// Read status purely for observability; NEVER refund or fail an accepted Workflow if status() throws
+	let wfStatusValue = 'running'
+	if (createdInstance) {
+		try {
+			const status = await createdInstance.status()
+			wfStatusValue = status.status
+		} catch {
+			wfStatusValue = 'unknown'
 		}
 	}
 

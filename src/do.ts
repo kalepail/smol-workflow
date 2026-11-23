@@ -121,13 +121,24 @@ export class SmolDurableObject extends DurableObject<Env> {
 		if (retrySeedPending && !hasExecutionArtifacts) {
 			const seededPayload = existingMap.get('payload') as WorkflowParams | undefined;
 			const seededOverride = existingMap.get('retry_override_provider') as MusicProvider | undefined;
+			const quotaNeedsReservation = existingMap.get('quota_needs_reservation');
+			const quotaProvider = existingMap.get('quota_provider') as MusicProvider | undefined;
+			const quotaReservationId = existingMap.get('quota_reservation_id');
+			const quotaDayKey = existingMap.get('quota_day_key');
 			return {
 				state: 'seeded_unstarted',
 				retrySourceId: typeof existingMap.get('retry_source_id') === 'string'
 					? existingMap.get('retry_source_id') as string
 					: undefined,
+				ownerAddress: typeof seededPayload?.address === 'string'
+					? seededPayload.address
+					: undefined,
 				provider: seededPayload?.provider,
 				overrideProvider: seededOverride,
+				...(typeof quotaNeedsReservation === 'boolean' ? { quotaNeedsReservation } : {}),
+				...(quotaProvider ? { quotaProvider } : {}),
+				...(typeof quotaReservationId === 'string' ? { quotaReservationId } : {}),
+				...(typeof quotaDayKey === 'string' ? { quotaDayKey } : {}),
 				...(existingAttempt ? { existingAttempt } : {}),
 			};
 		}

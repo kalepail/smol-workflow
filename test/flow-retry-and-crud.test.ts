@@ -8,6 +8,7 @@ import {
 	createMockDoNamespace,
 	createMockExecutionContext,
 	createMockR2Bucket,
+	createMockUserQuotaNamespace,
 	createWorkflowStep,
 	installCloudflareStubs,
 	type CloudflareStubHandle,
@@ -38,6 +39,7 @@ after(() => {
 function createRetryCrudHarness() {
 	const r2 = createMockR2Bucket()
 	const doNs = createMockDoNamespace(r2.bucket)
+	const quotaNs = createMockUserQuotaNamespace(appModule.UserQuotaDO)
 	const kv = new Map<string, string>()
 	const smolsTable = new Map<string, Record<string, unknown>>()
 	const playlistsTable: Array<{ Id: string; Title: string }> = []
@@ -175,6 +177,7 @@ function createRetryCrudHarness() {
 		CF_AIG_BYOK_ALIAS: 'default',
 		ELEVENLABS_FALLBACK_ENABLED: 'true',
 		DURABLE_OBJECT: doNs.namespace,
+		USER_QUOTA: quotaNs.namespace,
 		SMOL_BUCKET: r2.bucket,
 		SMOL_D1: d1,
 		SMOL_KV: {

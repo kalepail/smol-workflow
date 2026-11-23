@@ -40,6 +40,13 @@ import {
 	matchSongsByFingerprint,
 	type AudioFingerprint,
 } from './audio-fingerprint';
+import {
+	commitGenerationQuota,
+	markAmbiguousGenerationQuota,
+	refundGenerationQuota,
+	reserveGenerationQuota,
+	transitionFallbackQuota,
+} from './quota';
 
 export const DEFAULT_MUSIC_PROVIDER: MusicProvider = 'aisonggenerator';
 export const SUPPORTED_MUSIC_PROVIDERS = ['aisonggenerator', 'elevenlabs'] as const;
@@ -120,7 +127,7 @@ function inferSnapshotProvider(retrySteps: WorkflowSteps): MusicProvider | 'lega
 	return isValidMusicProvider(retrySteps.payload?.provider) ? retrySteps.payload!.provider : null;
 }
 
-function isPollableAisgIds(retrySteps: WorkflowSteps): boolean {
+export function isPollableAisgIds(retrySteps: WorkflowSteps): boolean {
 	const ids = toDistinctStringIds(retrySteps.song_ids);
 	if (ids.length === 0) return false;
 	if (ids.some((id) => id.startsWith('el-'))) return false;
@@ -140,6 +147,141 @@ function isPollableAisgIds(retrySteps: WorkflowSteps): boolean {
 		}
 	}
 	return true;
+}
+
+export function hasReusableCompleteSongs(retrySteps: WorkflowSteps | undefined): boolean {
+	if (!retrySteps) return false;
+	const previousProvider = inferSnapshotProvider(retrySteps);
+	const retrySongIds = toDistinctStringIds(retrySteps.song_ids);
+	const retrySongs = Array.isArray(retrySteps.songs) ? retrySteps.songs : [];
+	const distinctRetrySongMusicIds = toDistinctStringIds(
+		retrySongs.map((s) => s?.music_id).filter((id): id is string => Boolean(id))
+	);
+	const isExplicitAisgSnapshot = previousProvider === 'aisonggenerator'
+		|| retrySongs.some((s) => (s.service || s.provider || '').toLowerCase() === 'aisonggenerator');
+	const requiredTrackCount = isExplicitAisgSnapshot ? EXPECTED_AISG_TRACK_COUNT : 1;
+	const songIdsMatchRetrySongs = distinctRetrySongMusicIds.length === retrySongs.length
+		&& distinctRetrySongMusicIds.length === retrySongIds.length
+		&& distinctRetrySongMusicIds.every((id) => retrySongIds.includes(id));
+
+	return retrySongs.length >= requiredTrackCount
+		&& songIdsMatchRetrySongs
+		&& retrySongs.every((s) => Boolean(s?.music_id && s.status >= 4 && s.audio));
+}
+
+export function hasIncompleteAisgSnapshot(retrySteps: WorkflowSteps | undefined): boolean {
+	if (!retrySteps) return false;
+	const previousProvider = inferSnapshotProvider(retrySteps);
+	const retrySongs = Array.isArray(retrySteps.songs) ? retrySteps.songs : [];
+	const distinctRetrySongMusicIds = toDistinctStringIds(
+		retrySongs.map((s) => s?.music_id).filter((id): id is string => Boolean(id))
+	);
+	const isExplicitAisgSnapshot = previousProvider === 'aisonggenerator'
+		|| retrySongs.some((s) => (s.service || s.provider || '').toLowerCase() === 'aisonggenerator');
+
+	return isExplicitAisgSnapshot
+		&& distinctRetrySongMusicIds.length > 0
+		&& distinctRetrySongMusicIds.length < EXPECTED_AISG_TRACK_COUNT
+		&& retrySongs.every((s) => typeof s.status !== 'number' || s.status >= 0);
+}
+
+export function resolveRetryTargetProvider(
+	retrySteps: WorkflowSteps,
+	overrideProvider?: MusicProvider
+): MusicProvider {
+	if (overrideProvider) {
+		return overrideProvider;
+	}
+	if (retrySteps.active_provider === 'elevenlabs' || retrySteps.fallback_from === 'aisonggenerator') {
+		return 'elevenlabs';
+	}
+	if (isValidMusicProvider(retrySteps.payload?.provider)) {
+		return retrySteps.payload!.provider;
+	}
+	if (isValidMusicProvider(retrySteps.requested_provider)) {
+		return retrySteps.requested_provider;
+	}
+	return DEFAULT_MUSIC_PROVIDER;
+}
+
+export type RetryAdmissionPlan =
+	| {
+		kind: 'reuse';
+		reason: 'complete_songs' | 'active_attempt' | 'pollable_aisg' | 'incomplete_aisg_snapshot' | 'r2_elevenlabs_artifact';
+		expectedR2Key?: string;
+	}
+	| {
+		kind: 'fresh';
+		targetProvider: MusicProvider;
+	};
+
+/**
+ * Classify whether retrying `retrySteps` will reuse/reconcile an existing paid/pending/complete
+ * attempt or dispatch a fresh paid provider call.
+ * R2 lookup errors propagate (never swallowed as "missing") so callers treat them as retryable 503.
+ */
+export async function classifyRetryAdmission(
+	env: Env,
+	retryId: string,
+	retrySteps: WorkflowSteps,
+	overrideProvider?: MusicProvider
+): Promise<RetryAdmissionPlan> {
+	if (hasReusableCompleteSongs(retrySteps)) {
+		return { kind: 'reuse', reason: 'complete_songs' };
+	}
+
+	// Active/claimed/submitted/committed/ambiguous paid attempts always enter reconcileCarriedAttempt first
+	if (retrySteps.provider_attempt && retrySteps.provider_attempt.status !== 'failed') {
+		return { kind: 'reuse', reason: 'active_attempt' };
+	}
+
+	// Pending AISG IDs enter Path 2 quick-check/resume (if quick-check later hits terminal_failed,
+	// ElevenLabs fallback/override enforces independent quota inside the workflow before dispatch)
+	if (isPollableAisgIds(retrySteps)) {
+		return { kind: 'reuse', reason: 'pollable_aisg' };
+	}
+
+	// Incomplete historical AISG snapshot fails closed without making a paid call
+	if (hasIncompleteAisgSnapshot(retrySteps)) {
+		return { kind: 'reuse', reason: 'incomplete_aisg_snapshot' };
+	}
+
+	// Path 1B: prior ElevenLabs fallback whose committed R2 artifact already exists.
+	// Propagate R2 errors (fail closed / retryable) rather than treating transient R2 failures as missing.
+	const previousProvider = inferSnapshotProvider(retrySteps);
+	const providerChangedOnRetry = Boolean(
+		overrideProvider
+		&& previousProvider
+		&& previousProvider !== overrideProvider
+	);
+	if (
+		!providerChangedOnRetry
+		&& (retrySteps.active_provider === 'elevenlabs' || retrySteps.fallback_from === 'aisonggenerator')
+	) {
+		const prevSmolId = retrySteps.provider_attempt?.source_smol_id ?? retryId;
+		if (prevSmolId && typeof env.SMOL_BUCKET?.head === 'function') {
+			const r2Key = `${getElevenLabsMusicId(prevSmolId)}.mp3`;
+			const head = await env.SMOL_BUCKET.head(r2Key);
+			if (head && head.size > 0) {
+				return { kind: 'reuse', reason: 'r2_elevenlabs_artifact', expectedR2Key: r2Key };
+			}
+		}
+	}
+
+	return {
+		kind: 'fresh',
+		targetProvider: resolveRetryTargetProvider(retrySteps, overrideProvider),
+	};
+}
+
+export async function doesRetryReuseExistingAttempt(
+	env: Env,
+	retryId: string,
+	retrySteps: WorkflowSteps,
+	overrideProvider?: MusicProvider
+): Promise<boolean> {
+	const plan = await classifyRetryAdmission(env, retryId, retrySteps, overrideProvider);
+	return plan.kind === 'reuse';
 }
 
 async function saveProviderProgress(
@@ -305,6 +447,348 @@ export async function commitSongsAudioToR2(params: {
 }
 
 /**
+ * Require a fresh provider-specific reservation before ANY new paid dispatch (defense in depth).
+ * - A reuse-only workflow MUST stop instead of dispatching unreserved paid work.
+ * - If the workflow already carries a matching provider-specific reservation, reuse it directly.
+ * - Otherwise (e.g. legacy unreserved workflow or mismatched inherited reservation), atomically reserve
+ *   a distinct provider-specific reservation inside a workflow step before dispatching.
+ */
+async function ensureFreshPaidDispatchQuota(params: {
+	env: Env;
+	stub: DurableObjectStub<SmolDurableObject>;
+	step: WorkflowStep;
+	config: WorkflowStepConfig;
+	smolId: string;
+	targetProvider: MusicProvider;
+	address?: string;
+	quotaReservationId?: string;
+	quotaDayKey?: string;
+	quotaProvider?: MusicProvider;
+	reuseOnly?: boolean;
+}): Promise<{ reservationId: string; dayKey?: string; provider: MusicProvider }> {
+	const {
+		env,
+		stub,
+		step,
+		config,
+		smolId,
+		targetProvider,
+		address,
+		quotaReservationId,
+		quotaDayKey,
+		quotaProvider,
+		reuseOnly,
+	} = params;
+
+	if (reuseOnly) {
+		throw new NonRetryableError(
+			`Reuse-only retry refused to dispatch unreserved paid ${targetProvider} generation because expected reusable artifact was unavailable`
+		);
+	}
+
+	if (quotaReservationId && quotaProvider === targetProvider) {
+		return {
+			reservationId: quotaReservationId,
+			dayKey: quotaDayKey,
+			provider: targetProvider,
+		};
+	}
+
+	type DispatchAuthResult =
+		| { ok: true; reservationId: string; dayKey: string }
+		| { ok: false; code: string; error: string };
+
+	const dispatchReservationId = `${smolId}:dispatch:${targetProvider}`;
+	const auth = await step.do(
+		`reserve ${targetProvider} dispatch quota`,
+		config,
+		async (): Promise<DispatchAuthResult> => {
+			if (!address) {
+				return {
+					ok: false,
+					code: 'missing_address',
+					error: `Missing user address for ${targetProvider} quota enforcement`,
+				};
+			}
+			if (!env.USER_QUOTA) {
+				return {
+					ok: false,
+					code: 'quota_unavailable',
+					error: `${targetProvider} quota service is unavailable`,
+				};
+			}
+
+			const reserved = await reserveGenerationQuota(env, {
+				address,
+				reservationId: dispatchReservationId,
+				provider: targetProvider,
+			});
+			if (reserved.ok) {
+				return {
+					ok: true,
+					reservationId: dispatchReservationId,
+					dayKey: reserved.dayKey,
+				};
+			}
+			if (reserved.code === 'quota_exceeded') {
+				return {
+					ok: false,
+					code: 'quota_exceeded',
+					error: reserved.payload.error,
+				};
+			}
+			return {
+				ok: false,
+				code: 'quota_conflict',
+				error: `Unable to reserve ${targetProvider} quota (conflict with ${reserved.existingProvider})`,
+			};
+		}
+	);
+
+	if (!auth.ok) {
+		await step.do('record dispatch quota denial', config, async () => {
+			await saveStateOnlyStep(stub, 'songs', [{
+				music_id: targetProvider === 'elevenlabs' ? getElevenLabsMusicId(smolId) : smolId,
+				status: -4,
+				audio: '',
+				service: targetProvider,
+				error_message: auth.error,
+			}]);
+		});
+		throw new NonRetryableError(`Paid ${targetProvider} dispatch blocked by quota (${auth.code}): ${auth.error}`);
+	}
+
+	return {
+		reservationId: auth.reservationId,
+		dayKey: auth.dayKey,
+		provider: targetProvider,
+	};
+}
+
+/**
+ * Enforce ElevenLabs daily/global quota BEFORE any automatic AISG -> ElevenLabs fallback
+ * or pending-AISG -> ElevenLabs override. Never allows fallback to bypass ElevenLabs limits.
+ *
+ * Accounting policy:
+ * - Confirmed pre-charge AISG rejection (`aisgWasUnbilled === true`): transfers the unbilled Classic
+ *   slot to ElevenLabs via `transitionFallbackQuota` (or refunds Classic if ElevenLabs cap is exceeded).
+ * - Already-accepted/billed AISG failure (`aisgWasUnbilled === false`, e.g., poll/quick-check failure):
+ *   RETAINS the accepted Classic reservation permanently on its original UTC day (`markAmbiguous`),
+ *   and reserves ElevenLabs INDEPENDENTLY under a distinct reservation ID (`<smolId>:fallback:elevenlabs`).
+ *   This guarantees Classic usage is never lost on fallback success/unknown outcomes and never breaks
+ *   across UTC midnight if ElevenLabs subsequently rejects.
+ */
+async function authorizeElevenLabsFallbackQuota(params: {
+	env: Env;
+	stub: DurableObjectStub<SmolDurableObject>;
+	step: WorkflowStep;
+	config: WorkflowStepConfig;
+	smolId: string;
+	address?: string;
+	quotaReservationId?: string;
+	quotaDayKey?: string;
+	aisgWasUnbilled: boolean;
+	failureReason: string;
+}): Promise<{ reservationId: string; dayKey: string; provider: 'elevenlabs' }> {
+	const {
+		env,
+		stub,
+		step,
+		config,
+		smolId,
+		address,
+		quotaReservationId,
+		quotaDayKey,
+		aisgWasUnbilled,
+		failureReason,
+	} = params;
+
+	type FallbackAuthStepResult =
+		| { ok: true; reservationId: string; dayKey: string }
+		| { ok: false; error: string; code: string };
+
+	const authResult = await step.do(
+		'authorize elevenlabs fallback quota',
+		config,
+		async (): Promise<FallbackAuthStepResult> => {
+			if (!address) {
+				return {
+					ok: false,
+					code: 'missing_address',
+					error: 'Missing user address for ElevenLabs fallback quota enforcement',
+				};
+			}
+			if (!env.USER_QUOTA) {
+				return {
+					ok: false,
+					code: 'quota_unavailable',
+					error: 'ElevenLabs fallback quota service is unavailable',
+				};
+			}
+
+			// Case 1: Confirmed pre-charge AISG rejection -> transfer the unbilled Classic slot to ElevenLabs
+			if (aisgWasUnbilled && quotaReservationId) {
+				const transitioned = await transitionFallbackQuota(env, {
+					address,
+					reservationId: quotaReservationId,
+					fromProvider: 'aisonggenerator',
+					toProvider: 'elevenlabs',
+					previousDayKey: quotaDayKey,
+				});
+				if (transitioned.ok) {
+					return {
+						ok: true,
+						reservationId: quotaReservationId,
+						dayKey: transitioned.dayKey,
+					};
+				}
+				if (transitioned.code === 'quota_exceeded') {
+					return {
+						ok: false,
+						code: 'quota_exceeded',
+						error: transitioned.payload.error,
+					};
+				}
+				return {
+					ok: false,
+					code: 'quota_invalid_state',
+					error: `Unable to transition quota reservation to ElevenLabs (${transitioned.status})`,
+				};
+			}
+
+			// Case 2: Already-accepted/billed AISG failure (or legacy smol with no prior reservation):
+			// Retain the billed Classic attempt on its original UTC day first, then reserve ElevenLabs independently!
+			if (!aisgWasUnbilled && quotaReservationId) {
+				await markAmbiguousGenerationQuota(env, {
+					address,
+					reservationId: quotaReservationId,
+					dayKey: quotaDayKey,
+					reason: `aisg_billed_fallback_${failureReason}`,
+				});
+			}
+
+			const independentFallbackId = `${smolId}:fallback:elevenlabs`;
+			const reserved = await reserveGenerationQuota(env, {
+				address,
+				reservationId: independentFallbackId,
+				provider: 'elevenlabs',
+			});
+			if (reserved.ok) {
+				return {
+					ok: true,
+					reservationId: independentFallbackId,
+					dayKey: reserved.dayKey,
+				};
+			}
+			if (reserved.code === 'quota_exceeded') {
+				return {
+					ok: false,
+					code: 'quota_exceeded',
+					error: reserved.payload.error,
+				};
+			}
+			return {
+				ok: false,
+				code: 'quota_conflict',
+				error: `Unable to reserve ElevenLabs fallback quota (conflict with ${reserved.existingProvider})`,
+			};
+		}
+	);
+
+	if (!authResult.ok) {
+		await step.do('handle elevenlabs fallback quota denial', config, async () => {
+			if (address && quotaReservationId) {
+				if (aisgWasUnbilled) {
+					await refundGenerationQuota(env, {
+						address,
+						reservationId: quotaReservationId,
+						dayKey: quotaDayKey,
+						reason: `aisg_rejected_fallback_${authResult.code}`,
+					});
+				} else {
+					await markAmbiguousGenerationQuota(env, {
+						address,
+						reservationId: quotaReservationId,
+						dayKey: quotaDayKey,
+						reason: `aisg_billed_fallback_${authResult.code}`,
+					});
+				}
+			}
+
+			await saveStateOnlyStep(stub, 'songs', [{
+				music_id: smolId,
+				status: -4,
+				audio: '',
+				service: 'aisonggenerator',
+				error_message: `Classic failed (${failureReason}) and ElevenLabs fallback unavailable: ${authResult.error}`,
+			}]);
+		});
+
+		throw new NonRetryableError(`ElevenLabs fallback blocked by quota (${authResult.code}): ${authResult.error}`);
+	}
+
+	return {
+		reservationId: authResult.reservationId,
+		dayKey: authResult.dayKey,
+		provider: 'elevenlabs',
+	};
+}
+
+function isOwnFreshReservationId(reservationId: string | undefined, smolId: string): boolean {
+	if (!reservationId) {
+		return false;
+	}
+	return (
+		reservationId === smolId
+		|| reservationId === `${smolId}:fallback:elevenlabs`
+		|| reservationId === `${smolId}:dispatch:elevenlabs`
+		|| reservationId === `${smolId}:dispatch:aisonggenerator`
+	);
+}
+
+/**
+ * Reconcile ElevenLabs quota strictly from the actual dispatch vs reuse outcome:
+ * - If a predecessor's already-paid R2 artifact was reused without a paid dispatch, REFUND this
+ *   successor's fresh reservation instead of committing it!
+ * - Otherwise (genuine paid dispatch or replay of this instance's own R2 artifact), COMMIT it.
+ */
+async function settleElevenLabsQuotaFromOutcome(
+	env: Env,
+	params: {
+		address?: string;
+		reservationId?: string;
+		dayKey?: string;
+		quotaProvider?: MusicProvider;
+		smolId: string;
+		targetSmolId: string;
+		reusedFromR2: boolean;
+	}
+): Promise<void> {
+	const { address, reservationId, dayKey, quotaProvider, smolId, targetSmolId, reusedFromR2 } = params;
+	if (!address || !reservationId) {
+		return;
+	}
+	const isPredecessorReuse = reusedFromR2 && targetSmolId !== smolId && isOwnFreshReservationId(reservationId, smolId);
+	if (isPredecessorReuse) {
+		await refundGenerationQuota(env, {
+			address,
+			reservationId,
+			dayKey,
+			reason: 'reused_predecessor_r2_artifact',
+		});
+		return;
+	}
+	if (!quotaProvider || quotaProvider === 'elevenlabs') {
+		await commitGenerationQuota(env, {
+			address,
+			reservationId,
+			actualProvider: 'elevenlabs',
+			dayKey,
+		});
+	}
+}
+
+/**
  * Execute ElevenLabs 1-track generation (explicit or automatic fallback) inside a non-retried paid step.
  */
 async function runElevenLabsGeneration(params: {
@@ -313,6 +797,11 @@ async function runElevenLabsGeneration(params: {
 	step: WorkflowStep;
 	config: WorkflowStepConfig;
 	smolId: string;
+	address?: string;
+	quotaReservationId?: string;
+	quotaDayKey?: string;
+	quotaProvider?: MusicProvider;
+	reuseOnly?: boolean;
 	prompt: string;
 	description: string;
 	lyrics: AiSongGeneratorLyrics;
@@ -328,6 +817,11 @@ async function runElevenLabsGeneration(params: {
 		step,
 		config,
 		smolId,
+		address,
+		quotaReservationId,
+		quotaDayKey,
+		quotaProvider,
+		reuseOnly,
 		prompt,
 		description,
 		lyrics,
@@ -339,7 +833,132 @@ async function runElevenLabsGeneration(params: {
 	} = params;
 
 	const targetSmolId = resumeFromR2SmolId ?? smolId;
+	const existingMusicId = getElevenLabsMusicId(targetSmolId);
 	const stepName = fallback_from ? 'generate song (elevenlabs fallback)' : 'generate song (elevenlabs)';
+
+	// Always perform pre-claim R2 HEAD inside a RETRYABLE step BEFORE claiming any paid attempt:
+	// - Transient R2 read failures retry cleanly via Workflows without stranding quota.
+	// - If retries exhaust before any paid claim, release own fresh reservation cleanly.
+	// - If a committed R2 artifact already exists, reuse it and reconcile quota from reuse outcome.
+	// - If a reuse-only workflow finds its expected artifact missing, stop immediately without dispatching.
+	let existingR2Meta: { size: number; upstreamSongId?: string; gatewayLogId?: string } | null = null;
+	try {
+		existingR2Meta = await step.do('check existing elevenlabs r2 artifact', config, async () => {
+			if (typeof env.SMOL_BUCKET.head !== 'function') {
+				return null;
+			}
+			const head = await env.SMOL_BUCKET.head(`${existingMusicId}.mp3`);
+			if (!head || head.size <= 0) {
+				return null;
+			}
+			if (head.customMetadata?.smolId && head.customMetadata.smolId !== targetSmolId) {
+				return null;
+			}
+			return {
+				size: head.size,
+				upstreamSongId: head.customMetadata?.upstreamSongId,
+				gatewayLogId: head.customMetadata?.gatewayLogId,
+			};
+		});
+	} catch (err) {
+		if (
+			!(err instanceof Error && err.name === 'SuspendSignal')
+			&& address
+			&& quotaReservationId
+			&& isOwnFreshReservationId(quotaReservationId, smolId)
+		) {
+			await step.do('refund quota on pre-claim r2 failure', config, async () => {
+				await refundGenerationQuota(env, {
+					address,
+					reservationId: quotaReservationId,
+					dayKey: quotaDayKey,
+					reason: 'pre_claim_r2_head_failed',
+				});
+			}).catch(() => {});
+		}
+		throw err;
+	}
+
+	if (existingR2Meta) {
+		const reusedSong: AiSongGeneratorSong = {
+			music_id: existingMusicId,
+			status: 4,
+			audio: getCanonicalSongUrl(existingMusicId),
+			service: 'elevenlabs',
+		};
+		const songs = [reusedSong];
+		const song_ids = [existingMusicId];
+		const generation_meta: GenerationMeta = {
+			requested_provider,
+			actual_provider: 'elevenlabs',
+			...(fallback_from ? { fallback_from } : {}),
+			...(fallback_reason ? { fallback_reason } : {}),
+		};
+
+		await step.do('save song ids', config, () => saveStateOnlyStep(stub, 'song_ids', song_ids));
+		await step.do('save songs', config, async () => {
+			await updateAttemptIfSupported(stub, {
+				provider: 'elevenlabs',
+				status: 'committed',
+				source_smol_id: targetSmolId,
+				song_ids,
+				r2_keys: [`${existingMusicId}.mp3`],
+				upstream_song_id: existingR2Meta!.upstreamSongId,
+				gateway_log_id: existingR2Meta!.gatewayLogId,
+				updated_at: new Date().toISOString(),
+			});
+			await saveStateOnlyStep(stub, 'songs', songs);
+			await saveProviderProgress(stub, {
+				requested_provider,
+				active_provider: 'elevenlabs',
+				actual_provider: 'elevenlabs',
+				fallback_from,
+				fallback_reason,
+			});
+			await settleElevenLabsQuotaFromOutcome(env, {
+				address,
+				reservationId: quotaReservationId,
+				dayKey: quotaDayKey,
+				quotaProvider,
+				smolId,
+				targetSmolId,
+				reusedFromR2: true,
+			});
+		});
+
+		return {
+			songs,
+			song_ids,
+			requested_provider,
+			active_provider: 'elevenlabs',
+			actual_provider: 'elevenlabs',
+			fallback_from,
+			fallback_reason,
+			generation_meta,
+			reused_songs: true,
+		};
+	}
+
+	if (reuseOnly) {
+		throw new NonRetryableError(
+			`Expected reusable ElevenLabs R2 artifact (${existingMusicId}.mp3) is missing; refusing unreserved paid dispatch`
+		);
+	}
+
+	// Require a fresh ElevenLabs-specific reservation before ANY new paid ElevenLabs dispatch
+	const paidQuota = await ensureFreshPaidDispatchQuota({
+		env,
+		stub,
+		step,
+		config,
+		smolId,
+		targetProvider: 'elevenlabs',
+		address,
+		quotaReservationId,
+		quotaDayKey,
+		quotaProvider,
+		reuseOnly,
+	});
 
 	await step.do('record elevenlabs provider state', config, async () => {
 		await saveProviderProgress(stub, {
@@ -349,9 +968,17 @@ async function runElevenLabsGeneration(params: {
 			fallback_from,
 			fallback_reason,
 		});
+		await saveStateOnlyStep(stub, 'quota_reservation_id', paidQuota.reservationId);
+		await saveStateOnlyStep(stub, 'quota_provider', 'elevenlabs');
+		if (paidQuota.dayKey) {
+			await saveStateOnlyStep(stub, 'quota_day_key', paidQuota.dayKey);
+		}
 	});
 
 	// Paid submit step: retries MUST be 0 so an ambiguous response never triggers a silent second charge.
+	// Pre-claim R2 HEAD already ran in the retryable step above; if the provider helper itself discovers
+	// a newly committed R2 artifact (receipt.reused_from_r2 === true), quota is reconciled from reuse outcome
+	// (refunding a fresh successor reservation instead of committing it!).
 	const result = await step.do(
 		stepName,
 		{
@@ -359,39 +986,6 @@ async function runElevenLabsGeneration(params: {
 			retries: { limit: 0, delay: '1 second' },
 		},
 		async () => {
-			// Check R2 first before attempting a paid claim (covers committed prior artifacts cleanly)
-			const existingMusicId = getElevenLabsMusicId(targetSmolId);
-			const existingHead = typeof env.SMOL_BUCKET.head === 'function'
-				? await env.SMOL_BUCKET.head(`${existingMusicId}.mp3`)
-				: null;
-			if (existingHead && existingHead.size > 0) {
-				await updateAttemptIfSupported(stub, {
-					provider: 'elevenlabs',
-					status: 'committed',
-					source_smol_id: targetSmolId,
-					song_ids: [existingMusicId],
-					r2_keys: [`${existingMusicId}.mp3`],
-					upstream_song_id: existingHead.customMetadata?.upstreamSongId,
-					gateway_log_id: existingHead.customMetadata?.gatewayLogId,
-					updated_at: new Date().toISOString(),
-				});
-				return {
-					song: {
-						music_id: existingMusicId,
-						status: 4,
-						audio: getCanonicalSongUrl(existingMusicId),
-						service: 'elevenlabs',
-					} satisfies AiSongGeneratorSong,
-					receipt: {
-						r2_key: `${existingMusicId}.mp3`,
-						bytes: existingHead.size,
-						upstream_song_id: existingHead.customMetadata?.upstreamSongId,
-						gateway_log_id: existingHead.customMetadata?.gatewayLogId,
-						reused_from_r2: true,
-					},
-				};
-			}
-
 			const claim = await claimAttemptIfSupported(stub, 'elevenlabs', {
 				source_smol_id: targetSmolId,
 			});
@@ -422,11 +1016,21 @@ async function runElevenLabsGeneration(params: {
 					updated_at: new Date().toISOString(),
 				});
 
+				await settleElevenLabsQuotaFromOutcome(env, {
+					address,
+					reservationId: paidQuota.reservationId,
+					dayKey: paidQuota.dayKey,
+					quotaProvider: 'elevenlabs',
+					smolId,
+					targetSmolId,
+					reusedFromR2: Boolean(generated.receipt.reused_from_r2),
+				}).catch(() => {});
+
 				return generated;
 			} catch (err) {
 				// Only a confirmed pre-charge rejection (ElevenLabsProviderError with outcome==='rejected')
-				// may mark the attempt 'failed'. Any unknown outcome or unexpected post-dispatch error
-				// MUST record 'ambiguous' so a retry cannot silently charge a second time.
+				// may mark the attempt 'failed' and refund THIS ElevenLabs reservation (any previously
+				// accepted Classic reservation lives on its own row and stays untouched).
 				const isConfirmedRejection = err instanceof ElevenLabsProviderError && err.outcome === 'rejected';
 				const errorCode = err instanceof ElevenLabsProviderError ? err.code : 'storage_commit_failed';
 				const errorMessage = err instanceof Error ? err.message : String(err);
@@ -439,6 +1043,24 @@ async function runElevenLabsGeneration(params: {
 					error_message: errorMessage,
 					updated_at: new Date().toISOString(),
 				});
+
+				if (address && paidQuota.reservationId) {
+					if (isConfirmedRejection) {
+						await refundGenerationQuota(env, {
+							address,
+							reservationId: paidQuota.reservationId,
+							dayKey: paidQuota.dayKey,
+							reason: errorCode,
+						}).catch(() => {});
+					} else {
+						await markAmbiguousGenerationQuota(env, {
+							address,
+							reservationId: paidQuota.reservationId,
+							dayKey: paidQuota.dayKey,
+							reason: errorCode,
+						}).catch(() => {});
+					}
+				}
 
 				await saveStateOnlyStep(stub, 'songs', [{
 					music_id: getElevenLabsMusicId(targetSmolId),
@@ -455,6 +1077,7 @@ async function runElevenLabsGeneration(params: {
 
 	const songs = [result.song];
 	const song_ids = [result.song.music_id];
+	const reusedFromR2 = Boolean(result.receipt.reused_from_r2);
 	const generation_meta: GenerationMeta = {
 		requested_provider,
 		actual_provider: 'elevenlabs',
@@ -472,6 +1095,15 @@ async function runElevenLabsGeneration(params: {
 			fallback_from,
 			fallback_reason,
 		});
+		await settleElevenLabsQuotaFromOutcome(env, {
+			address,
+			reservationId: paidQuota.reservationId,
+			dayKey: paidQuota.dayKey,
+			quotaProvider: 'elevenlabs',
+			smolId,
+			targetSmolId,
+			reusedFromR2,
+		});
 	});
 
 	return {
@@ -483,7 +1115,7 @@ async function runElevenLabsGeneration(params: {
 		fallback_from,
 		fallback_reason,
 		generation_meta,
-		reused_songs: Boolean(result.receipt.reused_from_r2),
+		reused_songs: reusedFromR2,
 	};
 }
 
@@ -604,6 +1236,9 @@ async function reconcileCarriedAttempt(params: {
 	step: WorkflowStep;
 	config: WorkflowStepConfig;
 	smolId: string;
+	address?: string;
+	quotaReservationId?: string;
+	quotaDayKey?: string;
 	retry_id?: string;
 	retry_steps: WorkflowSteps;
 	prompt: string;
@@ -619,6 +1254,9 @@ async function reconcileCarriedAttempt(params: {
 		step,
 		config,
 		smolId,
+		address,
+		quotaReservationId,
+		quotaDayKey,
 		retry_id,
 		retry_steps,
 		prompt,
@@ -658,6 +1296,11 @@ async function reconcileCarriedAttempt(params: {
 				step,
 				config,
 				smolId,
+				address,
+				quotaReservationId,
+				quotaDayKey,
+				quotaProvider: 'elevenlabs',
+				reuseOnly: true,
 				prompt,
 				description,
 				lyrics,
@@ -726,6 +1369,9 @@ async function reconcileCarriedAttempt(params: {
 				step,
 				config,
 				smolId,
+				address,
+				quotaReservationId,
+				quotaDayKey,
 				songIds: resolvedSongIds,
 				prompt,
 				description,
@@ -761,6 +1407,9 @@ async function reconcileCarriedAttempt(params: {
 				step,
 				config,
 				smolId,
+				address,
+				quotaReservationId,
+				quotaDayKey,
 				songIds: discoveredIds,
 				prompt,
 				description,
@@ -795,6 +1444,11 @@ export async function generateOrReuseSongs(params: {
 	step: WorkflowStep;
 	config: WorkflowStepConfig;
 	smolId: string;
+	address?: string;
+	quotaReservationId?: string;
+	quotaDayKey?: string;
+	quotaProvider?: MusicProvider;
+	quotaReuseOnly?: boolean;
 	retry_id?: string;
 	retry_steps: WorkflowSteps | undefined;
 	prompt: string;
@@ -811,6 +1465,11 @@ export async function generateOrReuseSongs(params: {
 		step,
 		config,
 		smolId,
+		address,
+		quotaReservationId,
+		quotaDayKey,
+		quotaProvider,
+		quotaReuseOnly,
 		retry_id,
 		retry_steps,
 		prompt,
@@ -834,20 +1493,8 @@ export async function generateOrReuseSongs(params: {
 	// Already-paid completed tracks are reused rather than discarded for a second charge.
 	// AISG snapshots MUST have 2 distinct matching IDs; legitimate ElevenLabs & non-AISG singles pass.
 	// =========================================================================
-	const retrySongIds = toDistinctStringIds(retry_steps?.song_ids);
 	const retrySongs = Array.isArray(retry_steps?.songs) ? retry_steps!.songs! : [];
-	const distinctRetrySongMusicIds = toDistinctStringIds(
-		retrySongs.map((s) => s?.music_id).filter((id): id is string => Boolean(id))
-	);
-	const isExplicitAisgSnapshot = previousProvider === 'aisonggenerator'
-		|| retrySongs.some((s) => (s.service || s.provider || '').toLowerCase() === 'aisonggenerator');
-	const requiredTrackCount = isExplicitAisgSnapshot ? EXPECTED_AISG_TRACK_COUNT : 1;
-	const songIdsMatchRetrySongs = distinctRetrySongMusicIds.length === retrySongs.length
-		&& distinctRetrySongMusicIds.length === retrySongIds.length
-		&& distinctRetrySongMusicIds.every((id) => retrySongIds.includes(id));
-	const hasCompleteSongs = retrySongs.length >= requiredTrackCount
-		&& songIdsMatchRetrySongs
-		&& retrySongs.every((s) => Boolean(s?.music_id && s.status >= 4 && s.audio));
+	const hasCompleteSongs = hasReusableCompleteSongs(retry_steps);
 
 	if (hasCompleteSongs) {
 		let songs = retrySongs;
@@ -895,6 +1542,14 @@ export async function generateOrReuseSongs(params: {
 				fallback_from: fallbackFrom,
 				fallback_reason: fallbackReason,
 			});
+			if (address && quotaReservationId && actualProvider) {
+				await commitGenerationQuota(env, {
+					address,
+					reservationId: quotaReservationId,
+					actualProvider,
+					dayKey: quotaDayKey,
+				});
+			}
 		});
 
 		return {
@@ -926,6 +1581,9 @@ export async function generateOrReuseSongs(params: {
 			step,
 			config,
 			smolId,
+			address,
+			quotaReservationId,
+			quotaDayKey,
 			retry_id,
 			retry_steps,
 			prompt,
@@ -958,6 +1616,11 @@ export async function generateOrReuseSongs(params: {
 			step,
 			config,
 			smolId,
+			address,
+			quotaReservationId,
+			quotaDayKey,
+			quotaProvider,
+			reuseOnly: quotaReuseOnly,
 			prompt,
 			description,
 			lyrics,
@@ -1050,6 +1713,14 @@ export async function generateOrReuseSongs(params: {
 					active_provider: 'aisonggenerator',
 					actual_provider: 'aisonggenerator',
 				});
+				if (address && quotaReservationId) {
+					await commitGenerationQuota(env, {
+						address,
+						reservationId: quotaReservationId,
+						actualProvider: 'aisonggenerator',
+						dayKey: quotaDayKey,
+					});
+				}
 			});
 
 			return {
@@ -1075,6 +1746,9 @@ export async function generateOrReuseSongs(params: {
 				step,
 				config,
 				smolId,
+				address,
+				quotaReservationId,
+				quotaDayKey,
 				songIds: targetIds,
 				prompt,
 				description,
@@ -1088,15 +1762,41 @@ export async function generateOrReuseSongs(params: {
 		// Confirmed terminal failure on existing AISG songs
 		if (quickCheck.state === 'terminal_failed') {
 			if (!quickCheck.failure.fallbackEligible) {
+				if (address && quotaReservationId) {
+					await step.do('mark failed aisg quota non-refundable', config, () =>
+						markAmbiguousGenerationQuota(env, {
+							address,
+							reservationId: quotaReservationId,
+							dayKey: quotaDayKey,
+							reason: quickCheck.failure.code,
+						})
+					);
+				}
 				throw new NonRetryableError(`Song generation failed (${quickCheck.failure.code}): ${quickCheck.failure.message}`);
 			}
 			if (override_provider === 'elevenlabs') {
+				const fallbackAuth = await authorizeElevenLabsFallbackQuota({
+					env,
+					stub,
+					step,
+					config,
+					smolId,
+					address,
+					quotaReservationId,
+					quotaDayKey,
+					aisgWasUnbilled: false,
+					failureReason: quickCheck.failure.code,
+				});
 				return await runElevenLabsGeneration({
 					env,
 					stub,
 					step,
 					config,
 					smolId,
+					address,
+					quotaReservationId: fallbackAuth.reservationId,
+					quotaDayKey: fallbackAuth.dayKey,
+					quotaProvider: 'elevenlabs',
 					prompt,
 					description,
 					lyrics,
@@ -1105,12 +1805,28 @@ export async function generateOrReuseSongs(params: {
 				});
 			}
 			if (isFallbackEnabled(env)) {
+				const fallbackAuth = await authorizeElevenLabsFallbackQuota({
+					env,
+					stub,
+					step,
+					config,
+					smolId,
+					address,
+					quotaReservationId,
+					quotaDayKey,
+					aisgWasUnbilled: false,
+					failureReason: quickCheck.failure.code,
+				});
 				return await runElevenLabsGeneration({
 					env,
 					stub,
 					step,
 					config,
 					smolId,
+					address,
+					quotaReservationId: fallbackAuth.reservationId,
+					quotaDayKey: fallbackAuth.dayKey,
+					quotaProvider: 'elevenlabs',
 					prompt,
 					description,
 					lyrics,
@@ -1120,18 +1836,26 @@ export async function generateOrReuseSongs(params: {
 					fallback_reason: quickCheck.failure.code,
 				});
 			}
+			if (address && quotaReservationId) {
+				await step.do('mark failed aisg quota non-refundable', config, () =>
+					markAmbiguousGenerationQuota(env, {
+						address,
+						reservationId: quotaReservationId,
+						dayKey: quotaDayKey,
+						reason: quickCheck.failure.code,
+					})
+				);
+			}
 			throw new NonRetryableError(`Song generation failed (${quickCheck.failure.code}): ${quickCheck.failure.message}`);
 		}
 	}
 
 	// Refuse incomplete historical AISG snapshot (e.g. 1 completed AISG track without song_ids or task_id)
 	// rather than falling through to a fresh paid submission.
-	if (
-		isExplicitAisgSnapshot
-		&& distinctRetrySongMusicIds.length > 0
-		&& distinctRetrySongMusicIds.length < EXPECTED_AISG_TRACK_COUNT
-		&& retrySongs.every((s) => typeof s.status !== 'number' || s.status >= 0)
-	) {
+	if (hasIncompleteAisgSnapshot(retry_steps)) {
+		const distinctRetrySongMusicIds = toDistinctStringIds(
+			retrySongs.map((s) => s?.music_id).filter((id): id is string => Boolean(id))
+		);
 		throw new NonRetryableError(
 			`Incomplete historical AISG snapshot (${distinctRetrySongMusicIds.length}/${EXPECTED_AISG_TRACK_COUNT} tracks); refusing singleton publish or duplicate charge`
 		);
@@ -1147,6 +1871,11 @@ export async function generateOrReuseSongs(params: {
 			step,
 			config,
 			smolId,
+			address,
+			quotaReservationId,
+			quotaDayKey,
+			quotaProvider,
+			reuseOnly: quotaReuseOnly,
 			prompt,
 			description,
 			lyrics,
@@ -1159,12 +1888,33 @@ export async function generateOrReuseSongs(params: {
 	// PATH 3B: Fresh AISG v6 generation (split submit -> paginated discovery -> bounded poll -> R2)
 	// with automatic fallback to ElevenLabs STRICTLY on confirmed eligible failures
 	// =========================================================================
+	const paidAisgQuota = await ensureFreshPaidDispatchQuota({
+		env,
+		stub,
+		step,
+		config,
+		smolId,
+		targetProvider: 'aisonggenerator',
+		address,
+		quotaReservationId,
+		quotaDayKey,
+		quotaProvider,
+		reuseOnly: quotaReuseOnly,
+	});
+	const activeAisgReservationId = paidAisgQuota.reservationId;
+	const activeAisgDayKey = paidAisgQuota.dayKey;
+
 	await step.do('record aisonggenerator provider state', config, async () => {
 		await saveProviderProgress(stub, {
 			requested_provider: 'aisonggenerator',
 			active_provider: 'aisonggenerator',
 			actual_provider: null,
 		});
+		await saveStateOnlyStep(stub, 'quota_reservation_id', activeAisgReservationId);
+		await saveStateOnlyStep(stub, 'quota_provider', 'aisonggenerator');
+		if (activeAisgDayKey) {
+			await saveStateOnlyStep(stub, 'quota_day_key', activeAisgDayKey);
+		}
 	});
 
 	const aisgAttemptId = `smol-${smolId}-aisg`;
@@ -1248,6 +1998,15 @@ export async function generateOrReuseSongs(params: {
 						updated_at: new Date().toISOString(),
 					});
 
+					if (err.outcome === 'unknown' && address && activeAisgReservationId) {
+						await markAmbiguousGenerationQuota(env, {
+							address,
+							reservationId: activeAisgReservationId,
+							dayKey: activeAisgDayKey,
+							reason: err.code,
+						}).catch(() => {});
+					}
+
 					return {
 						ok: false,
 						code: err.code,
@@ -1268,6 +2027,15 @@ export async function generateOrReuseSongs(params: {
 					updated_at: new Date().toISOString(),
 				});
 
+				if (address && activeAisgReservationId) {
+					await markAmbiguousGenerationQuota(env, {
+						address,
+						reservationId: activeAisgReservationId,
+						dayKey: activeAisgDayKey,
+						reason: 'submit_outcome_unknown',
+					}).catch(() => {});
+				}
+
 				return {
 					ok: false,
 					code: 'submit_outcome_unknown',
@@ -1281,17 +2049,43 @@ export async function generateOrReuseSongs(params: {
 
 	if (!submitOutcome.ok) {
 		if (submitOutcome.outcome === 'unknown') {
+			if (address && activeAisgReservationId) {
+				await step.do('mark ambiguous aisg quota', config, () =>
+					markAmbiguousGenerationQuota(env, {
+						address,
+						reservationId: activeAisgReservationId,
+						dayKey: activeAisgDayKey,
+						reason: submitOutcome.code,
+					})
+				);
+			}
 			throw new NonRetryableError(
 				`AISG submission outcome unknown (${submitOutcome.code}): ${submitOutcome.message}`
 			);
 		}
 		if (submitOutcome.fallbackEligible && isFallbackEnabled(env)) {
+			const fallbackAuth = await authorizeElevenLabsFallbackQuota({
+				env,
+				stub,
+				step,
+				config,
+				smolId,
+				address,
+				quotaReservationId: activeAisgReservationId,
+				quotaDayKey: activeAisgDayKey,
+				aisgWasUnbilled: true,
+				failureReason: submitOutcome.code,
+			});
 			return await runElevenLabsGeneration({
 				env,
 				stub,
 				step,
 				config,
 				smolId,
+				address,
+				quotaReservationId: fallbackAuth.reservationId,
+				quotaDayKey: fallbackAuth.dayKey,
+				quotaProvider: 'elevenlabs',
 				prompt,
 				description,
 				lyrics,
@@ -1301,15 +2095,23 @@ export async function generateOrReuseSongs(params: {
 				fallback_reason: submitOutcome.code,
 			});
 		}
-		await step.do('save failed song state', config, () =>
-			saveStateOnlyStep(stub, 'songs', [{
+		await step.do('save failed song state', config, async () => {
+			if (address && activeAisgReservationId) {
+				await refundGenerationQuota(env, {
+					address,
+					reservationId: activeAisgReservationId,
+					dayKey: activeAisgDayKey,
+					reason: submitOutcome.code,
+				});
+			}
+			await saveStateOnlyStep(stub, 'songs', [{
 				music_id: smolId,
 				status: submitOutcome.code === 'content_policy' ? -1 : -4,
 				audio: '',
 				service: 'aisonggenerator',
 				error_message: submitOutcome.message,
-			}])
-		);
+			}]);
+		});
 		throw new NonRetryableError(`AISG generation rejected (${submitOutcome.code}): ${submitOutcome.message}`);
 	}
 
@@ -1349,6 +2151,9 @@ export async function generateOrReuseSongs(params: {
 		step,
 		config,
 		smolId,
+		address,
+		quotaReservationId: activeAisgReservationId,
+		quotaDayKey: activeAisgDayKey,
 		songIds,
 		prompt,
 		description,
@@ -1416,6 +2221,9 @@ async function pollAndCommitAisgOrFallback(params: {
 	step: WorkflowStep;
 	config: WorkflowStepConfig;
 	smolId: string;
+	address?: string;
+	quotaReservationId?: string;
+	quotaDayKey?: string;
 	songIds: string[];
 	prompt: string;
 	description: string;
@@ -1430,6 +2238,9 @@ async function pollAndCommitAisgOrFallback(params: {
 		step,
 		config,
 		smolId,
+		address,
+		quotaReservationId,
+		quotaDayKey,
 		songIds,
 		prompt,
 		description,
@@ -1555,12 +2366,28 @@ async function pollAndCommitAisgOrFallback(params: {
 		});
 
 		if (terminalFailure.fallbackEligible && isFallbackEnabled(env)) {
+			const fallbackAuth = await authorizeElevenLabsFallbackQuota({
+				env,
+				stub,
+				step,
+				config,
+				smolId,
+				address,
+				quotaReservationId,
+				quotaDayKey,
+				aisgWasUnbilled: false,
+				failureReason: terminalFailure.code,
+			});
 			return await runElevenLabsGeneration({
 				env,
 				stub,
 				step,
 				config,
 				smolId,
+				address,
+				quotaReservationId: fallbackAuth.reservationId,
+				quotaDayKey: fallbackAuth.dayKey,
+				quotaProvider: 'elevenlabs',
 				prompt,
 				description,
 				lyrics,
@@ -1569,6 +2396,17 @@ async function pollAndCommitAisgOrFallback(params: {
 				fallback_from: 'aisonggenerator',
 				fallback_reason: terminalFailure.code,
 			});
+		}
+
+		if (address && quotaReservationId) {
+			await step.do('mark failed aisg quota non-refundable', config, () =>
+				markAmbiguousGenerationQuota(env, {
+					address,
+					reservationId: quotaReservationId,
+					dayKey: quotaDayKey,
+					reason: terminalFailure!.code,
+				})
+			);
 		}
 
 		throw new NonRetryableError(`Song generation failed (${terminalFailure.code}): ${terminalFailure.message}`);
@@ -1590,6 +2428,14 @@ async function pollAndCommitAisgOrFallback(params: {
 			r2_keys: committed.map((s) => `${s.music_id}.mp3`),
 			updated_at: new Date().toISOString(),
 		});
+		if (address && quotaReservationId) {
+			await commitGenerationQuota(env, {
+				address,
+				reservationId: quotaReservationId,
+				actualProvider: 'aisonggenerator',
+				dayKey: quotaDayKey,
+			}).catch(() => {});
+		}
 		return committed;
 	});
 
@@ -1602,6 +2448,14 @@ async function pollAndCommitAisgOrFallback(params: {
 			active_provider: 'aisonggenerator',
 			actual_provider: 'aisonggenerator',
 		});
+		if (address && quotaReservationId) {
+			await commitGenerationQuota(env, {
+				address,
+				reservationId: quotaReservationId,
+				actualProvider: 'aisonggenerator',
+				dayKey: quotaDayKey,
+			});
+		}
 	});
 
 	return {
