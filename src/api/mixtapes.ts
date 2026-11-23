@@ -799,28 +799,67 @@ mixtapes.post('/check-uniqueness', parseAuth, async (c) => {
 const REPLAY_POLL_MS = 40
 const REPLAY_WAIT_MS = 2000
 const MAX_CREATE_ATTEMPTS = 2
+const CLAIM_IN_PROGRESS = 0
+const CLAIM_FINALIZED = 1
+const CLAIM_FAILED = 2
+/** An in-progress claim older than this is considered abandoned and may be recovered. */
+const CLAIM_STALE_AFTER = '-30 seconds'
 
-/** The committed state of an existing winner, as a 200 idempotent-retry receipt. */
-async function dedupedResponse(c: Context<HonoEnv>, sub: string, winner: MixtapeRow) {
-	const { rows, publicSmols } = await loadCohortSnapshot(c.env, sub)
-	const current = rows.find((row) => row.Id === winner.Id) ?? winner
-	const { decisions } = await deriveDecisions(rows, publicSmols)
-	return privateJson(c, { ...writeReceipt(current, decisions.get(winner.Id)!), deduplicated: true })
-}
+type ClaimWait =
+	| { state: 'finalized' | 'recoverable'; mixtapeId: string }
+	| { state: 'pending' | 'gone' }
 
 /**
  * Wait (briefly) until the winning create has committed its cohort classification, so a
- * concurrent replay reports the same final visibility as the winner's 201.
+ * concurrent replay reports the same final visibility as the winner's 201. Never reports
+ * success for an unfinished or failed classification.
  */
-async function awaitFinalizedClaim(env: Env, key: string): Promise<string | null> {
+async function awaitClaim(env: Env, key: string): Promise<ClaimWait> {
 	const deadline = Date.now() + REPLAY_WAIT_MS
 	for (;;) {
-		const claim = await env.SMOL_D1.prepare('SELECT Mixtape_Id, Finalized FROM MixtapeRetryClaim WHERE Retry_Key = ?1')
-			.bind(key).first<{ Mixtape_Id: string; Finalized: number }>()
-		if (!claim) return null
-		if (claim.Finalized === 1 || Date.now() >= deadline) return claim.Mixtape_Id
+		const claim = await env.SMOL_D1.prepare(`
+			SELECT Mixtape_Id, Finalized, Created_At <= datetime('now', '${CLAIM_STALE_AFTER}') AS Stale
+			FROM MixtapeRetryClaim WHERE Retry_Key = ?1
+		`).bind(key).first<{ Mixtape_Id: string; Finalized: number; Stale: number }>()
+		if (!claim) return { state: 'gone' }
+		if (claim.Finalized === CLAIM_FINALIZED) return { state: 'finalized', mixtapeId: claim.Mixtape_Id }
+		if (claim.Finalized === CLAIM_FAILED || claim.Stale) return { state: 'recoverable', mixtapeId: claim.Mixtape_Id }
+		if (Date.now() >= deadline) return { state: 'pending' }
 		await new Promise((resolve) => setTimeout(resolve, REPLAY_POLL_MS))
 	}
+}
+
+async function markClaim(env: Env, key: string, mixtapeId: string, state: typeof CLAIM_FINALIZED | typeof CLAIM_FAILED) {
+	await env.SMOL_D1.prepare('UPDATE MixtapeRetryClaim SET Finalized = ?3 WHERE Retry_Key = ?1 AND Mixtape_Id = ?2')
+		.bind(key, mixtapeId, state).run()
+}
+
+/**
+ * Classify a claimed create (Tier 1 + borderline Tier 2) and flip its claim to FINALIZED only once
+ * that commits; on failure flip it to FAILED (never finalized) so a replay can recover the row.
+ */
+async function classifyClaimedCreate(env: Env, sub: string, key: string, mixtapeId: string): Promise<CohortResult> {
+	try {
+		const cohort = await reevaluateOwnerCohort(env, sub, { subjectId: mixtapeId, allowAi: true })
+		await markClaim(env, key, mixtapeId, CLAIM_FINALIZED)
+		return cohort
+	} catch (error) {
+		await markClaim(env, key, mixtapeId, CLAIM_FAILED).catch((markError) => console.warn('mixtape_retry_mark_failed', markError))
+		throw error
+	}
+}
+
+/** Retry identity of a live row's CURRENT content (owner, ordered smols, normalized title & desc). */
+function rowRetryKey(row: MixtapeRow): Promise<string> {
+	return retryKey(row.Address, row.Smols, row.Title, row.Desc ?? '')
+}
+
+function createPending(c: Context<HonoEnv>) {
+	return c.json(
+		{ error: 'Mixtape creation is still finishing; please retry', code: 'create_pending' },
+		503,
+		{ ...PRIVATE_HEADERS, 'Retry-After': '1' },
+	)
 }
 
 // Create new mixtape
@@ -879,27 +918,53 @@ mixtapes.post('/', parseAuth, async (c) => {
 
 		if (results[3]?.meta?.changes === 1) {
 			return await afterCommit(c, [id], async (purgeIds) => {
-				try {
-					const cohort = await reevaluateOwnerCohort(env, sub, { subjectId: id, allowAi: true })
-					cohort.changedIds.forEach((changed) => purgeIds.add(changed))
-					const { row, decision } = cohortView(cohort, id)
-					return privateJson(c, { ...writeReceipt(row, decision), deduplicated: false }, 201)
-				} finally {
-					// Classification committed (or failed): release any replay waiting on this claim.
-					await env.SMOL_D1.prepare('UPDATE MixtapeRetryClaim SET Finalized = 1 WHERE Retry_Key = ?1 AND Mixtape_Id = ?2')
-						.bind(key, id).run().catch((error) => console.warn('mixtape_retry_finalize_failed', error))
-				}
+				const cohort = await classifyClaimedCreate(env, sub, key, id)
+				cohort.changedIds.forEach((changed) => purgeIds.add(changed))
+				const { row, decision } = cohortView(cohort, id)
+				return privateJson(c, { ...writeReceipt(row, decision), deduplicated: false }, 201)
 			})
 		}
 
-		const winnerId = await awaitFinalizedClaim(env, key)
-		const winner = winnerId ? await loadMixtapeRow(env, winnerId) : null
-		if (winner && !winner.Deleted_At && await retryKey(winner.Address, winner.Smols, winner.Title, winner.Desc) === key) {
-			return await dedupedResponse(c, sub, winner)
+		// Replay of an existing claim: wait for the winner, recover a failed/abandoned one.
+		let wait = await awaitClaim(env, key)
+		let cohort: CohortResult | null = null
+		while (wait.state === 'recoverable') {
+			const takeover = await env.SMOL_D1.prepare(`
+				UPDATE MixtapeRetryClaim SET Finalized = ${CLAIM_IN_PROGRESS}, Created_At = CURRENT_TIMESTAMP
+				WHERE Retry_Key = ?1 AND Mixtape_Id = ?2
+					AND (Finalized = ${CLAIM_FAILED} OR (Finalized = ${CLAIM_IN_PROGRESS} AND Created_At <= datetime('now', '${CLAIM_STALE_AFTER}')))
+			`).bind(key, wait.mixtapeId).run()
+			if (takeover.meta?.changes === 1) {
+				// This request now owns recovery of the EXISTING row: classify it (no second insert).
+				const recoveredId = wait.mixtapeId
+				cohort = await afterCommit(c, [recoveredId], async (purgeIds) => {
+					const result = await classifyClaimedCreate(env, sub, key, recoveredId)
+					result.changedIds.forEach((changed) => purgeIds.add(changed))
+					return result
+				})
+				wait = { state: 'finalized', mixtapeId: recoveredId }
+				break
+			}
+			wait = await awaitClaim(env, key) // someone else recovered it first
 		}
-		// The claim holder vanished or was edited away meanwhile: claim again.
+		if (wait.state === 'pending') return createPending(c)
+		if (wait.state !== 'finalized') continue // claim vanished: claim again
+
+		// Build the receipt from ONE cohort snapshot, and only if that very row is live and still
+		// has this exact normalized content (owner, ordered smols, title, description).
+		const snapshot = cohort ?? { ...(await loadCohortSnapshot(env, sub)), decisions: null }
+		const row = snapshot.rows.find((candidate) => candidate.Id === wait.mixtapeId)
+		if (!row || await rowRetryKey(row) !== key) {
+			// Deleted or edited away since the claim: release it and create afresh (bounded).
+			await env.SMOL_D1.prepare('DELETE FROM MixtapeRetryClaim WHERE Retry_Key = ?1 AND Mixtape_Id = ?2').bind(key, wait.mixtapeId).run()
+			continue
+		}
+		const decisions = snapshot.decisions ?? (await deriveDecisions(snapshot.rows, snapshot.publicSmols)).decisions
+		const decision = decisions.get(row.Id)
+		if (!decision) continue
+		return privateJson(c, { ...writeReceipt(row, decision), deduplicated: true })
 	}
-	throw new HTTPException(409, { message: 'An identical mixtape is being created; try again' })
+	throw new HTTPException(409, { message: 'An identical mixtape was just changed or removed; try again' })
 })
 
 /** Terminal live target of a merged mixtape. Cycle-safe, no hop limit (writes flatten aliases). */

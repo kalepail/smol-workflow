@@ -49,13 +49,14 @@ INSERT OR IGNORE INTO MixtapeState (Id, Epoch) VALUES (1, 0);
 -- Atomic idempotency claim for POST /mixtapes exact retries (15-minute window). The claim and
 -- the Mixtapes INSERT run in one batch, so simultaneous identical creates never produce a
 -- provisional duplicate row. Retry_Key = SHA-256(owner, ordered smols, normalized title/desc).
--- Finalized flips to 1 once the winning create's cohort classification has committed, so a
--- concurrent replay can wait for (and report) the same final visibility as the winner.
+-- Finalized: 0 = classification in progress, 1 = classification committed, 2 = classification
+-- failed. A concurrent replay waits for 1 (and reports the winner's final visibility), gets a
+-- retryable 503 while 0 is fresh, and takes over recovery of the SAME row when 2 or abandoned.
 CREATE TABLE IF NOT EXISTS MixtapeRetryClaim (
     Retry_Key TEXT PRIMARY KEY,
     Mixtape_Id TEXT NOT NULL,
     Created_At DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    Finalized INTEGER NOT NULL DEFAULT 0 CHECK (Finalized IN (0, 1))
+    Finalized INTEGER NOT NULL DEFAULT 0 CHECK (Finalized IN (0, 1, 2))
 );
 
 CREATE INDEX IF NOT EXISTS idx_mixtape_retry_claim_created

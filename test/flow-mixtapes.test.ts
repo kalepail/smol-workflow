@@ -1134,3 +1134,111 @@ test('Pass 3 P2: non-200 public responses (deleted / merged / unknown 404) are n
 	const restored = await h.send(`/mixtapes/${CORDOVA}`)
 	assert.deepEqual([restored.status, restored.headers.get('Cache-Control'), restored.headers.get('CDN-Cache-Control')], [200, 'public, max-age=0, must-revalidate', 'public, s-maxage=60, stale-while-revalidate=120'], 'undo is visible immediately')
 })
+
+// ---------------------------------------------------------------------------
+// Pass-4 regressions (reports/25b-review-mixtape-be.md §Pass 4)
+// ---------------------------------------------------------------------------
+
+const CLASSIFY_BATCH = 'UPDATE MixtapeState SET Epoch = -1 WHERE Id = 1 AND Epoch != ?1'
+const OWNER_ROWS_READ = /"Address" = \?1 AND Deleted_At IS NULL AND Visibility != 'deleted'/
+
+async function seedBiggerSibling(h: ReturnType<typeof buildHarness>) {
+	const bigger = (await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title: 'Full set', smols: [1, 2, 3, 4, 6, 7, 8].map(SYN) } })).body.id as string
+	h.backdate(bigger, 60)
+	return bigger
+}
+const countTitled = (h: ReturnType<typeof buildHarness>, title: string) => (h.db.prepare('SELECT COUNT(*) AS n FROM Mixtapes WHERE Title = ?').get(title) as { n: number }).n
+const claimState = (h: ReturnType<typeof buildHarness>, id: string) => (h.db.prepare('SELECT Finalized FROM MixtapeRetryClaim WHERE Mixtape_Id = ?').get(id) as { Finalized: number } | undefined)?.Finalized
+
+test('Pass 4 P2-1a: a replay that outlasts an unfinished classification gets a retryable 503, never a premature 200', async () => {
+	const h = buildHarness({ ai: async () => clefAnswer(0.95) })
+	await seedBiggerSibling(h)
+	let release!: () => void
+	const gate = new Promise<void>((resolve) => { release = resolve })
+	let held = false
+	h.hooks.onStatement = async (sql) => {
+		if (!held && sql.includes(CLASSIFY_BATCH)) {
+			held = true
+			await gate // the winner's classification commit is stuck past the replay deadline
+		}
+	}
+	const body = { title: 'Early set', smols: [1, 2, 3, 4, 5].map(SYN) }
+	const pendingWinner = h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	while (!held) await tick()
+
+	const replay = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	assert.deepEqual([replay.status, replay.body.code], [503, 'create_pending'])
+	assert.equal(replay.res.headers.get('Retry-After'), '1')
+	assert.equal(replay.res.headers.get('Cache-Control'), 'private, no-store')
+
+	release()
+	const winner = await pendingWinner
+	h.hooks.onStatement = undefined
+	assert.deepEqual([winner.status, winner.body.visibility, winner.body.hiddenReason], [201, 'owner', 'semantic_duplicate'])
+	assert.equal(claimState(h, winner.body.id), 1)
+	const retried = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	assert.deepEqual([retried.status, retried.body.id, retried.body.visibility, retried.body.hiddenReason], [200, winner.body.id, 'owner', 'semantic_duplicate'])
+	assert.equal(countTitled(h, 'Early set'), 1)
+})
+
+test('Pass 4 P2-1b: a failed or abandoned classification is recovered by a replay on the SAME row', async () => {
+	const h = buildHarness({ ai: async () => clefAnswer(0.95) })
+	await seedBiggerSibling(h)
+	let failed = false
+	h.hooks.onStatement = (sql) => {
+		if (!failed && sql.includes(CLASSIFY_BATCH)) {
+			failed = true
+			throw new Error('D1_ERROR: transient network error')
+		}
+	}
+	const body = { title: 'Early set', smols: [1, 2, 3, 4, 5].map(SYN) }
+	const winner = await h.send('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	h.hooks.onStatement = undefined
+	assert.equal(winner.status, 500)
+	const id = (h.db.prepare(`SELECT Id FROM Mixtapes WHERE Title = 'Early set'`).get() as { Id: string }).Id
+	assert.equal(claimState(h, id), 2, 'failure is recorded as FAILED, never finalized')
+	assert.equal(h.row(id)!.Ai_Verdict, null, 'no verdict persisted yet')
+
+	const recovered = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	assert.deepEqual([recovered.status, recovered.body.id, recovered.body.deduplicated], [200, id, true])
+	assert.deepEqual([recovered.body.visibility, recovered.body.hiddenReason], ['owner', 'semantic_duplicate'], 'the true persisted verdict')
+	assert.equal(JSON.parse(h.row(id)!.Ai_Verdict).p, 0.95)
+	assert.equal(claimState(h, id), 1)
+	assert.equal(countTitled(h, 'Early set'), 1, 'zero second mixtape inserted')
+
+	// An abandoned in-progress claim (>= 30 s old) is recovered the same way.
+	const other = { title: 'Solo pair', smols: [SYN(40), SYN(41)] }
+	const created = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: other })
+	h.db.prepare(`UPDATE MixtapeRetryClaim SET Finalized = 0, Created_At = datetime('now', '-60 seconds') WHERE Mixtape_Id = ?`).run(created.body.id)
+	const takeover = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: other })
+	assert.deepEqual([takeover.status, takeover.body.id, takeover.body.visibility], [200, created.body.id, 'public'])
+	assert.equal(claimState(h, created.body.id), 1)
+	assert.equal(countTitled(h, 'Solo pair'), 1)
+})
+
+test('Pass 4 P2-2: a delete or edit between replay reads never yields a 500 or a false 200', async () => {
+	for (const change of ['delete', 'edit'] as const) {
+		const h = buildHarness()
+		const body = { title: `Replay ${change}`, smols: [SYN(1), SYN(2)] }
+		const original = (await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })).body.id as string
+		let fired = false
+		h.hooks.onStatement = (sql, args) => {
+			if (fired || !OWNER_ROWS_READ.test(sql) || args[0] !== NEW_OWNER) return
+			fired = true // the replay has seen the finalized claim; now the owner changes the row
+			if (change === 'delete') {
+				h.write(`UPDATE Mixtapes SET Deleted_At = CURRENT_TIMESTAMP, Visibility = 'deleted', Hidden_Reason = 'deleted', Revision = Revision + 1 WHERE Id = ?`, original)
+			} else {
+				h.write('UPDATE Mixtapes SET Title = ?, Smols = ?, Revision = Revision + 1 WHERE Id = ?', 'Something else', [SYN(7), SYN(8)].join(','), original)
+			}
+		}
+		const replay = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+		h.hooks.onStatement = undefined
+		assert.equal(fired, true, change)
+		assert.equal(replay.status, 201, `${change}: re-enters create instead of 500 / false dedupe`)
+		assert.notEqual(replay.body.id, original)
+		assert.equal(replay.body.deduplicated, false)
+		assert.equal(h.row(replay.body.id)!.Title, body.title, `${change}: the new row has the requested content`)
+		if (change === 'edit') assert.equal(h.row(original)!.Title, 'Something else', 'edited row untouched')
+		assert.equal((h.db.prepare('SELECT COUNT(*) AS n FROM Mixtapes WHERE Title = ? AND Deleted_At IS NULL').get(body.title) as { n: number }).n, 1)
+	}
+})
