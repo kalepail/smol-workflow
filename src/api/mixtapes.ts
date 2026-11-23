@@ -926,8 +926,9 @@ async function classifyClaimedCreate(env: Env, sub: string, key: string, mixtape
 		// that still has exactly the requested content (same snapshot) may be finalized/reported.
 		const row = cohort.rows.find((candidate) => candidate.Id === mixtapeId)
 		if (!row || await rowRetryKey(row) !== key) {
-			await markClaim(env, key, mixtapeId, token, CLAIM_FAILED)
-			return { cohort, outcome: 'conflict' }
+			// Owned conflict (we still held the claim and released it as FAILED) vs lost ownership.
+			const owned = await markClaim(env, key, mixtapeId, token, CLAIM_FAILED)
+			return { cohort, outcome: owned ? 'conflict' : 'superseded' }
 		}
 		const owned = await markClaim(env, key, mixtapeId, token, cohort.committed ? CLAIM_FINALIZED : CLAIM_FAILED)
 		// A recovery took this claim over meanwhile: our classification is no longer authoritative.
@@ -970,6 +971,7 @@ mixtapes.post('/', parseAuth, async (c) => {
 	// Claim the normalized retry identity and insert the row in ONE batch: whoever holds the claim
 	// owns the only row, so no provisional duplicate row is ever created or visible.
 	const key = await retryKey(sub, smolsString, title, desc)
+	let conflictId: string | undefined
 	for (let attempt = 0; attempt < MAX_CREATE_ATTEMPTS; attempt += 1) {
 		// A claim stands while its mixtape is live, inside the window and its CURRENT content still
 		// has this retry identity (a no-op PATCH keeps the protection; a real edit releases it).
@@ -1039,9 +1041,18 @@ mixtapes.post('/', parseAuth, async (c) => {
 					return result
 				})
 				if (recovery.outcome === 'not_committed') return createPending(c)
-				if (recovery.outcome === 'superseded' || recovery.outcome === 'conflict') {
+				if (recovery.outcome === 'conflict') {
+					// The owner deleted/edited the row while WE held recovery: nobody else is working
+					// on this claim, so go straight back into the bounded atomic replacement check.
+					conflictId = recoveredId
+					cohort = null
+					wait = { state: 'gone' }
+					break
+				}
+				if (recovery.outcome === 'superseded') {
 					const current = await currentClaimResponse(c, sub, key, recoveredId, 200)
 					if (current) return current
+					conflictId = recoveredId
 					cohort = null
 					wait = { state: 'gone' }
 					break // re-enter the bounded, atomic claim check
@@ -1060,6 +1071,7 @@ mixtapes.post('/', parseAuth, async (c) => {
 		const snapshot = cohort ?? { ...(await loadCohortSnapshot(env, sub)), decisions: null }
 		const row = snapshot.rows.find((candidate) => candidate.Id === wait.mixtapeId)
 		if (!row || await rowRetryKey(row) !== key) {
+			conflictId = wait.mixtapeId
 			// Deleted or edited away since the claim. Never release it here: the next iteration's
 			// replacement batch re-validates the claim (still absent / still divergent) and replaces
 			// it together with the new row in ONE transaction, so an Undo/restore at any point in
@@ -1071,7 +1083,7 @@ mixtapes.post('/', parseAuth, async (c) => {
 		if (!decision) continue
 		return privateJson(c, { ...writeReceipt(row, decision), deduplicated: true })
 	}
-	throw new HTTPException(409, { message: 'An identical mixtape was just changed or removed; try again' })
+	return createConflict(c, conflictId)
 })
 
 /** Terminal live target of a merged mixtape. Cycle-safe, no hop limit (writes flatten aliases). */

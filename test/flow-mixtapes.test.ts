@@ -1594,3 +1594,53 @@ test('Pass 8 P2c: an owner DELETE right after commit on PATCH, restore and merge
 	)
 	assert.deepEqual([h.row(source)!.Hidden_Reason, h.row(source)!.Related_Mixtape_Id], ['merged', target], 'the merge committed')
 })
+
+// ---------------------------------------------------------------------------
+// Pass-9 regression (reports/25b-review-mixtape-be.md §Pass 9)
+// ---------------------------------------------------------------------------
+
+test('Pass 9 P2: an owner DELETE or PATCH while an active recovery awaits Clef re-enters create (201), never 503', async () => {
+	for (const change of ['patch', 'delete'] as const) {
+		let calls = 0
+		let resolveRecovery!: (value: unknown) => void
+		const h = buildHarness({
+			ai: async () => {
+				calls += 1
+				if (calls === 2) return await new Promise((resolve) => { resolveRecovery = resolve }) // the recovery's Clef call
+				return clefAnswer(0.95)
+			},
+		})
+		await seedBiggerSibling(h)
+		const body = { title: 'Early set', smols: [1, 2, 3, 4, 5].map(SYN) }
+		let failed = false
+		h.hooks.onStatement = (sql) => {
+			if (!failed && sql.includes(CLASSIFY_BATCH)) {
+				failed = true
+				throw new Error('D1_ERROR: transient')
+			}
+		}
+		assert.equal((await h.send('/mixtapes', { method: 'POST', as: NEW_OWNER, body })).status, 500)
+		h.hooks.onStatement = undefined
+		const id = (h.db.prepare(`SELECT Id FROM Mixtapes WHERE Title = 'Early set'`).get() as { Id: string }).Id
+		assert.equal(claimRow(h, id)!.Finalized, 2)
+
+		const pendingRecovery = h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+		while (calls < 2) await tick() // the recovery took over and is awaiting Clef
+		const ownerWrite = change === 'delete'
+			? await h.send(`/mixtapes/${id}`, { method: 'DELETE', as: NEW_OWNER })
+			: await h.send(`/mixtapes/${id}`, { method: 'PATCH', as: NEW_OWNER, body: { title: 'Renamed', smols: [SYN(1)] } })
+		assert.equal(ownerWrite.status, 200)
+		resolveRecovery(clefAnswer(0.95))
+		const recovery = await pendingRecovery
+
+		assert.notEqual(recovery.status, 503, `${change}: never create_pending for its own failed claim`)
+		assert.deepEqual([recovery.status, recovery.body.deduplicated], [201, false], `${change}: re-entered the atomic replacement`)
+		assert.notEqual(recovery.body.id, id)
+		assert.equal(h.row(recovery.body.id)!.Title, 'Early set', 'the fresh row has the requested content')
+		assert.equal(claimRow(h, recovery.body.id)!.Finalized, 1)
+		if (change === 'patch') assert.equal(h.row(id)!.Title, 'Renamed', 'the owner edit stands')
+		else assert.ok(h.row(id)!.Deleted_At, 'the owner delete stands')
+		const replay = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+		assert.deepEqual([replay.status, replay.body.id], [200, recovery.body.id])
+	}
+})
