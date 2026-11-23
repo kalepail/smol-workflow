@@ -1,12 +1,20 @@
 // Augment the Cloudflare.Env interface with secrets and runtime bindings not in wrangler.jsonc
 // This ensures the global `env` from cloudflare:workers has the right types
 // These secrets are managed via `wrangler secret put` or `.dev.vars`
-interface KaleWorkerBinding extends Fetcher {
+type KaleWorkerChainReads = import("../src/utils/chain").MainnetChainReads
+
+interface KaleWorkerBinding extends Fetcher, KaleWorkerChainReads {
 	submitTransaction(input: { xdr: string }): Promise<{
 		hash?: string
 		error?: string
 		errorCode?: string
 	}>
+}
+
+// Wrangler generates a generic Fetcher for the sibling Worker. Refine the app's Env
+// here so `wrangler types` can regenerate its declaration independently.
+interface Env {
+	KALE_WORKER: KaleWorkerBinding
 }
 
 declare namespace Cloudflare {
@@ -237,4 +245,5 @@ type WorkflowTxParams = {
 	sub: string       // JWT sub of the user who initiated the mint
 	ownerSub?: string
 	ownerSubsById?: Record<string, string>
+	trackStatus?: boolean
 }

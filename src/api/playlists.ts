@@ -38,60 +38,24 @@ playlists.get(
 		const playlistTitle = c.req.param('title')
 		const { limit, cursor } = parsePaginationParams(new URL(req.url))
 
-		const whereClause = buildCursorWhereClause(cursor, 'p.Title = ? AND s.Public = 1', 's.')
-		const bindings: any[] = []
+		const [where, ...cursorBindings] = buildCursorWhereClause(cursor, 'p.Title = ? AND +s.Public = 1', 's.')
+		const { results: smolsFromDb } = await env.SMOL_D1.prepare(`
+			SELECT s.Id, s.Title, s.Song_1, s.Address, s.Plays, s.Views, s.Mint_Token, s.Mint_Amm, s.Created_At, s.Public
+			FROM Playlists p CROSS JOIN Smols s ON s.Id = p.Id
+			WHERE ${where}
+			ORDER BY s.Created_At DESC, s.Id DESC
+			LIMIT ?
+		`).bind(playlistTitle, ...cursorBindings, limit).all<Smol>()
 
-		let query: string
-		if (whereClause.length > 1) {
-			// Has cursor bindings
-			query = `
-				SELECT s.Id, s.Title, s.Song_1, s.Address, s.Plays, s.Views, s.Mint_Token, s.Mint_Amm, s.Created_At, s.Public
-				FROM Smols s
-				INNER JOIN Playlists p ON s.Id = p.Id
-				WHERE ${whereClause[0]}
-				ORDER BY s.Created_At DESC, s.Id DESC
-				LIMIT ?
-			`
-			bindings.push(playlistTitle, whereClause[1], whereClause[2], whereClause[3], limit)
-		} else {
-			// No cursor bindings
-			query = `
-				SELECT s.Id, s.Title, s.Song_1, s.Address, s.Plays, s.Views, s.Mint_Token, s.Mint_Amm, s.Created_At, s.Public
-				FROM Smols s
-				INNER JOIN Playlists p ON s.Id = p.Id
-				WHERE ${whereClause[0]}
-				ORDER BY s.Created_At DESC, s.Id DESC
-				LIMIT ?
-			`
-			bindings.push(playlistTitle, limit)
+		const addresses = [...new Set(smolsFromDb.map((smol) => smol.Address))].filter(Boolean)
+		const userReads: Promise<D1Result<User>>[] = []
+		for (let index = 0; index < addresses.length; index += 90) {
+			const chunk = addresses.slice(index, index + 90)
+			userReads.push(env.SMOL_D1.prepare(
+				`SELECT Username, Address FROM Users WHERE Address IN (${chunk.map(() => '?').join(',')})`
+			).bind(...chunk).all<User>())
 		}
-
-		const smolsD1Result = await env.SMOL_D1.prepare(query)
-			.bind(...bindings)
-			.all<Smol>()
-
-		const smolsFromDb = smolsD1Result.results || []
-		let users: User[] = []
-
-		if (smolsFromDb.length > 0) {
-			const creatorAddresses = [...new Set(smolsFromDb.map((smol) => smol.Address!))].filter(
-				Boolean
-			)
-
-			if (creatorAddresses.length > 0) {
-				const D1_IN_CHUNK_SIZE = 90
-				for (let index = 0; index < creatorAddresses.length; index += D1_IN_CHUNK_SIZE) {
-					const chunk = creatorAddresses.slice(index, index + D1_IN_CHUNK_SIZE)
-					const placeholders = chunk.map(() => '?').join(',')
-					const usersD1Result = await env.SMOL_D1.prepare(
-						`SELECT Username, Address FROM Users WHERE Address IN (${placeholders})`
-					)
-						.bind(...chunk)
-						.all<User>()
-					users.push(...(usersD1Result.results || []))
-				}
-			}
-		}
+		const users = (await Promise.all(userReads)).flatMap(({ results }) => results)
 
 		const pagination = buildPaginationResponse(
 			smolsFromDb,

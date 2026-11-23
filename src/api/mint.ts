@@ -3,6 +3,9 @@ import { HTTPException } from 'hono/http-exception'
 import { xdr as stellarXdr } from '@stellar/stellar-sdk/minimal'
 import type { HonoEnv } from '../types'
 import { parseAuth } from '../middleware/auth'
+import { deriveMintPair, isLedgerSequence } from '../utils/chain'
+import { parseIdList, parseTrackTarget, readChainTarget, type MintBatchRow } from '../utils/chain-target'
+import { privateNoStore, readJsonBody } from './mixtapes'
 
 const mint = new Hono<HonoEnv>()
 const MAX_BATCH_MINT_IDS = 100
@@ -74,19 +77,28 @@ async function createDedupedTxWorkflow(
 	id: string,
 	params: WorkflowTxParams
 ): Promise<void> {
+	const ids = params.mintableIds ?? [params.entropy!]
+	const claim = await env.SMOL_D1.prepare(`
+		INSERT INTO MintBatchStatus (Workflow_Id, "Address", Ids) VALUES (?1, ?2, ?3)
+		ON CONFLICT (Workflow_Id) DO UPDATE SET Workflow_Id = excluded.Workflow_Id
+		WHERE MintBatchStatus."Address" = excluded."Address"
+		RETURNING Workflow_Id
+	`).bind(id, params.sub, JSON.stringify(ids)).first()
+	if (!claim) throw new HTTPException(409, { message: 'Mint workflow already exists' })
+
 	try {
-		await env.TX_WORKFLOW.create({ id, params })
+		await env.TX_WORKFLOW.create({ id, params: { ...params, trackStatus: true } })
 	} catch (err) {
-		if (isDuplicateWorkflowError(err)) {
-			return
+		if (!isDuplicateWorkflowError(err)) {
+			throw new HTTPException(503, { message: 'Mint workflow creation unavailable' })
 		}
-		throw err
 	}
 }
 
 mint.post('/', parseAuth, async (c) => {
 	const { env, req } = c
-	const payload = c.get('jwtPayload')!
+	const payload = c.get('jwtPayload')
+	if (typeof payload?.sub !== 'string' || !payload.sub) throw new HTTPException(401, { message: 'User session required' })
 	const body = await req.json() as { xdr?: string; ids?: string[] }
 	const xdr = assertSignedXdr(body?.xdr)
 	const ids = assertMintIds(body?.ids)
@@ -140,6 +152,7 @@ mint.post('/', parseAuth, async (c) => {
 
 	if (mintableIds.length === 0) {
 		return c.json({
+			workflowId: null,
 			acceptedIds: [],
 			skipped: {
 				alreadyMinted: alreadyMintedIds,
@@ -162,6 +175,7 @@ mint.post('/', parseAuth, async (c) => {
 	})
 
 	return c.json({
+		workflowId,
 		acceptedIds: mintableIds,
 		skipped: {
 			alreadyMinted: alreadyMintedIds,
@@ -169,15 +183,71 @@ mint.post('/', parseAuth, async (c) => {
 	}, 202)
 })
 
+async function batchProgress(env: Env, batch: MintBatchRow) {
+	const { phase, txHash, confirmedLedger } = batch
+	const progress = {
+		phase: phase === 'submitting' ? 'queued' : phase,
+		...(txHash ? { txHash } : {}),
+		...(confirmedLedger ? { confirmedLedger } : {}),
+	}
+	if (phase === 'persisted' || phase === 'failed') return progress
+	try {
+		const instance = await env.TX_WORKFLOW.get(batch.workflowId)
+		const { status, output } = await instance.status()
+		if (status === 'complete' && output && typeof output === 'object' && 'hash' in output
+			&& typeof output.hash === 'string' && /^[0-9a-f]{64}$/.test(output.hash)) {
+			// The workflow can settle after the D1 read. Its final output follows persistence.
+			const ledger = 'ledger' in output && isLedgerSequence(output.ledger) ? output.ledger : confirmedLedger
+			return { phase: 'persisted', txHash: output.hash, ...(ledger ? { confirmedLedger: ledger } : {}) }
+		}
+		if (status === 'errored' || status === 'terminated') {
+			return { ...progress, phase: phase === 'queued' ? 'failed' : 'uncertain' }
+		}
+		if (status === 'unknown' || status === 'complete') return { ...progress, phase: 'uncertain' }
+	} catch {
+		// A transient Workflow lookup failure leaves the durable D1 checkpoint usable.
+	}
+	return progress
+}
+
+mint.post('/status', privateNoStore, parseAuth, async (c) => {
+	const sub = c.get('jwtPayload')?.sub
+	if (typeof sub !== 'string' || !sub) throw new HTTPException(401, { message: 'User session required' })
+	const body = await readJsonBody(c)
+	const workflowIds = body.workflowIds === undefined ? [] : parseIdList(body.workflowIds, 'workflow IDs')
+	const ids = body.ids === undefined ? [] : parseIdList(body.ids, 'track IDs')
+	const target = body.target === undefined ? (ids.length ? { trackIds: ids } : undefined) : parseTrackTarget(body.target)
+	if (!target && !workflowIds.length) throw new HTTPException(400, { message: 'Supply a target, IDs or workflow IDs' })
+
+	const { revision, batches, tracks } = await readChainTarget(c.env, target, sub, workflowIds)
+	const visible = new Set(tracks.map(({ Id }) => Id))
+	const selected = batches.map((batch) => ({ ...batch, ids: batch.ids.filter((id) => visible.has(id)) }))
+	const statuses = []
+	for (let i = 0; i < selected.length; i += 20) {
+		const group = await Promise.all(selected.slice(i, i + 20).map(async (batch) => ({
+			workflowId: batch.workflowId,
+			ids: batch.ids,
+			...await batchProgress(c.env, batch),
+		})))
+		statuses.push(...group)
+	}
+	return c.json({
+		revision,
+		batches: statuses,
+		tracks: tracks.map(({ Id, Mint_Token, Mint_Amm }) => ({ id: Id, sac: Mint_Token, pool: Mint_Amm })),
+	})
+})
+
 mint.post('/:id', parseAuth, async (c) => {
 	const { env, req } = c
-	const payload = c.get('jwtPayload')!
+	const payload = c.get('jwtPayload')
+	if (typeof payload?.sub !== 'string' || !payload.sub) throw new HTTPException(401, { message: 'User session required' })
 	const id = req.param('id')
 	const body = await req.json() as { xdr?: string }
 	const xdr = assertSignedXdr(body?.xdr)
 
-	if (!id) {
-		throw new HTTPException(400, { message: 'Missing smol id' })
+	if (!deriveMintPair(id)) {
+		throw new HTTPException(400, { message: 'Invalid canonical smol ID' })
 	}
 
 	const smolRecord = await env.SMOL_D1.prepare(

@@ -35,6 +35,7 @@ export async function purgeCacheByTags(tags: string[]): Promise<boolean> {
 				`https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/purge_cache`,
 				{
 					method: 'POST',
+					signal: AbortSignal.timeout(10_000),
 					headers: {
 						'Authorization': `Bearer ${env.CF_API_TOKEN}`,
 						'Content-Type': 'application/json',
@@ -44,11 +45,11 @@ export async function purgeCacheByTags(tags: string[]): Promise<boolean> {
 			)
 
 			if (!response.ok) {
-				const error = (await response.text()).slice(0, 300)
+				await response.body?.cancel().catch(() => {})
 				if (response.status === 401 || response.status === 403) {
 					console.warn('Cache purge skipped due auth error:', response.status)
 				} else {
-					console.error('Cache purge failed:', response.status, error)
+					console.error('Cache purge failed:', response.status)
 				}
 				return false
 			}
@@ -59,8 +60,8 @@ export async function purgeCacheByTags(tags: string[]): Promise<boolean> {
 
 		console.log('Cache purged', { tagCount: uniqueTags.length, chunkCount: tagChunks.length })
 		return results.every(Boolean)
-	} catch (error) {
-		console.warn('Cache purge error:', error)
+	} catch {
+		console.warn('Cache purge request failed')
 		return false
 	}
 }

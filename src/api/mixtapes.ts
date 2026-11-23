@@ -63,6 +63,9 @@ interface MixtapeRow {
 	Revision: number
 }
 
+export type MixtapeVisibilityRow = Pick<MixtapeRow,
+	'Id' | 'Address' | 'Title' | 'Desc' | 'Smols' | 'Created_At' | 'Ai_Verdict' | 'Visibility' | 'Revision'>
+
 interface MixtapeSmolRow {
 	Id: string
 	Title: string
@@ -71,6 +74,7 @@ interface MixtapeSmolRow {
 	Mint_Amm: string | null
 	Song_1: string
 	Public: number
+	Tags: string | null
 }
 
 /**
@@ -105,7 +109,7 @@ const MIXTAPE_SELECT = `
 // Parsing & validation
 // ---------------------------------------------------------------------------
 
-function parseStoredSmolIds(smols: string): string[] {
+export function parseStoredSmolIds(smols: string): string[] {
 	return dedupeOrdered(smols.split(','))
 }
 
@@ -163,7 +167,7 @@ function parseExpectedRevision(value: unknown): number | undefined {
 	return value
 }
 
-async function readJsonBody(c: Context<HonoEnv>): Promise<Record<string, unknown>> {
+export async function readJsonBody(c: Context<HonoEnv>): Promise<Record<string, unknown>> {
 	let body: unknown
 	try {
 		body = await c.req.json()
@@ -189,7 +193,7 @@ function requireOwnerSub(c: Context<HonoEnv>): string {
 // D1 access
 // ---------------------------------------------------------------------------
 
-async function loadPublicSmolRows(env: Env, ids: string[]): Promise<Map<string, MixtapeSmolRow>> {
+async function loadPublicSmolRows(env: Env, ids: string[], includeTags = false): Promise<Map<string, MixtapeSmolRow>> {
 	const uniqueIds = [...new Set(ids)].filter(Boolean)
 	const rows = new Map<string, MixtapeSmolRow>()
 	const batches: string[][] = []
@@ -201,9 +205,9 @@ async function loadPublicSmolRows(env: Env, ids: string[]): Promise<Map<string, 
 	const results = await Promise.all(batches.map((batch) => {
 		const placeholders = batch.map(() => '?').join(',')
 		return env.SMOL_D1.prepare(`
-				SELECT Id, Title, "Address" as Address, Mint_Token, Mint_Amm, Song_1, Public
+				SELECT Id, Title, "Address" as Address, Mint_Token, Mint_Amm, Song_1, Public, ${includeTags ? 'Tags' : 'NULL AS Tags'}
 				FROM Smols
-				WHERE Public = 1 AND Id IN (${placeholders})
+				WHERE Id IN (${placeholders}) AND +Public = 1
 			`)
 			.bind(...batch)
 			.all<MixtapeSmolRow>()
@@ -309,7 +313,7 @@ const publicCache = () => async (c: Context<HonoEnv>, next: Next) => {
 }
 
 /** Private, never-shared cache policy on EVERY response (incl. 400/401/403 thrown before handlers). */
-async function privateNoStore(c: Context<HonoEnv>, next: Next) {
+export async function privateNoStore(c: Context<HonoEnv>, next: Next) {
 	await next()
 	for (const [name, value] of Object.entries(PRIVATE_HEADERS)) c.res.headers.set(name, value)
 }
@@ -318,7 +322,7 @@ async function privateNoStore(c: Context<HonoEnv>, next: Next) {
 // Derivation (Tier 1 + validated persisted Tier 2 verdicts). Zero inference.
 // ---------------------------------------------------------------------------
 
-function toCandidate(row: MixtapeRow, publicSmols: ReadonlyMap<string, unknown>): MixtapeCandidate {
+function toCandidate(row: MixtapeVisibilityRow, publicSmols: Pick<ReadonlySet<string>, 'has'>): MixtapeCandidate {
 	const stored = parseStoredSmolIds(row.Smols)
 	return {
 		id: row.Id,
@@ -363,10 +367,10 @@ function receiptRevisionsCurrent(receipt: AiVerdictReceipt, revisions: ReadonlyM
  * judged revisions, the pair STILL in the borderline band, and the SHA-256 fingerprint of the
  * resolved public inputs unchanged (a song flipping private invalidates it immediately).
  */
-async function collectVerdicts(
-	rows: MixtapeRow[],
+async function collectVerdicts<Row extends MixtapeVisibilityRow>(
+	rows: Row[],
 	candidates: MixtapeCandidate[],
-	receiptOf: (row: MixtapeRow) => AiVerdictReceipt | null,
+	receiptOf: (row: Row) => AiVerdictReceipt | null,
 ): Promise<SemanticDuplicateVerdict[]> {
 	const byId = new Map(candidates.map((candidate) => [candidate.id, candidate]))
 	const revisions = new Map(rows.map((row) => [row.Id, row.Revision]))
@@ -384,7 +388,7 @@ async function collectVerdicts(
 	return verdicts
 }
 
-async function deriveDecisions(rows: MixtapeRow[], publicSmols: ReadonlyMap<string, unknown>) {
+export async function deriveDecisions(rows: MixtapeVisibilityRow[], publicSmols: Pick<ReadonlySet<string>, 'has'>) {
 	const candidates = rows.map((row) => toCandidate(row, publicSmols))
 	const verdicts = await collectVerdicts(rows, candidates, (row) => parseReceipt(row.Ai_Verdict))
 	return { candidates, decisions: classifyOwnerMixtapes(candidates, verdicts) }
@@ -1098,6 +1102,15 @@ async function resolveMergeTarget(env: Env, row: MixtapeRow): Promise<MixtapeRow
 	return current && !current.Deleted_At ? current : null
 }
 
+function parseSmolTags(raw: string): string[] {
+	try {
+		const tags: unknown = JSON.parse(raw)
+		return Array.isArray(tags) ? tags.filter((tag): tag is string => typeof tag === 'string') : []
+	} catch {
+		return []
+	}
+}
+
 // Get single mixtape by ID. Public or owner-hidden rows are playable unlisted links (200).
 mixtapes.get('/:id', publicCache(), async (c) => {
 	const { env } = c
@@ -1119,7 +1132,7 @@ mixtapes.get('/:id', publicCache(), async (c) => {
 	}
 
 	const cohortRows = await loadOwnerRows(env, mixtapeRow.Address)
-	const publicSmolRows = await loadPublicSmolRows(env, cohortRows.flatMap((row) => parseStoredSmolIds(row.Smols)))
+	const publicSmolRows = await loadPublicSmolRows(env, cohortRows.flatMap((row) => parseStoredSmolIds(row.Smols)), true)
 	const { decisions } = await deriveDecisions(cohortRows, publicSmolRows)
 	const decision = decisions.get(id)
 	const smolRows = parseStoredSmolIds(mixtapeRow.Smols)
@@ -1127,10 +1140,12 @@ mixtapes.get('/:id', publicCache(), async (c) => {
 		.filter((row): row is MixtapeSmolRow => Boolean(row))
 
 	// Fetch KV data in bulk (up to 100 keys at once)
-	const publicSmolIds = smolRows.map((row) => row.Id)
-	const kvData = publicSmolIds.length > 0
-		? await env.SMOL_KV.get<SmolKVData>(publicSmolIds, 'json')
-		: new Map<string, SmolKVData | null>()
+	const legacyIds = smolRows.filter((row) => row.Tags === null).map((row) => row.Id)
+	const kvReads: Promise<Map<string, SmolKVData | null>>[] = []
+	for (let i = 0; i < legacyIds.length; i += MAX_MIXTAPE_SMOLS) {
+		kvReads.push(env.SMOL_KV.get<SmolKVData>(legacyIds.slice(i, i + MAX_MIXTAPE_SMOLS), 'json'))
+	}
+	const kvData = new Map((await Promise.all(kvReads)).flatMap((chunk) => [...chunk]))
 
 	const smolsWithKV = smolRows.map((row) => ({
 		Id: row.Id,
@@ -1140,7 +1155,7 @@ mixtapes.get('/:id', publicCache(), async (c) => {
 		Mint_Amm: row.Mint_Amm,
 		Song_1: row.Song_1,
 		Public: row.Public,
-		Tags: kvData.get(row.Id)?.lyrics?.style || [],
+		Tags: row.Tags === null ? kvData.get(row.Id)?.lyrics?.style ?? [] : parseSmolTags(row.Tags),
 	}))
 
 	const view = ownerView(mixtapeRow, decision, publicSmolRows)
@@ -1163,8 +1178,15 @@ mixtapes.get('/:id', publicCache(), async (c) => {
 		Public_Track_Count: view.Public_Track_Count,
 	})
 
-	response.headers.append('Cache-Tag', 'mixtapes')
-	response.headers.append('Cache-Tag', `mixtape:${id}`)
+	const cacheTags = ['mixtapes', `mixtape:${id}`]
+	let length = cacheTags.join(',').length
+	for (const row of smolRows.slice(0, MAX_MIXTAPE_SMOLS)) {
+		const tag = `smol:${row.Id}:anonymous`
+		if (!/^[!-~]+$/.test(tag) || tag.length > 1024 || tag.includes(',') || length + tag.length + 1 > 16 * 1024) continue
+		cacheTags.push(tag)
+		length += tag.length + 1
+	}
+	response.headers.set('Cache-Tag', cacheTags.join(','))
 	if (view.Visibility !== 'public') {
 		response.headers.set('X-Robots-Tag', 'noindex')
 	}

@@ -237,7 +237,7 @@ test('retry workflow restores payload and reused state when the cached retry ste
 		assert.equal(image_base64, 'aW1hZ2UtYnl0ZXM=')
 
 		const insert = calls.d1.find((call) => call.sql.includes('INSERT INTO Smols'))
-		assert.deepEqual(insert?.args, [NEW_ID, 'Parrot Dusk', 'song-1', 'song-2', 'GORIGINALCREATOR', true, false, 'aisonggenerator', null])
+		assert.deepEqual(insert?.args, [NEW_ID, 'Parrot Dusk', 'song-1', 'song-2', 'GORIGINALCREATOR', true, false, 'aisonggenerator', null, JSON.stringify(['chiptune', 'synthwave'])])
 
 		const playlistInsert = calls.d1.find((call) => call.sql.includes('INSERT OR IGNORE INTO Playlists'))
 		assert.deepEqual(playlistInsert?.args, [NEW_ID, 'playlist-1'])

@@ -1,8 +1,9 @@
 import { verifyRegistrationResponse, verifyAuthenticationResponse, AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server"
-import { xdr, Address } from "@stellar/stellar-sdk/minimal";
+import { xdr } from "@stellar/stellar-sdk/minimal";
 import { Server } from "@stellar/stellar-sdk/minimal/rpc";
 import base64url from "base64url";
 import { HTTPException } from "hono/http-exception";
+import { contractDataKey, decodeLedgerPage, LEDGER_KEY_LIMIT, storageKey, type MainnetChainReads } from "./utils/chain";
 
 // Protocol types for different smart account implementations
 export type Protocol = 'passkey-kit' | 'smart-account-kit';
@@ -136,107 +137,70 @@ function buildCoseKey(rawpk: Buffer): Buffer {
     return Buffer.concat(parts);
 }
 
-/**
- * Lookup public key from passkey-kit contract storage
- * Storage format: ['Secp256r1', keyIdBytes] => publicKey
- */
-async function getPublicKeyFromPasskeyKit(rpc: Server, contractId: string, keyId: string): Promise<Buffer> {
-    const data = await rpc.getContractData(
-        contractId,
-        xdr.ScVal.scvVec([
-            xdr.ScVal.scvSymbol('Secp256r1'),
-            xdr.ScVal.scvBytes(base64url.toBuffer(keyId))
-        ])
-    )
-    return Buffer.from(data.val.contractData().val().vec()?.[1].bytes()!)
+type SignerReader = (keys: xdr.LedgerKey[], minLedger?: number) => Promise<{
+    ledger: number;
+    values: Map<string, xdr.ScVal>;
+}>;
+
+function getSignerReader(rpcUrl: string, binding?: MainnetChainReads): SignerReader {
+    if (typeof binding?.readEntries === 'function') {
+        return async (ledgerKeys, minLedger) => {
+            const keys = ledgerKeys.map((key) => key.toXDR('base64'));
+            const { ledger, values } = decodeLedgerPage(await binding.readEntries({ keys, minLedger }), keys, minLedger);
+            return { ledger, values: new Map([...values].flatMap(([key, entry]) =>
+                entry.state === 'present' && entry.life !== 'archived' ? [[key, entry.value] as const] : [],
+            )) };
+        };
+    }
+    const rpc = new Server(rpcUrl);
+    return async (keys) => {
+        const result = await rpc.getLedgerEntries(...keys);
+        return {
+            ledger: result.latestLedger,
+            values: new Map(result.entries.map(({ key, val }) => [key.toXDR('base64'), val.contractData().val()])),
+        };
+    };
 }
 
-/**
- * Lookup public key from smart-account-kit (OpenZeppelin) contract storage
- * Storage structure:
- *   - Ids(Default) => Vec<u32> rule IDs
- *   - Signers(ruleId) => Vec<Signer>
- *   - Signer::External(verifier, keyData) where keyData = publicKey (65 bytes) + credentialId
- */
-async function getPublicKeyFromSmartAccountKit(rpc: Server, contractId: string, keyId: string): Promise<Buffer> {
-    const keyIdBuffer = base64url.toBuffer(keyId);
-    const contractAddress = Address.fromString(contractId);
+async function getPublicKeyFromPasskeyKit(read: SignerReader, contractId: string, keyId: string): Promise<Buffer> {
+    const key = contractDataKey(contractId, storageKey('Secp256r1', xdr.ScVal.scvBytes(base64url.toBuffer(keyId))));
+    const { values } = await read([key]);
+    const signer = values.get(key.toXDR('base64'))?.vec()?.[1];
+    if (!signer || signer.switch().name !== 'scvBytes') throw new Error('Passkey signer unavailable');
+    return Buffer.from(signer.bytes());
+}
 
-    // Step 1: Get rule IDs for Default context
-    // SmartAccountStorageKey::Ids(ContextRuleType::Default) => ['Ids', ['Default']]
-    // ContextRuleType::Default is a unit variant enum, serialized as ['Default']
-    const idsKey = xdr.ScVal.scvVec([
-        xdr.ScVal.scvSymbol('Ids'),
-        xdr.ScVal.scvVec([xdr.ScVal.scvSymbol('Default')])
-    ]);
+/** Read Default context-rule IDs, then read their Signers vectors in bounded pages. */
+async function getPublicKeyFromSmartAccountKit(
+    read: SignerReader, contractId: string, keyId: string,
+): Promise<Buffer> {
+    const credential = base64url.toBuffer(keyId);
+    const idsKey = contractDataKey(contractId, storageKey('Ids', storageKey('Default')));
+    const { ledger, values } = await read([idsKey]);
+    const ids = values.get(idsKey.toXDR('base64'))?.vec();
+    if (!ids) throw new Error('No context rules found for contract');
 
-    const idsLedgerKey = xdr.LedgerKey.contractData(
-        new xdr.LedgerKeyContractData({
-            contract: contractAddress.toScAddress(),
-            key: idsKey,
-            durability: xdr.ContractDataDurability.persistent()
-        })
-    );
-
-    const idsResponse = await rpc.getLedgerEntries(idsLedgerKey);
-    if (!idsResponse.entries || idsResponse.entries.length === 0) {
-        throw new Error('No context rules found for contract');
+    const ruleIds = [...new Set(ids.map((id) => id.u32()))];
+    const keys = ruleIds.map((id) => contractDataKey(contractId, storageKey('Signers', xdr.ScVal.scvU32(id))));
+    const pages = [];
+    for (let i = 0; i < keys.length; i += LEDGER_KEY_LIMIT) {
+        pages.push(read(keys.slice(i, i + LEDGER_KEY_LIMIT), ledger));
     }
+    const signerValues = new Map((await Promise.all(pages)).flatMap((page) => [...page.values]));
 
-    const idsEntry = idsResponse.entries[0];
-    // val is already parsed as xdr.LedgerEntryData
-    const ruleIds = idsEntry.val.contractData().val().vec()?.map(v => v.u32()) ?? [];
-
-    // Step 2: For each rule, look up signers and find matching credential
-    for (const ruleId of ruleIds) {
-        // SmartAccountStorageKey::Signers(ruleId) => ['Signers', ruleId]
-        const signersKey = xdr.ScVal.scvVec([
-            xdr.ScVal.scvSymbol('Signers'),
-            xdr.ScVal.scvU32(ruleId)
-        ]);
-
-        const signersLedgerKey = xdr.LedgerKey.contractData(
-            new xdr.LedgerKeyContractData({
-                contract: contractAddress.toScAddress(),
-                key: signersKey,
-                durability: xdr.ContractDataDurability.persistent()
-            })
-        );
-
-        const signersResponse = await rpc.getLedgerEntries(signersLedgerKey);
-        if (!signersResponse.entries || signersResponse.entries.length === 0) {
-            continue;
-        }
-
-        const signersEntry = signersResponse.entries[0];
-        // val is already parsed as xdr.LedgerEntryData
-        const signers = signersEntry.val.contractData().val().vec() ?? [];
-
-        // Step 3: Find External signer with matching credential ID
+    for (const key of keys) {
+        const signers = signerValues.get(key.toXDR('base64'))?.vec() ?? [];
         for (const signer of signers) {
-            const signerVec = signer.vec();
-            if (!signerVec || signerVec.length < 1) continue;
-
-            // Check if this is an External signer: ['External', verifier, keyData]
-            const tag = signerVec[0].sym().toString();
-            if (tag !== 'External' || signerVec.length < 3) continue;
-
-            const keyData = Buffer.from(signerVec[2].bytes());
-
-            // keyData format: publicKey (65 bytes) + credentialId
-            if (keyData.length <= SECP256R1_PUBLIC_KEY_SIZE) continue;
-
-            const credentialId = keyData.slice(SECP256R1_PUBLIC_KEY_SIZE);
-
-            // Compare credential IDs
-            if (credentialId.equals(keyIdBuffer)) {
-                // Found matching signer - extract public key
-                return keyData.slice(0, SECP256R1_PUBLIC_KEY_SIZE);
+            const fields = signer.vec();
+            if (!fields || fields.length < 3 || fields[0].sym().toString() !== 'External') continue;
+            const keyData = Buffer.from(fields[2].bytes());
+            if (keyData.length > SECP256R1_PUBLIC_KEY_SIZE
+                && keyData.subarray(SECP256R1_PUBLIC_KEY_SIZE).equals(credential)) {
+                return keyData.subarray(0, SECP256R1_PUBLIC_KEY_SIZE);
             }
         }
     }
-
-    throw new Error(`No signer found with credential ID: ${keyId}`);
+    throw new Error('No matching signer found');
 }
 
 export async function verifyAuthentication(
@@ -245,17 +209,18 @@ export async function verifyAuthentication(
     contractId: string,
     response: AuthenticationResponseJSON,
     rpcUrl: string,
-    protocol: Protocol = 'passkey-kit'
+    protocol: Protocol = 'passkey-kit',
+    binding?: MainnetChainReads,
 ) {
     const { expectedOrigin, expectedRPID } = resolvePasskeyVerificationTarget(host);
 
     try {
-        const rpc = new Server(rpcUrl);
+        const read = getSignerReader(rpcUrl, binding);
 
         // Get raw public key based on protocol
         const rawpk = protocol === 'smart-account-kit'
-            ? await getPublicKeyFromSmartAccountKit(rpc, contractId, keyId)
-            : await getPublicKeyFromPasskeyKit(rpc, contractId, keyId);
+            ? await getPublicKeyFromSmartAccountKit(read, contractId, keyId)
+            : await getPublicKeyFromPasskeyKit(read, contractId, keyId);
 
         // Build COSE key from raw public key
         const publicKey = buildCoseKey(rawpk);

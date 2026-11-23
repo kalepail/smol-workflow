@@ -9,6 +9,8 @@ const media = new Hono<HonoEnv>()
 export const MEDIA_CACHE_CONTROL = 'public, max-age=2592000, stale-while-revalidate=86400'
 const CANONICAL_MEDIA_ORIGIN = 'https://api.smol.xyz'
 const MAX_PROBE_BYTES = 2
+const MAX_RANGE_WARM_BYTES = 16 * 1024 * 1024
+const songCacheWarms = new Map<string, Promise<void>>()
 
 function getEdgeCache(): Cache | undefined {
 	if (typeof caches === 'undefined') {
@@ -18,8 +20,8 @@ function getEdgeCache(): Cache | undefined {
 }
 
 function runInBackground(c: Context<HonoEnv>, task: Promise<unknown>): void {
-	const safeTask = task.catch((err) => {
-		console.warn('Media background task failed:', err)
+	const safeTask = task.catch(() => {
+		console.warn('Media background task failed')
 	})
 	try {
 		c.executionCtx.waitUntil(safeTask)
@@ -194,6 +196,31 @@ function buildSongHeaders(musicId: string, objectMeta: R2Object): Headers {
 	headers.set('Cache-Tag', tags.join(','))
 
 	return headers
+}
+
+function warmSongCache(env: Env, cache: Cache, cacheKey: Request, id: string, musicId: string): Promise<void> {
+	const active = songCacheWarms.get(musicId)
+	if (active) return active
+
+	const warm = (async () => {
+		const cached = await cache.match(cacheKey)
+		if (cached) {
+			await cached.body?.cancel()
+			return
+		}
+		const object = await env.SMOL_BUCKET.get(id)
+		if (!object) return
+		if (object.size > MAX_RANGE_WARM_BYTES) {
+			await object.body?.cancel()
+			return
+		}
+		const headers = stripOriginSpecificHeaders(buildSongHeaders(musicId, object))
+		headers.set('Content-Length', String(object.size))
+		await cache.put(cacheKey, new Response(object.body, { status: 200, headers }))
+	})().finally(() => songCacheWarms.delete(musicId))
+
+	songCacheWarms.set(musicId, warm)
+	return warm
 }
 
 function stripOriginSpecificHeaders(headers: Headers): Headers {
@@ -400,6 +427,11 @@ media.get('/:id{.+\\.mp3}', async (c) => {
 
 			if (getPlayCountMode(env) === 'server' && shouldIncrementSongPlays(req.method, originalParsedRange, size)) {
 				recordSongPlay(c, musicId)
+			}
+
+			if (edgeCache && id.endsWith('.mp3') && size <= MAX_RANGE_WARM_BYTES
+				&& (parsed.offset !== 0 || parsed.isOpenEnded || parsed.length > MAX_PROBE_BYTES)) {
+				runInBackground(c, warmSongCache(env, edgeCache, cacheKey, id, musicId))
 			}
 
 			return new Response(object.body, { status: 206, headers })

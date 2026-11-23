@@ -27,6 +27,7 @@ const FIXTURE = JSON.parse(readFileSync(new URL('./fixtures/mixtapes-live-18.jso
 	smols: FixtureSmol[]
 }
 const MIGRATION_0002 = readFileSync(new URL('../migrations/0002_mixtapes_lifecycle.sql', import.meta.url), 'utf8')
+const MIGRATION_0003 = readFileSync(new URL('../migrations/0003_storage_query_optimization.sql', import.meta.url), 'utf8')
 const SCHEMA_SQL = readFileSync(new URL('../schema.sql', import.meta.url), 'utf8')
 
 const byId = (id: string) => FIXTURE.mixtapes.find((m) => m.Id === id)!
@@ -50,6 +51,7 @@ const PRIVATE_SYN = 'syn-private'
 const LEGACY_DDL = `
 	CREATE TABLE Smols (
 		Id TEXT PRIMARY KEY, Title TEXT NOT NULL, Song_1 TEXT NOT NULL, Public BOOLEAN DEFAULT 1,
+		Created_At DATETIME DEFAULT CURRENT_TIMESTAMP,
 		"Address" TEXT NOT NULL, Mint_Token TEXT DEFAULT NULL, Mint_Amm TEXT DEFAULT NULL
 	);
 	CREATE TABLE Mixtapes (
@@ -58,6 +60,7 @@ const LEGACY_DDL = `
 		Created_At DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 	CREATE INDEX idx_mixtapes_created ON Mixtapes(Created_At DESC, Id DESC);
+	CREATE TABLE Playlists (Id TEXT NOT NULL, Title TEXT NOT NULL);
 `
 
 let stubs: CloudflareStubHandle
@@ -117,6 +120,7 @@ function buildHarness(options: { ai?: AiHandler; aiEnabled?: string; seed?: numb
 	const insertMixtape = db.prepare('INSERT INTO Mixtapes (Id, Title, Desc, Smols, "Address", Created_At) VALUES (?, ?, ?, ?, ?, ?)')
 	for (const m of seededShuffle(FIXTURE.mixtapes, options.seed ?? 7)) insertMixtape.run(m.Id, m.Title, m.Desc, m.Smols, m.Address, m.Created_At)
 	db.exec(MIGRATION_0002)
+	db.exec(MIGRATION_0003)
 
 	const { d1, hooks } = createSqliteD1(db)
 	const edge = createMockEdgeCache()
@@ -237,7 +241,7 @@ test('migration 0002 is additive on the legacy table, backfills Updated_At, and 
 	assert.deepEqual(indexes(db), ['idx_mixtapes_address_created', 'idx_mixtapes_created', 'idx_mixtapes_visibility_created'])
 	assert.deepEqual(indexes(fresh), indexes(db))
 	const epochObjects = (target: DatabaseSync) => (target.prepare(`SELECT type, name, sql FROM sqlite_master WHERE name IN ('MixtapeState', 'MixtapeRetryClaim', 'idx_mixtape_retry_claim_created') OR name LIKE 'trg_mixtape_epoch_%' ORDER BY name`).all() as Array<Record<string, string>>).map((r) => `${r.type}:${r.name}:${r.sql.replace(/\s+/g, ' ')}`)
-	assert.deepEqual(epochObjects(db).map((o) => o.split(':').slice(0, 2).join(':')), ['table:MixtapeRetryClaim', 'table:MixtapeState', 'index:idx_mixtape_retry_claim_created', 'trigger:trg_mixtape_epoch_smol_delete', 'trigger:trg_mixtape_epoch_smol_insert', 'trigger:trg_mixtape_epoch_smol_public'])
+	assert.deepEqual(epochObjects(db).map((o) => o.split(':').slice(0, 2).join(':')), ['table:MixtapeRetryClaim', 'table:MixtapeState', 'index:idx_mixtape_retry_claim_created', 'trigger:trg_mixtape_epoch_smol_delete', 'trigger:trg_mixtape_epoch_smol_insert', 'trigger:trg_mixtape_epoch_smol_mint', 'trigger:trg_mixtape_epoch_smol_public'])
 	assert.throws(() => db.exec('UPDATE MixtapeState SET Epoch = -1'), /CHECK constraint failed/, 'the epoch CHECK is the batch abort switch')
 	assert.deepEqual(epochObjects(fresh), epochObjects(db))
 	const epochOf = (target: DatabaseSync) => (target.prepare('SELECT Epoch FROM MixtapeState WHERE Id = 1').get() as { Epoch: number }).Epoch

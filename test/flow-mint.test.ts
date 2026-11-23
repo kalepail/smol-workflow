@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test, { after, before } from 'node:test'
 import { nativeToScVal, xdr } from '@stellar/stellar-sdk/minimal'
+import { deriveMintPair } from '../src/utils/chain'
 import {
 	createAuthToken,
 	createMockExecutionContext,
@@ -15,6 +16,8 @@ let appModule: typeof import('../src/index')
 
 const TEST_SECRET = 'test-jwt-secret-32-chars-minimum!'
 const MINTER_SUB = 'GMINTERSUB00000000000000'
+const SINGLE_ID = 'a'.repeat(64)
+const SINGLE_PAIR = deriveMintPair(SINGLE_ID)!
 const OWNER_SUB = 'GOWNERSUB000000000000000'
 
 before(async () => {
@@ -77,6 +80,7 @@ function createMintEnv(initialRows: Record<string, { Address: string; Mint_Token
 	let batchCalls = 0
 	const txWorkflowCreates: Array<{ id?: string; params: WorkflowTxParams }> = []
 	const seenWorkflowIds = new Set<string>()
+	const workflowOwners = new Map<string, string>()
 	let relaySubmitCalls = 0
 	let relayResponder: (input: { xdr: string }) => Promise<{ hash?: string; error?: string; errorCode?: string }> = async () => ({
 		hash: 'relay-hash-abc123',
@@ -102,6 +106,12 @@ function createMintEnv(initialRows: Record<string, { Address: string; Mint_Token
 					return {
 						run,
 						first: async () => {
+							if (sql.includes('INSERT INTO MintBatchStatus')) {
+								const [id, owner] = args.map(String)
+								if (workflowOwners.has(id) && workflowOwners.get(id) !== owner) return null
+								workflowOwners.set(id, owner)
+								return { Workflow_Id: id }
+							}
 							if (sql.includes('FROM Smols WHERE Id = ?1')) {
 								return rows.get(String(args[0])) ?? null
 							}
@@ -161,11 +171,11 @@ function createMintEnv(initialRows: Record<string, { Address: string; Mint_Token
 	}
 }
 
-test('Gate 3a: TxWorkflow splits submit vs confirm so confirmation retry never double-submits relay, and narrows cache purge tags', async () => {
+test('Gate 3a: TxWorkflow splits submit vs confirm so confirmation retry never double-submits relay, and purges all affected cache tags', async () => {
 	const harness = createMintEnv({
-		'smol-1': { Address: OWNER_SUB, Mint_Token: null, Mint_Amm: null },
+		[SINGLE_ID]: { Address: OWNER_SUB, Mint_Token: null, Mint_Amm: null },
 	})
-	const resultMetaB64 = buildReturnValueMetaB64(['CTOKEN1', 'CAMM1'])
+	const resultMetaB64 = buildReturnValueMetaB64([SINGLE_PAIR.sac, SINGLE_PAIR.pool])
 	const { envelopeXdr, resultXdr } = buildMockEnvelopeAndResultXdr()
 	const purgedTags: string[][] = []
 	let rpcCalls = 0
@@ -212,7 +222,7 @@ test('Gate 3a: TxWorkflow splits submit vs confirm so confirmation retry never d
 		const event = {
 			payload: {
 				type: 'mint' as const,
-				entropy: 'smol-1',
+				entropy: SINGLE_ID,
 				xdr: 'unsigned-xdr',
 				sub: MINTER_SUB,
 				ownerSub: OWNER_SUB,
@@ -232,14 +242,14 @@ test('Gate 3a: TxWorkflow splits submit vs confirm so confirmation retry never d
 		const run2 = createWorkflowStep(cache)
 		await wf.run(event as never, run2.step as never)
 		assert.equal(harness.getRelaySubmitCalls(), 1, 'Relay submitTransaction must be called EXACTLY ONCE across confirm replay')
-		assert.equal(harness.rows.get('smol-1')?.Mint_Token, 'CTOKEN1')
-		assert.equal(harness.rows.get('smol-1')?.Mint_Amm, 'CAMM1')
+		assert.equal(harness.rows.get(SINGLE_ID)?.Mint_Token, SINGLE_PAIR.sac)
+		assert.equal(harness.rows.get(SINGLE_ID)?.Mint_Amm, SINGLE_PAIR.pool)
 
-		// Narrowed cache purge tags (never global public-smols or mixtapes)
+		// Mint changes public list metadata as well as individual Smol metadata.
 		const allTags = purgedTags.flat()
-		assert.equal(allTags.includes('public-smols'), false)
-		assert.equal(allTags.includes('mixtapes'), false)
-		assert.ok(allTags.includes('smol:smol-1:anonymous'))
+		assert.equal(allTags.includes('public-smols'), true)
+		assert.equal(allTags.includes('mixtapes'), true)
+		assert.ok(allTags.includes(`smol:${SINGLE_ID}:anonymous`))
 		assert.ok(allTags.includes(`artist:${OWNER_SUB}:smols`))
 	} finally {
 		globalThis.fetch = originalFetch
@@ -423,7 +433,7 @@ test('Gate 3b: batch mint maps reversed contract push_front tuples to signed coi
 
 test('Gate 3c: POST /mint/:id and POST /mint deduplicate identical submissions and keep 202 response formats', async () => {
 	const harness = createMintEnv({
-		'm1': { Address: OWNER_SUB, Mint_Token: null, Mint_Amm: null },
+		[SINGLE_ID]: { Address: OWNER_SUB, Mint_Token: null, Mint_Amm: null },
 		'm2': { Address: OWNER_SUB, Mint_Token: 'CEXIST', Mint_Amm: 'CAMMEXIST' },
 	})
 	const token = await createAuthToken(MINTER_SUB, TEST_SECRET)
@@ -447,7 +457,7 @@ test('Gate 3c: POST /mint/:id and POST /mint deduplicate identical submissions a
 
 	// Duplicate single mint requests both return 202 empty body, but only 1 workflow is created
 	const s1 = await appModule.app.fetch(
-		new Request('https://api.smol.xyz/mint/m1', {
+		new Request(`https://api.smol.xyz/mint/${SINGLE_ID}`, {
 			method: 'POST',
 			headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
 			body: JSON.stringify({ xdr: emptyEnvelope }),
@@ -456,7 +466,7 @@ test('Gate 3c: POST /mint/:id and POST /mint deduplicate identical submissions a
 		ctx.ctx
 	)
 	const s2 = await appModule.app.fetch(
-		new Request('https://api.smol.xyz/mint/m1', {
+		new Request(`https://api.smol.xyz/mint/${SINGLE_ID}`, {
 			method: 'POST',
 			headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
 			body: JSON.stringify({ xdr: emptyEnvelope }),
@@ -473,14 +483,17 @@ test('Gate 3c: POST /mint/:id and POST /mint deduplicate identical submissions a
 		new Request('https://api.smol.xyz/mint', {
 			method: 'POST',
 			headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-			body: JSON.stringify({ xdr: emptyEnvelope, ids: ['m1', 'm2'] }),
+			body: JSON.stringify({ xdr: emptyEnvelope, ids: [SINGLE_ID, 'm2'] }),
 		}),
 		harness.env,
 		ctx.ctx
 	)
 	assert.equal(b1.status, 202)
-	assert.deepEqual(await b1.json(), {
-		acceptedIds: ['m1'],
+	const firstBatch = await b1.json() as { workflowId: string }
+	assert.match(firstBatch.workflowId, /^batch-mint-[0-9a-f]{48}$/)
+	assert.deepEqual(firstBatch, {
+		workflowId: firstBatch.workflowId,
+		acceptedIds: [SINGLE_ID],
 		skipped: { alreadyMinted: ['m2'] },
 	})
 	assert.equal(harness.txWorkflowCreates.length, 2)
@@ -489,11 +502,12 @@ test('Gate 3c: POST /mint/:id and POST /mint deduplicate identical submissions a
 		new Request('https://api.smol.xyz/mint', {
 			method: 'POST',
 			headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-			body: JSON.stringify({ xdr: emptyEnvelope, ids: ['m1', 'm2'] }),
+			body: JSON.stringify({ xdr: emptyEnvelope, ids: [SINGLE_ID, 'm2'] }),
 		}),
 		harness.env,
 		ctx.ctx
 	)
 	assert.equal(b2.status, 202)
+	assert.deepEqual(await b2.json(), firstBatch)
 	assert.equal(harness.txWorkflowCreates.length, 2, 'Duplicate batch mint request must deduplicate')
 })

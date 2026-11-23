@@ -46,7 +46,8 @@ auth.post('/login', async (c) => {
 				throw new HTTPException(400, { message: 'Missing required login fields' })
 			}
 			const rpcUrl = network === 'testnet' ? env.RPC_URL_TESTNET : env.RPC_URL
-			await verifyAuthentication(host, keyId, contractId, response as AuthenticationResponseJSON, rpcUrl, protocol)
+			const binding = network === 'testnet' ? undefined : env.KALE_WORKER
+			await verifyAuthentication(host, keyId, contractId, response as AuthenticationResponseJSON, rpcUrl, protocol, binding)
 			const user = await env.SMOL_D1.prepare(`SELECT Username FROM Users WHERE "Address" = ?1`)
 				.bind(contractId)
 				.first()

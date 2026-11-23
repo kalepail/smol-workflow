@@ -1,4 +1,4 @@
-import { Keypair, scValToNative, xdr } from "@stellar/stellar-sdk/minimal";
+import { Keypair, Networks, scValToNative, xdr } from "@stellar/stellar-sdk/minimal";
 import { Server } from "@stellar/stellar-sdk/minimal/rpc";
 import { basicNodeSigner } from "@stellar/stellar-sdk/minimal/contract";
 import { WorkflowEntrypoint, WorkflowEvent, WorkflowStep, WorkflowStepConfig } from "cloudflare:workers";
@@ -6,6 +6,8 @@ import { NonRetryableError } from "cloudflare:workflows";
 import { Client as SmolClient } from "smol-sdk";
 import { purgeCacheByTags } from "./utils/cache";
 import { artistSmolsCacheTag } from "./utils/cache-tags";
+import { deriveMintPair, isLedgerSequence, type MainnetChainReads } from "./utils/chain";
+import type { MintPhase } from "./utils/chain-target";
 
 const config: WorkflowStepConfig = {
 	retries: {
@@ -148,38 +150,55 @@ export function pairBatchMintResults(params: {
 	return paired;
 }
 
-/**
- * Poll Stellar RPC for a submitted relay transaction hash and return its base64 returnValue.
- */
-export async function confirmTransactionOnRpc(
+type ConfirmedMint = { returnValue: string; ledger?: number };
+class FailedMintReceipt extends NonRetryableError {}
+
+async function confirmMint(
 	hash: string,
 	rpcUrl: string,
-	options?: { timeoutMs?: number; pollIntervalMs?: number }
-): Promise<string> {
-	const rpcServer = new Server(rpcUrl);
-	const timeoutMs = options?.timeoutMs ?? 25_000;
-	const pollIntervalMs = options?.pollIntervalMs ?? 1_000;
-	const deadline = Date.now() + timeoutMs;
-
+	binding?: MainnetChainReads,
+): Promise<ConfirmedMint> {
+	let getTx: MainnetChainReads['getTx'];
+	let pollInterval: number;
+	if (typeof binding?.getTx === 'function') {
+		getTx = (txHash) => binding.getTx(txHash);
+		pollInterval = 4_000;
+	} else {
+		const server = new Server(rpcUrl);
+		getTx = async (txHash) => {
+			const result = await server.getTransaction(txHash);
+			return {
+				status: result.status,
+				latestLedger: result.latestLedger,
+				...(result.status === 'SUCCESS' ? {
+					ledger: result.ledger,
+					returnValueXdr: result.returnValue?.toXDR('base64'),
+				} : {}),
+			};
+		};
+		pollInterval = 1_000;
+	}
+	const deadline = Date.now() + 25_000;
 	while (true) {
-		const result = await rpcServer.getTransaction(hash);
-
+		let result;
+		try {
+			result = await getTx(hash);
+		} catch {
+			throw new Error('Mint receipt lookup unavailable');
+		}
 		if (result.status === 'SUCCESS') {
-			if (!result.returnValue) {
-				throw new NonRetryableError(`Transaction ${hash} succeeded on-chain but has no returnValue`);
+			if (!result.returnValueXdr || (binding && typeof binding.getTx === 'function' && !isLedgerSequence(result.ledger))) {
+				throw new NonRetryableError('Mint succeeded on-chain but its receipt is incomplete');
 			}
-			return result.returnValue.toXDR('base64');
+			return { returnValue: result.returnValueXdr, ledger: result.ledger };
 		}
-
 		if (result.status === 'FAILED') {
-			throw new NonRetryableError(`Transaction ${hash} failed on-chain`);
+			throw new FailedMintReceipt('Mint transaction failed on-chain');
 		}
-
-		if (Date.now() >= deadline) {
-			throw new Error(`Transaction ${hash} still pending on Stellar RPC (NOT_FOUND)`);
+		if (result.status !== 'NOT_FOUND' || Date.now() >= deadline) {
+			throw new Error('Mint receipt is still unavailable');
 		}
-
-		await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+		await new Promise((resolve) => setTimeout(resolve, Math.min(pollInterval, deadline - Date.now())));
 	}
 }
 
@@ -222,6 +241,30 @@ async function verifyExistingMintRow(
 	);
 }
 
+async function purgeMintCaches(env: Env, ids: string[], tags: Iterable<string>): Promise<void> {
+	if (!ids.length) return;
+	const { results } = await env.SMOL_D1.prepare(`
+		WITH ids AS (SELECT value AS Id FROM json_each(?1))
+		SELECT 'mixtape:' || m.mix_id AS Tag
+		FROM ids CROSS JOIN MixtapeMember m ON m.smol_id = ids.Id
+		UNION
+		SELECT 'playlist:' || p.Title AS Tag
+		FROM ids CROSS JOIN Playlists p ON p.Id = ids.Id
+	`).bind(JSON.stringify(ids)).all<{ Tag: string }>();
+	await purgeCacheByTags(['mixtapes', 'public-smols', ...tags, ...results.map(({ Tag }) => Tag)]);
+}
+
+async function recordMintPhase(
+	env: Env, event: WorkflowEvent<WorkflowTxParams>, phase: MintPhase, hash?: string, ledger?: number,
+) {
+	if (!event.payload.trackStatus) return;
+	await env.SMOL_D1.prepare(`
+		UPDATE MintBatchStatus SET Phase = ?1, Tx_Hash = coalesce(?2, Tx_Hash),
+			Confirmed_Ledger = coalesce(?3, Confirmed_Ledger)
+		WHERE Workflow_Id = ?4 AND "Address" = ?5
+	`).bind(phase, hash ?? null, ledger ?? null, event.instanceId, event.payload.sub).run();
+}
+
 export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
 	async run(event: WorkflowEvent<WorkflowTxParams>, step: WorkflowStep) {
 		if (event.payload.type !== 'mint' && event.payload.type !== 'batch-mint') {
@@ -236,6 +279,12 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
 			return await this.signTransaction(event.payload.xdr);
 		});
 
+		if (event.payload.trackStatus) {
+			await step.do('record mint submit intent', config, async () => {
+				await recordMintPhase(this.env, event, 'submitting');
+			});
+		}
+
 		// Step 2: Single non-retried submission to kale-worker relay; checkpoints returned relay hash.
 		const submitted = await step.do(
 			'submit transaction',
@@ -243,16 +292,13 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
 			async (): Promise<{ hash: string }> => {
 				let result: { hash?: string; error?: string; errorCode?: string };
 				try {
-					result = await (this.env.KALE_WORKER as KaleWorkerBinding).submitTransaction({ xdr: signedXdr });
-				} catch (err) {
-					const message = err instanceof Error ? err.message : String(err);
-					throw new NonRetryableError(
-						`Relay submission outcome unknown (requires reconciliation, refusing duplicate submit): ${message}`
-					);
+					result = await this.env.KALE_WORKER.submitTransaction({ xdr: signedXdr });
+				} catch {
+					throw new NonRetryableError('Relay submission outcome unknown (requires reconciliation)');
 				}
 
 				if (result?.error) {
-					throw new NonRetryableError(`Transaction rejected by relay: ${result.error} (${result.errorCode ?? 'unknown'})`);
+					throw new NonRetryableError('Relay could not confirm submission');
 				}
 
 				if (!result?.hash || typeof result.hash !== 'string') {
@@ -265,18 +311,36 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
 			}
 		);
 
-		// Step 3: Read-only confirmation step using the durable relay hash
-		const returnValue = await step.do(
+		if (event.payload.trackStatus) {
+			await step.do('record submitted mint', config, async () => {
+				await recordMintPhase(this.env, event, 'submitted', submitted.hash);
+			});
+		}
+
+		// Step 3: Read-only confirmation step using the durable relay hash.
+		const receipt = await step.do(
 			'confirm transaction',
 			confirmConfig,
-			async (): Promise<string> => {
-				return await confirmTransactionOnRpc(submitted.hash, this.env.RPC_URL);
+			async (): Promise<ConfirmedMint | string> => {
+				const binding = this.env.NETWORK_PASSPHRASE === Networks.PUBLIC ? this.env.KALE_WORKER : undefined;
+				try {
+					return await confirmMint(submitted.hash, this.env.RPC_URL, binding);
+				} catch (error) {
+					if (error instanceof FailedMintReceipt) await recordMintPhase(this.env, event, 'failed', submitted.hash);
+					throw error;
+				}
 			}
 		);
+		// In-flight legacy runs may already have checkpointed a raw return-value string.
+		const confirmed = typeof receipt === 'string' ? { returnValue: receipt } : receipt;
+		if (event.payload.trackStatus) {
+			await step.do('record confirmed mint', config, async () => {
+				await recordMintPhase(this.env, event, 'confirmed', submitted.hash, confirmed.ledger);
+			});
+		}
+		const res = { hash: submitted.hash, ...confirmed };
 
-		const res = { hash: submitted.hash, returnValue };
-
-		// Step 4: Idempotent D1 persistence + narrowed cache invalidation
+		// Step 4: Idempotent D1 persistence and cache invalidation.
 		if (event.payload.type === 'mint') {
 			await step.do('persist mint metadata', config, async () => {
 				const decoded = scValToNative(xdr.ScVal.fromXDR(res.returnValue, 'base64'));
@@ -284,6 +348,10 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
 				const id = event.payload.entropy;
 				if (!id) {
 					throw new NonRetryableError('Missing smol entropy id for mint persistence');
+				}
+				const expected = deriveMintPair(id);
+				if (!expected || tokenSACAddress !== expected.sac || cometAMMAddress !== expected.pool) {
+					throw new NonRetryableError('Single mint receipt conflicts with the canonical token and pool');
 				}
 
 				const result = await this.env.SMOL_D1.prepare(`
@@ -306,10 +374,7 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
 					`user:${event.payload.sub}:smol:${id}`,
 				]);
 
-				await purgeCacheByTags([
-					...userTags,
-					`smol:${id}:anonymous`,
-				]);
+				await purgeMintCaches(this.env, [id], [...userTags, `smol:${id}:anonymous`]);
 			});
 		} else if (event.payload.type === 'batch-mint') {
 			await step.do('persist batch mint metadata', config, async () => {
@@ -348,13 +413,21 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
 				}
 
 				const smolCacheTags = new Set<string>();
+				const persistedIds: string[] = [];
+				let conflict: unknown;
 				for (let i = 0; i < verifiedPairs.length; i++) {
 					const { id, token, amm } = verifiedPairs[i];
 					const changes = runResults[i]?.meta?.changes ?? 0;
 					if (changes === 0) {
-						await verifyExistingMintRow(this.env, id, token, amm);
+						try {
+							await verifyExistingMintRow(this.env, id, token, amm);
+						} catch (error) {
+							conflict ??= error;
+							continue;
+						}
 					}
 
+					persistedIds.push(id);
 					const ownerSub = event.payload.ownerSubsById?.[id] ?? event.payload.sub;
 					smolCacheTags.add(artistSmolsCacheTag(ownerSub));
 					smolCacheTags.add(`user:${ownerSub}:created`);
@@ -363,12 +436,16 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
 					smolCacheTags.add(`smol:${id}:anonymous`);
 				}
 
-				if (smolCacheTags.size > 0) {
-					await purgeCacheByTags([...smolCacheTags]);
-				}
+				await purgeMintCaches(this.env, persistedIds, smolCacheTags);
+				if (conflict) throw conflict;
 			});
 		}
 
+		if (event.payload.trackStatus) {
+			await step.do('record persisted mint', config, async () => {
+				await recordMintPhase(this.env, event, 'persisted', submitted.hash, confirmed.ledger);
+			});
+		}
 		return res;
 	}
 
@@ -383,7 +460,23 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
 
 		const at = contract.txFromXDR(xdrEnvelope);
 
+		const getSequence = async () => {
+			if (this.env.NETWORK_PASSPHRASE === Networks.PUBLIC && typeof this.env.KALE_WORKER?.getTip === 'function') {
+				return (await this.env.KALE_WORKER.getTip()).sequence;
+			}
+			return (await new Server(this.env.RPC_URL).getHealth()).latestLedger;
+		};
+		let sequence: number;
+		try {
+			sequence = await getSequence();
+		} catch {
+			throw new Error('Signing ledger tip unavailable');
+		}
+		const expiration = sequence + 100;
+		if (!isLedgerSequence(sequence) || !isLedgerSequence(expiration)) throw new Error('Invalid signing ledger tip');
+
 		await at.signAuthEntries({
+			expiration,
 			address: signerPublicKey,
 			signAuthEntry: basicNodeSigner(signerKeypair, this.env.NETWORK_PASSPHRASE).signAuthEntry,
 		});

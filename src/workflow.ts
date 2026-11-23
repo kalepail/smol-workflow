@@ -84,6 +84,7 @@ async function persistSmolAndPlaylistD1(params: {
 	env: Env;
 	id: string;
 	title: string;
+	tags: string[];
 	song1: string;
 	song2: string | null;
 	address: string;
@@ -97,6 +98,7 @@ async function persistSmolAndPlaylistD1(params: {
 		env,
 		id,
 		title,
+		tags,
 		song1,
 		song2,
 		address,
@@ -121,29 +123,22 @@ async function persistSmolAndPlaylistD1(params: {
 		? env.SMOL_D1.prepare(`INSERT OR IGNORE INTO Playlists (Id, Title) VALUES (?1, ?2)`).bind(id, playlist)
 		: null;
 
-	// Post-migration schema (nullable Song_2 + Requested_Provider + Actual_Provider)
-	const postMigrationInsert = env.SMOL_D1.prepare(`
-		INSERT INTO Smols (Id, Title, Song_1, Song_2, Address, Public, Instrumental, Requested_Provider, Actual_Provider)
-		VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-		ON CONFLICT (Id) DO NOTHING
-	`).bind(
-		id,
-		title,
-		song1,
-		song2,
-		address,
-		isSearchPublic,
-		isInstrumental,
-		requestedProvider,
-		actualProvider,
-	);
-
-	try {
-		await runStatements(playlistStmt ? [postMigrationInsert, playlistStmt] : [postMigrationInsert]);
-		return;
-	} catch (err) {
-		if (!isSchemaCompatError(err)) {
-			throw err;
+	// Replay can encounter a row published by the prior worker, so fill only missing tags.
+	for (const includeTags of [true, false]) {
+		const insert = env.SMOL_D1.prepare(`
+			INSERT INTO Smols (Id, Title, Song_1, Song_2, Address, Public, Instrumental,
+				Requested_Provider, Actual_Provider${includeTags ? ', Tags' : ''})
+			VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9${includeTags ? ', ?10' : ''})
+			ON CONFLICT (Id) DO ${includeTags ? 'UPDATE SET Tags = excluded.Tags WHERE Smols.Tags IS NULL' : 'NOTHING'}
+		`).bind(
+			id, title, song1, song2, address, isSearchPublic, isInstrumental, requestedProvider, actualProvider,
+			...(includeTags ? [JSON.stringify(tags)] : []),
+		);
+		try {
+			await runStatements(playlistStmt ? [insert, playlistStmt] : [insert]);
+			return;
+		} catch (err) {
+			if (!isSchemaCompatError(err)) throw err;
 		}
 	}
 
@@ -453,6 +448,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 				env: this.env,
 				id: event.instanceId,
 				title: lyrics.title,
+				tags: lyrics.style ?? [],
 				song1,
 				song2,
 				address,
