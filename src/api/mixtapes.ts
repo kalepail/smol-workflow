@@ -1,6 +1,5 @@
 import { Hono, type Context, type Next } from 'hono'
 import { HTTPException } from 'hono/http-exception'
-import { cache } from 'hono/cache'
 import type { HonoEnv, SmolKVData } from '../types'
 import { parseAuth } from '../middleware/auth'
 import { purgeMixtapeCache } from '../utils/cache'
@@ -30,10 +29,17 @@ const DRAFT_ID = '__draft__'
 
 // v2 namespace: entries written by the pre-lifecycle worker (unfiltered, URL-keyed) are never read.
 const PUBLIC_CACHE_NAME = 'smol-workflow-mixtapes-v2'
-// Browsers always revalidate; only the edge keeps a copy (purged by tag, keyed by epoch).
-const PUBLIC_CACHE_CONTROL = 'public, max-age=0, s-maxage=60, stale-while-revalidate=120'
+// Browsers must revalidate synchronously on every use (no stale-while-revalidate window).
+const BROWSER_CACHE_CONTROL = 'public, max-age=0, must-revalidate'
+// Edge policy lives only in CDN-Cache-Control and on the epoch-keyed Worker Cache API copy.
+const CDN_CACHE_CONTROL = 'public, s-maxage=60, stale-while-revalidate=120'
+const EDGE_COPY_CACHE_CONTROL = 'public, max-age=60, s-maxage=60'
 const EPOCH_PARAM = '__mx_epoch'
 const BUMP_EPOCH_SQL = 'UPDATE MixtapeState SET Epoch = Epoch + 1 WHERE Id = 1'
+/** Rolls the whole batch back (CHECK Epoch >= 0) when the immediately preceding statement changed nothing. */
+const ABORT_IF_PREVIOUS_MISSED_SQL = 'UPDATE MixtapeState SET Epoch = -1 WHERE Id = 1 AND changes() = 0'
+/** Rolls the whole batch back when anything mixtape-related committed since the epoch was captured. */
+const ABORT_IF_EPOCH_MOVED_SQL = 'UPDATE MixtapeState SET Epoch = -1 WHERE Id = 1 AND Epoch != ?1'
 const PRIVATE_HEADERS = {
 	'Cache-Control': 'private, no-store',
 	'CDN-Cache-Control': 'no-store',
@@ -231,16 +237,21 @@ function newMixtapeId(): string {
 	return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
-/** Same-owner identical live mixtapes created within the retry window, oldest INSERT first. */
-async function findIdenticalRecent(env: Env, address: string, smols: string, title: string, desc: string): Promise<MixtapeRow | undefined> {
-	const { results } = await env.SMOL_D1.prepare(`
-		${MIXTAPE_SELECT}
-		WHERE "Address" = ?1 AND Smols = ?2 AND Deleted_At IS NULL
-			AND Created_At >= datetime('now', '${IDEMPOTENT_RETRY_WINDOW}')
-		ORDER BY rowid ASC
-	`).bind(address, smols).all<MixtapeRow>()
-	return results.find((row) => normalizeMixtapeText(row.Title) === normalizeMixtapeText(title)
-		&& normalizeMixtapeText(row.Desc) === normalizeMixtapeText(desc))
+/** SHA-256 identity of an exact retry: owner, ordered smols, normalized title & description. */
+async function retryKey(address: string, smols: string, title: string, desc: string): Promise<string> {
+	const payload = JSON.stringify([address, smols, normalizeMixtapeText(title), normalizeMixtapeText(desc)])
+	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(payload))
+	return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+/** A guarded batch aborted on purpose (CHECK on MixtapeState.Epoch): retry or 409, never 500. */
+function isGuardAbort(error: unknown): boolean {
+	return error instanceof Error && /CHECK constraint failed/i.test(error.message) && /Epoch/.test(error.message)
+}
+
+async function readEpoch(env: Env): Promise<number> {
+	const state = await env.SMOL_D1.prepare('SELECT Epoch FROM MixtapeState WHERE Id = 1').first<{ Epoch: number }>()
+	return state?.Epoch ?? 0
 }
 
 // ---------------------------------------------------------------------------
@@ -257,16 +268,37 @@ async function publicCacheKey(c: Context<HonoEnv>): Promise<string> {
 	const url = new URL(c.req.url)
 	url.searchParams.delete(EPOCH_PARAM)
 	url.searchParams.sort()
-	const state = await c.env.SMOL_D1.prepare('SELECT Epoch FROM MixtapeState WHERE Id = 1').first<{ Epoch: number }>()
-	url.searchParams.set(EPOCH_PARAM, String(state?.Epoch ?? 0))
+	url.searchParams.set(EPOCH_PARAM, String(await readEpoch(c.env)))
 	return url.toString()
 }
 
-const publicCache = () => cache({
-	cacheName: PUBLIC_CACHE_NAME,
-	cacheControl: PUBLIC_CACHE_CONTROL,
-	keyGenerator: publicCacheKey,
-})
+function withBrowserPolicy(response: Response): Response {
+	const out = new Response(response.body, response)
+	out.headers.set('Cache-Control', BROWSER_CACHE_CONTROL)
+	out.headers.set('CDN-Cache-Control', CDN_CACHE_CONTROL)
+	return out
+}
+
+/**
+ * Public read cache. The Worker Cache API copy (v2 namespace, epoch-versioned key) carries the
+ * edge TTL; every response that reaches a browser carries `max-age=0, must-revalidate`, so a
+ * rename, delete or song privacy change is never served stale from a browser cache.
+ */
+const publicCache = () => async (c: Context<HonoEnv>, next: Next) => {
+	const edge = typeof caches === 'undefined' ? null : await caches.open(PUBLIC_CACHE_NAME)
+	const key = edge ? await publicCacheKey(c) : ''
+	const hit = edge ? await edge.match(key) : undefined
+	if (hit) return withBrowserPolicy(hit)
+
+	await next()
+	if (edge && c.res.status === 200) {
+		const copy = new Response(c.res.clone().body, c.res)
+		copy.headers.set('Cache-Control', EDGE_COPY_CACHE_CONTROL)
+		c.executionCtx.waitUntil(edge.put(key, copy))
+	}
+	c.res.headers.set('Cache-Control', BROWSER_CACHE_CONTROL)
+	c.res.headers.set('CDN-Cache-Control', CDN_CACHE_CONTROL)
+}
 
 /** Private, never-shared cache policy on EVERY response (incl. 400/401/403 thrown before handlers). */
 async function privateNoStore(c: Context<HonoEnv>, next: Next) {
@@ -341,19 +373,6 @@ async function deriveDecisions(rows: MixtapeRow[], publicSmols: ReadonlyMap<stri
 	return { candidates, decisions: classifyOwnerMixtapes(candidates, verdicts) }
 }
 
-/** `id:revision` of every live cohort row, sorted by Id (binary order, same as SQLite's). */
-function cohortVersion(rows: MixtapeRow[]): string {
-	return rows.map((row) => `${row.Id}:${row.Revision}`).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).join(',')
-}
-
-const COHORT_VERSION_SQL = `(
-	SELECT group_concat(v, ',') FROM (
-		SELECT Id || ':' || Revision AS v FROM Mixtapes
-		WHERE "Address" = ?7 AND Deleted_At IS NULL AND Visibility != 'deleted'
-		ORDER BY Id
-	)
-)`
-
 // ---------------------------------------------------------------------------
 // Write-time cohort re-evaluation (Tier 1 + optional top-1 borderline Tier 2)
 // ---------------------------------------------------------------------------
@@ -366,27 +385,50 @@ interface CohortResult {
 }
 
 /**
- * Re-derive and persist the owner's whole cohort. Every derived UPDATE is guarded by the
- * exact cohort version (all live `Id:Revision` pairs) it was computed from, inside one D1
- * batch, so a slow AI call can never overwrite a newer edit's decision: if anything changed
- * meanwhile, nothing is written and the cohort is re-read and re-derived (no new inference;
- * the fresh receipt is reused only while its revisions and fingerprint still hold).
+ * Consistent read of one owner's cohort. The epoch is captured BEFORE the rows, so any commit
+ * that lands after (or during) this read is detected by the write guard below.
+ */
+async function loadCohortSnapshot(env: Env, address: string) {
+	const epoch = await readEpoch(env)
+	const rows = await loadOwnerRows(env, address)
+	const publicSmols = await loadPublicSmolRows(env, rows.flatMap((row) => parseStoredSmolIds(row.Smols)))
+	return { epoch, rows, publicSmols }
+}
+
+/**
+ * Re-derive and persist the owner's whole cohort with compare-and-swap semantics. The batch
+ * first aborts if `MixtapeState.Epoch` moved since the snapshot (any mixtape write, derived
+ * write or song privacy flip bumps it). Every derived UPDATE then requires the row's exact
+ * snapshot (Revision, Visibility, Hidden_Reason, Related_Mixtape_Id, Uniqueness_Score,
+ * Ai_Verdict) and is followed by an abort-if-missed statement, so the batch commits entirely
+ * or not at all. On abort the cohort is re-read and re-derived without new inference. A fresh
+ * AI receipt survives a retry only if its host row's verdict is untouched, its revisions are
+ * current and its input fingerprint still matches; a late/older call can never overwrite a
+ * committed verdict. If retries run out, the committed state is re-read and returned.
  */
 async function reevaluateOwnerCohort(
 	env: Env,
 	address: string,
 	options: { subjectId?: string; allowAi: boolean },
 ): Promise<CohortResult> {
-	let fresh: { hostId: string; receipt: AiVerdictReceipt } | null = null
-	let result: CohortResult | null = null
+	let fresh: { hostId: string; receipt: AiVerdictReceipt; baseVerdict: string | null } | null = null
 
 	for (let attempt = 0; attempt < MAX_COHORT_ATTEMPTS; attempt += 1) {
-		const rows = await loadOwnerRows(env, address)
-		const publicSmols = await loadPublicSmolRows(env, rows.flatMap((row) => parseStoredSmolIds(row.Smols)))
+		const { epoch, rows, publicSmols } = await loadCohortSnapshot(env, address)
 		const candidates = rows.map((row) => toCandidate(row, publicSmols))
+		const byId = new Map(candidates.map((candidate) => [candidate.id, candidate]))
 		const revisions = new Map(rows.map((row) => [row.Id, row.Revision]))
-		const freshCurrent = fresh !== null && receiptRevisionsCurrent(fresh.receipt, revisions)
-		const receiptOf = (row: MixtapeRow) => (freshCurrent && fresh?.hostId === row.Id ? fresh.receipt : parseReceipt(row.Ai_Verdict))
+
+		let freshUsable = false
+		if (fresh) {
+			const host = rows.find((row) => row.Id === fresh!.hostId)
+			const [x, y] = fresh.receipt.pair.map((id) => byId.get(id))
+			freshUsable = Boolean(host && x && y)
+				&& host!.Ai_Verdict === fresh.baseVerdict
+				&& receiptRevisionsCurrent(fresh.receipt, revisions)
+				&& fresh.receipt.fp === await pairFingerprint(x!, y!)
+		}
+		const receiptOf = (row: MixtapeRow) => (freshUsable && fresh?.hostId === row.Id ? fresh.receipt : parseReceipt(row.Ai_Verdict))
 		const verdicts = await collectVerdicts(rows, candidates, receiptOf)
 		let decisions = classifyOwnerMixtapes(candidates, verdicts)
 
@@ -403,6 +445,7 @@ async function reevaluateOwnerCohort(
 					fp: await pairFingerprint(pair.a, pair.b),
 					at: new Date().toISOString(),
 				}
+				const baseVerdictOf = (id: string) => rows.find((row) => row.Id === id)?.Ai_Verdict ?? null
 				const titles = new Map([...publicSmols.values()].map((smol) => [smol.Id, smol.Title]))
 				const verdict = await adjudicateMixtapePair(env, pair.a, pair.b, titles)
 				if (verdict.ok) {
@@ -418,7 +461,7 @@ async function reevaluateOwnerCohort(
 						hidden: null,
 						ms: verdict.verdict.latencyMs,
 					}
-					fresh = { hostId: subjectId, receipt }
+					fresh = { hostId: subjectId, receipt, baseVerdict: baseVerdictOf(subjectId) }
 					if (verdict.verdict.isDuplicate) {
 						const trial = classifyOwnerMixtapes(candidates, [...verdicts, { hiddenId: hidden.id, keeperId: keeper.id, pDuplicate: receipt.p! }])
 						const applied = trial.get(hidden.id)?.hiddenReason === 'semantic_duplicate' && trial.get(hidden.id)?.relatedId === keeper.id
@@ -426,23 +469,26 @@ async function reevaluateOwnerCohort(
 						if (applied) {
 							receipt.keep = keeper.id
 							receipt.hidden = hidden.id
-							fresh = { hostId: hidden.id, receipt }
+							fresh = { hostId: hidden.id, receipt, baseVerdict: baseVerdictOf(hidden.id) }
 							decisions = trial
 						}
 					}
 				} else if (verdict.reason !== 'disabled') {
-					fresh = { hostId: subjectId, receipt: { ...base, model: MIXTAPE_DEDUPE_MODEL_SELECTOR, fallback: verdict.reason, ms: verdict.latencyMs } }
+					fresh = {
+						hostId: subjectId,
+						receipt: { ...base, model: MIXTAPE_DEDUPE_MODEL_SELECTOR, fallback: verdict.reason, ms: verdict.latencyMs },
+						baseVerdict: baseVerdictOf(subjectId),
+					}
 				}
+				freshUsable = fresh !== null
 			}
 		}
 
-		const persistFresh = fresh !== null && receiptRevisionsCurrent(fresh.receipt, revisions)
-		const version = cohortVersion(rows)
-		const statements: D1PreparedStatement[] = []
+		const statements: D1PreparedStatement[] = [env.SMOL_D1.prepare(ABORT_IF_EPOCH_MOVED_SQL).bind(epoch)]
 		const changedIds: string[] = []
 		const nextRows = rows.map((row) => {
 			const decision = decisions.get(row.Id)!
-			const aiVerdict = persistFresh && fresh?.hostId === row.Id ? JSON.stringify(fresh.receipt) : row.Ai_Verdict
+			const aiVerdict = freshUsable && fresh?.hostId === row.Id ? JSON.stringify(fresh.receipt) : row.Ai_Verdict
 			const changed = row.Visibility !== decision.visibility
 				|| row.Hidden_Reason !== decision.hiddenReason
 				|| row.Related_Mixtape_Id !== decision.relatedId
@@ -450,12 +496,20 @@ async function reevaluateOwnerCohort(
 				|| row.Ai_Verdict !== aiVerdict
 			if (!changed) return row
 			changedIds.push(row.Id)
-			statements.push(env.SMOL_D1.prepare(`
-				UPDATE Mixtapes
-				SET Visibility = ?1, Hidden_Reason = ?2, Related_Mixtape_Id = ?3, Uniqueness_Score = ?4, Ai_Verdict = ?5
-				WHERE Id = ?6 AND "Address" = ?7 AND Revision = ?8 AND Deleted_At IS NULL
-					AND ${COHORT_VERSION_SQL} = ?9
-			`).bind(decision.visibility, decision.hiddenReason, decision.relatedId, decision.uniquenessScore, aiVerdict, row.Id, address, row.Revision, version))
+			statements.push(
+				env.SMOL_D1.prepare(`
+					UPDATE Mixtapes
+					SET Visibility = ?1, Hidden_Reason = ?2, Related_Mixtape_Id = ?3, Uniqueness_Score = ?4, Ai_Verdict = ?5
+					WHERE Id = ?6 AND "Address" = ?7 AND Revision = ?8 AND Deleted_At IS NULL
+						AND Visibility IS ?9 AND Hidden_Reason IS ?10 AND Related_Mixtape_Id IS ?11
+						AND Uniqueness_Score IS ?12 AND Ai_Verdict IS ?13
+				`).bind(
+					decision.visibility, decision.hiddenReason, decision.relatedId, decision.uniquenessScore, aiVerdict,
+					row.Id, address, row.Revision,
+					row.Visibility, row.Hidden_Reason, row.Related_Mixtape_Id, row.Uniqueness_Score, row.Ai_Verdict,
+				),
+				env.SMOL_D1.prepare(ABORT_IF_PREVIOUS_MISSED_SQL),
+			)
 			return {
 				...row,
 				Visibility: decision.visibility,
@@ -466,15 +520,24 @@ async function reevaluateOwnerCohort(
 			}
 		})
 
-		result = { rows: nextRows, decisions, publicSmols, changedIds }
-		if (!statements.length) return result
-		const outcomes = await env.SMOL_D1.batch([...statements, env.SMOL_D1.prepare(BUMP_EPOCH_SQL)])
-		if (outcomes.slice(0, statements.length).every((outcome) => outcome.meta?.changes === 1)) return result
-		console.warn('mixtape_cohort_stale_retry', { address, attempt })
+		const result: CohortResult = { rows: nextRows, decisions, publicSmols, changedIds }
+		if (!changedIds.length) {
+			if (await readEpoch(env) === epoch) return result // still exactly the committed state
+			continue
+		}
+		try {
+			await env.SMOL_D1.batch([...statements, env.SMOL_D1.prepare(BUMP_EPOCH_SQL)])
+			return result
+		} catch (error) {
+			if (!isGuardAbort(error)) throw error
+			console.warn('mixtape_cohort_cas_retry', { address, attempt })
+		}
 	}
 
-	// Still contended: nothing stale was written; reads re-derive dynamically anyway.
-	return result!
+	// Still contended: nothing from this request was written. Return what is actually committed.
+	const { rows, publicSmols } = await loadCohortSnapshot(env, address)
+	const { decisions } = await deriveDecisions(rows, publicSmols)
+	return { rows, decisions, publicSmols, changedIds: [] }
 }
 
 function ownerView(row: MixtapeRow, decision: MixtapeDecision | undefined, publicSmols: ReadonlyMap<string, unknown>) {
@@ -523,7 +586,10 @@ function cohortView(cohort: CohortResult, id: string) {
 
 /** Load a live mixtape for an owner mutation: 404 when missing/deleted, 403 when not the owner. */
 async function loadOwnedLiveRow(env: Env, id: string, sub: string): Promise<MixtapeRow> {
-	const row = await loadMixtapeRow(env, id)
+	return assertOwnedLive(await loadMixtapeRow(env, id), sub)
+}
+
+function assertOwnedLive(row: MixtapeRow | null | undefined, sub: string): MixtapeRow {
 	if (!row || row.Deleted_At || row.Visibility === 'deleted') {
 		throw new HTTPException(404, { message: 'Mixtape not found' })
 	}
@@ -692,24 +758,13 @@ mixtapes.post('/check-uniqueness', parseAuth, async (c) => {
 	})
 })
 
-async function dedupedResponse(c: Context<HonoEnv>, sub: string, winner: MixtapeRow) {
-	const rows = await loadOwnerRows(c.env, sub)
-	const publicSmols = await loadPublicSmolRows(c.env, rows.flatMap((row) => parseStoredSmolIds(row.Smols)))
+/** The committed state of an existing winner, as a 200 idempotent-retry receipt. */
+async function dedupedResponse(c: Context<HonoEnv>, sub: string, winnerId: string) {
+	const { rows, publicSmols } = await loadCohortSnapshot(c.env, sub)
+	const winner = rows.find((row) => row.Id === winnerId)
+	if (!winner) throw new HTTPException(409, { message: 'An identical mixtape is being created; try again' })
 	const { decisions } = await deriveDecisions(rows, publicSmols)
-	const current = rows.find((row) => row.Id === winner.Id) ?? winner
-	return privateJson(c, { ...writeReceipt(current, decisions.get(winner.Id) ?? fallbackDecision(current)), deduplicated: true })
-}
-
-function fallbackDecision(row: MixtapeRow): MixtapeDecision {
-	return {
-		id: row.Id,
-		visibility: row.Visibility === 'owner' ? 'owner' : 'public',
-		hiddenReason: null,
-		relatedId: null,
-		relatedTitle: null,
-		uniquenessScore: row.Uniqueness_Score,
-		advice: null,
-	}
+	return privateJson(c, { ...writeReceipt(winner, decisions.get(winnerId)!), deduplicated: true })
 }
 
 // Create new mixtape
@@ -727,28 +782,35 @@ mixtapes.post('/', parseAuth, async (c) => {
 	}
 	const smolsString = smolIds.join(',')
 
-	// Idempotent exact retry (double-tap / flaky network) within 15 minutes → return the original.
-	const earlier = await findIdenticalRecent(env, sub, smolsString, title, desc)
-	if (earlier) return await dedupedResponse(c, sub, earlier)
-
+	// Idempotent exact retry (double-tap / flaky network / simultaneous POSTs) within 15 minutes.
+	// Claim the normalized retry identity and insert the row in ONE batch: whoever holds the claim
+	// owns the only row, so no provisional duplicate row is ever created or visible.
+	const key = await retryKey(sub, smolsString, title, desc)
 	const id = newMixtapeId()
-	await env.SMOL_D1.batch([
+	const results = await env.SMOL_D1.batch([
+		env.SMOL_D1.prepare(`DELETE FROM MixtapeRetryClaim WHERE Created_At < datetime('now', '${IDEMPOTENT_RETRY_WINDOW}')`),
+		// A claim only stands while its mixtape is live, unedited (Revision 1) and inside the window.
+		env.SMOL_D1.prepare(`
+			DELETE FROM MixtapeRetryClaim
+			WHERE Retry_Key = ?1 AND NOT EXISTS (
+				SELECT 1 FROM Mixtapes m
+				WHERE m.Id = MixtapeRetryClaim.Mixtape_Id AND m.Deleted_At IS NULL AND m.Revision = 1
+					AND m.Created_At >= datetime('now', '${IDEMPOTENT_RETRY_WINDOW}')
+			)
+		`).bind(key),
+		env.SMOL_D1.prepare('INSERT OR IGNORE INTO MixtapeRetryClaim (Retry_Key, Mixtape_Id) VALUES (?1, ?2)').bind(key, id),
 		env.SMOL_D1.prepare(`
 			INSERT INTO Mixtapes (Id, Title, Desc, Smols, "Address", Updated_At, Visibility, Revision)
-			VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP, 'public', 1)
-		`).bind(id, title, desc, smolsString, sub),
+			SELECT ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP, 'public', 1
+			WHERE EXISTS (SELECT 1 FROM MixtapeRetryClaim WHERE Retry_Key = ?1 AND Mixtape_Id = ?2)
+		`).bind(key, id, title, desc, smolsString, sub),
 		env.SMOL_D1.prepare(BUMP_EPOCH_SQL),
 	])
 
-	// Simultaneous identical POSTs both pass the check above. After inserting, the identical row
-	// with the lowest rowid (first INSERT) wins deterministically; later inserts remove themselves.
-	const winner = await findIdenticalRecent(env, sub, smolsString, title, desc)
-	if (winner && winner.Id !== id) {
-		await env.SMOL_D1.batch([
-			env.SMOL_D1.prepare('DELETE FROM Mixtapes WHERE Id = ?1 AND "Address" = ?2 AND Revision = 1').bind(id, sub),
-			env.SMOL_D1.prepare(BUMP_EPOCH_SQL),
-		])
-		return await afterCommit(c, [id], () => dedupedResponse(c, sub, winner))
+	if (results[3]?.meta?.changes !== 1) {
+		const claim = await env.SMOL_D1.prepare('SELECT Mixtape_Id FROM MixtapeRetryClaim WHERE Retry_Key = ?1').bind(key).first<{ Mixtape_Id: string }>()
+		if (!claim) throw new HTTPException(409, { message: 'An identical mixtape is being created; try again' })
+		return await dedupedResponse(c, sub, claim.Mixtape_Id)
 	}
 
 	return await afterCommit(c, [id], async (purgeIds) => {
@@ -987,8 +1049,10 @@ mixtapes.post('/:id/merge', parseAuth, async (c) => {
 		throw new HTTPException(400, { message: 'A mixtape cannot be merged into itself' })
 	}
 
-	const source = await loadOwnedLiveRow(env, sourceId, sub)
-	const target = await loadOwnedLiveRow(env, targetId, sub)
+	// One read for both rows: the batch below requires exactly these two revisions.
+	const { results: pairRows } = await env.SMOL_D1.prepare(`${MIXTAPE_SELECT} WHERE Id IN (?1, ?2)`).bind(sourceId, targetId).all<MixtapeRow>()
+	const source = assertOwnedLive(pairRows.find((row) => row.Id === sourceId), sub)
+	const target = assertOwnedLive(pairRows.find((row) => row.Id === targetId), sub)
 	const title = body.title !== undefined ? parseTitle(body.title) : target.Title
 	const desc = body.desc !== undefined ? parseDesc(body.desc) : target.Desc
 
@@ -1013,47 +1077,37 @@ mixtapes.post('/:id/merge', parseAuth, async (c) => {
 		throw new HTTPException(400, { message: `Merged mixtape would have ${merged.length} songs (max ${MAX_MIXTAPE_SMOLS})` })
 	}
 	const mergedSmols = merged.join(',')
-	const sourceAfter = source.Revision + 1
-	const targetAfter = target.Revision + 1
 
-	// One D1 batch = one transaction, nothing interleaves. Statement 1 is the gate: it tombstones
-	// the source only if BOTH rows are still exactly as read. Statements 2 and 3 fire only when the
-	// source carries statement 1's exact post-state while the target is still at the read revision,
-	// which (inside this transaction) only statement 1 can produce. Statement 4 is a hard invariant:
-	// a source merged by this request without the matching target update violates CHECK(Revision >= 1)
-	// and rolls the whole batch back.
-	const [gate] = await env.SMOL_D1.batch([
-		env.SMOL_D1.prepare(`
-			UPDATE Mixtapes
-			SET Deleted_At = CURRENT_TIMESTAMP, Updated_At = CURRENT_TIMESTAMP, Visibility = 'deleted',
-				Hidden_Reason = 'merged', Related_Mixtape_Id = ?1, Uniqueness_Score = NULL, Revision = Revision + 1
-			WHERE Id = ?2 AND "Address" = ?3 AND Deleted_At IS NULL AND Revision = ?4
-				AND EXISTS (SELECT 1 FROM Mixtapes WHERE Id = ?1 AND "Address" = ?3 AND Deleted_At IS NULL AND Revision = ?5)
-		`).bind(targetId, sourceId, sub, source.Revision, target.Revision),
-		env.SMOL_D1.prepare(`
-			UPDATE Mixtapes
-			SET Smols = ?1, Title = ?2, Desc = ?3, Revision = Revision + 1, Updated_At = CURRENT_TIMESTAMP
-			WHERE Id = ?4 AND "Address" = ?5 AND Deleted_At IS NULL AND Revision = ?6
-				AND EXISTS (
-					SELECT 1 FROM Mixtapes WHERE Id = ?7 AND Deleted_At IS NOT NULL AND Hidden_Reason = 'merged'
-						AND Related_Mixtape_Id = ?4 AND Revision = ?8
-				)
-		`).bind(mergedSmols, title, desc, targetId, sub, target.Revision, sourceId, sourceAfter),
-		// Flatten older aliases (X merged into source) straight to the target: chains stay 1 hop.
-		env.SMOL_D1.prepare(`
-			UPDATE Mixtapes SET Related_Mixtape_Id = ?1
-			WHERE "Address" = ?2 AND Deleted_At IS NOT NULL AND Hidden_Reason = 'merged' AND Related_Mixtape_Id = ?3
-				AND EXISTS (SELECT 1 FROM Mixtapes WHERE Id = ?1 AND Revision = ?4 AND Smols = ?5 AND Deleted_At IS NULL)
-				AND EXISTS (SELECT 1 FROM Mixtapes WHERE Id = ?3 AND Revision = ?6 AND Hidden_Reason = 'merged' AND Related_Mixtape_Id = ?1)
-		`).bind(targetId, sub, sourceId, targetAfter, mergedSmols, sourceAfter),
-		env.SMOL_D1.prepare(`
-			UPDATE Mixtapes SET Revision = 0
-			WHERE Id = ?1 AND Hidden_Reason = 'merged' AND Related_Mixtape_Id = ?2 AND Revision = ?3
-				AND NOT EXISTS (SELECT 1 FROM Mixtapes WHERE Id = ?2 AND Revision = ?4 AND Smols = ?5 AND Deleted_At IS NULL)
-		`).bind(sourceId, targetId, sourceAfter, targetAfter, mergedSmols),
-		env.SMOL_D1.prepare(BUMP_EPOCH_SQL),
-	])
-	if (gate?.meta?.changes !== 1) {
+	// One D1 batch = one transaction. Statement 1 updates the target ONLY if the target AND the
+	// source are both still live at exactly the revisions read above; if it changed nothing,
+	// statement 2 violates CHECK (Epoch >= 0) and the whole batch rolls back. Statement 3 then
+	// tombstones the source under the same exact precondition (guarded the same way), and
+	// statement 5 flattens older aliases straight to the target so chains stay one hop.
+	// A competing merge/edit can therefore never touch either row on behalf of a loser.
+	try {
+		await env.SMOL_D1.batch([
+			env.SMOL_D1.prepare(`
+				UPDATE Mixtapes
+				SET Smols = ?1, Title = ?2, Desc = ?3, Revision = Revision + 1, Updated_At = CURRENT_TIMESTAMP
+				WHERE Id = ?4 AND "Address" = ?5 AND Deleted_At IS NULL AND Revision = ?6
+					AND EXISTS (SELECT 1 FROM Mixtapes WHERE Id = ?7 AND "Address" = ?5 AND Deleted_At IS NULL AND Revision = ?8)
+			`).bind(mergedSmols, title, desc, targetId, sub, target.Revision, sourceId, source.Revision),
+			env.SMOL_D1.prepare(ABORT_IF_PREVIOUS_MISSED_SQL),
+			env.SMOL_D1.prepare(`
+				UPDATE Mixtapes
+				SET Deleted_At = CURRENT_TIMESTAMP, Updated_At = CURRENT_TIMESTAMP, Visibility = 'deleted',
+					Hidden_Reason = 'merged', Related_Mixtape_Id = ?1, Uniqueness_Score = NULL, Revision = Revision + 1
+				WHERE Id = ?2 AND "Address" = ?3 AND Deleted_At IS NULL AND Revision = ?4
+			`).bind(targetId, sourceId, sub, source.Revision),
+			env.SMOL_D1.prepare(ABORT_IF_PREVIOUS_MISSED_SQL),
+			env.SMOL_D1.prepare(`
+				UPDATE Mixtapes SET Related_Mixtape_Id = ?1
+				WHERE "Address" = ?2 AND Deleted_At IS NOT NULL AND Hidden_Reason = 'merged' AND Related_Mixtape_Id = ?3
+			`).bind(targetId, sub, sourceId),
+			env.SMOL_D1.prepare(BUMP_EPOCH_SQL),
+		])
+	} catch (error) {
+		if (!isGuardAbort(error)) throw error
 		return await revisionConflict(c, targetId, sub)
 	}
 

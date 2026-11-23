@@ -186,6 +186,7 @@ function buildHarness(options: { ai?: AiHandler; aiEnabled?: string; seed?: numb
 	const cache = {
 		stats: edge.stats,
 		keys: () => [...edge.entries.keys()],
+		entries: () => [...edge.entries.entries()],
 		hold: () => { holdPuts = true },
 		release: () => {
 			holdPuts = false
@@ -235,8 +236,9 @@ test('migration 0002 is additive on the legacy table, backfills Updated_At, and 
 	const indexes = (target: DatabaseSync) => (target.prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'Mixtapes' AND name LIKE 'idx_%' ORDER BY name`).all() as Array<{ name: string }>).map((r) => r.name)
 	assert.deepEqual(indexes(db), ['idx_mixtapes_address_created', 'idx_mixtapes_created', 'idx_mixtapes_visibility_created'])
 	assert.deepEqual(indexes(fresh), indexes(db))
-	const epochObjects = (target: DatabaseSync) => (target.prepare(`SELECT type, name FROM sqlite_master WHERE name = 'MixtapeState' OR name LIKE 'trg_mixtape_epoch_%' ORDER BY name`).all() as Array<Record<string, string>>).map((r) => `${r.type}:${r.name}`)
-	assert.deepEqual(epochObjects(db), ['table:MixtapeState', 'trigger:trg_mixtape_epoch_smol_delete', 'trigger:trg_mixtape_epoch_smol_insert', 'trigger:trg_mixtape_epoch_smol_public'])
+	const epochObjects = (target: DatabaseSync) => (target.prepare(`SELECT type, name, sql FROM sqlite_master WHERE name IN ('MixtapeState', 'MixtapeRetryClaim', 'idx_mixtape_retry_claim_created') OR name LIKE 'trg_mixtape_epoch_%' ORDER BY name`).all() as Array<Record<string, string>>).map((r) => `${r.type}:${r.name}:${r.sql.replace(/\s+/g, ' ')}`)
+	assert.deepEqual(epochObjects(db).map((o) => o.split(':').slice(0, 2).join(':')), ['table:MixtapeRetryClaim', 'table:MixtapeState', 'index:idx_mixtape_retry_claim_created', 'trigger:trg_mixtape_epoch_smol_delete', 'trigger:trg_mixtape_epoch_smol_insert', 'trigger:trg_mixtape_epoch_smol_public'])
+	assert.throws(() => db.exec('UPDATE MixtapeState SET Epoch = -1'), /CHECK constraint failed/, 'the epoch CHECK is the batch abort switch')
 	assert.deepEqual(epochObjects(fresh), epochObjects(db))
 	const epochOf = (target: DatabaseSync) => (target.prepare('SELECT Epoch FROM MixtapeState WHERE Id = 1').get() as { Epoch: number }).Epoch
 	const before = epochOf(db)
@@ -311,12 +313,18 @@ test('GET / vs GET /mine vs GET /:id: visibility, caching headers, and live Smol
 	assert.deepEqual(list.body.map((m) => m.Created_At), [...list.body.map((m) => m.Created_At)].sort().reverse(), 'newest first')
 	assert.equal(list.body.find((m) => m.Id === '807e0a11b827b1e3')!.Smols.length, 11, 'private song slots never exposed')
 	assert.deepEqual(Object.keys(list.body[0]).sort(), ['Address', 'Created_At', 'Desc', 'Id', 'Smols', 'Title', 'Updated_At'])
-	assert.equal(list.res.headers.get('Cache-Control'), 'public, max-age=0, s-maxage=60, stale-while-revalidate=120', 'browsers revalidate; only the edge caches')
+	assert.equal(list.res.headers.get('Cache-Control'), 'public, max-age=0, must-revalidate', 'browsers revalidate synchronously (no SWR window)')
+	assert.equal(list.res.headers.get('CDN-Cache-Control'), 'public, s-maxage=60, stale-while-revalidate=120', 'edge policy only')
 	assert.equal(list.res.headers.get('Cache-Tag'), 'mixtapes')
 	assert.ok(openedCacheNames.has('smol-workflow-mixtapes-v2') && !openedCacheNames.has('smol-workflow'), 'fresh v2 namespace')
 	assert.deepEqual(h.cache.keys(), [`https://api.smol.xyz/mixtapes?__mx_epoch=${h.epoch()}`], 'edge key carries the committed epoch')
 	const hit = await h.send('/mixtapes?__mx_epoch=999')
 	assert.equal(h.cache.stats.hits, 1, 'unchanged epoch is a hit; client-supplied epoch params are ignored')
+	assert.equal(hit.headers.get('Cache-Control'), 'public, max-age=0, must-revalidate', 'cache hits also carry the browser policy')
+	assert.equal(hit.headers.get('CDN-Cache-Control'), 'public, s-maxage=60, stale-while-revalidate=120')
+	assert.equal(new Headers(h.cache.entries()[0][1].headers).get('Cache-Control'), 'public, max-age=60, s-maxage=60', 'the Worker Cache API copy carries the edge TTL')
+	const detailHeaders = (await h.send(`/mixtapes/${CORDOVA}`)).headers
+	assert.deepEqual([detailHeaders.get('Cache-Control'), detailHeaders.get('CDN-Cache-Control')], ['public, max-age=0, must-revalidate', 'public, s-maxage=60, stale-while-revalidate=120'])
 	assert.equal(((await hit.json()) as unknown[]).length, 15)
 
 	assert.equal((await h.send('/mixtapes/mine')).status, 401)
@@ -788,26 +796,39 @@ test('P1-4: a delayed in-flight GET cannot refill the current cache key; purge r
 	assert.ok(['mixtapes', `mixtape:${CORDOVA_RETRY}`].every((tag) => purgedTagBatches.flat().includes(tag)), 'purge is guaranteed after commit')
 })
 
-test('P2-1: simultaneous identical POSTs converge on one canonical id', async () => {
+test('P2-1: simultaneous identical POSTs claim atomically: zero provisional rows, consistent 201/200 receipts', async () => {
 	const h = buildHarness()
+	h.db.exec(`CREATE TEMP TABLE inserted_log (Id TEXT); CREATE TEMP TRIGGER log_mixtape_insert AFTER INSERT ON main.Mixtapes BEGIN INSERT INTO inserted_log VALUES (NEW.Id); END;`)
 	let arrivals = 0
 	let openBarrier!: () => void
 	const barrier = new Promise<void>((resolve) => { openBarrier = resolve })
 	h.hooks.onStatement = async (sql) => {
-		if (sql.includes('ORDER BY rowid ASC') && arrivals < 2) {
+		if (sql.includes('DELETE FROM MixtapeRetryClaim WHERE Created_At') && arrivals < 2) {
 			arrivals += 1
 			if (arrivals === 2) openBarrier()
-			await barrier // both requests pass the pre-insert retry check before either inserts
+			await barrier // both requests are past validation before either claims
 		}
 	}
 	const body = { title: 'Double Tap', smols: [SYN(1), SYN(2)] }
 	const results = await Promise.all([1, 2].map(() => h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })))
 	h.hooks.onStatement = undefined
+	assert.equal(arrivals, 2)
 	assert.deepEqual(results.map((r) => r.status).sort(), [200, 201])
-	assert.equal(results[0].body.id, results[1].body.id, 'both callers get the same id')
-	assert.equal(results.find((r) => r.status === 200)!.body.deduplicated, true)
-	const live = h.db.prepare(`SELECT Id FROM Mixtapes WHERE Title = 'Double Tap'`).all() as Array<{ Id: string }>
-	assert.deepEqual(live.map((r) => r.Id), [results[0].body.id], 'the losing insert removed itself')
+	const won = results.find((r) => r.status === 201)!.body
+	const deduped = results.find((r) => r.status === 200)!.body
+	assert.deepEqual([deduped.id, deduped.deduplicated, won.deduplicated], [won.id, true, false])
+	for (const field of ['visibility', 'hiddenReason', 'relatedMixtapeId', 'revision', 'uniquenessScore']) assert.deepEqual(deduped[field], won[field], `consistent ${field}`)
+	assert.deepEqual((h.db.prepare('SELECT Id FROM inserted_log').all() as Array<{ Id: string }>).map((r) => r.Id), [won.id], 'no provisional row was ever inserted')
+	assert.equal((await h.json(`/mixtapes/${won.id}`)).body.Visibility, won.visibility, 'receipt matches the next read')
+
+	// The claim only stands for a live, unedited row inside the window.
+	assert.equal((await h.send(`/mixtapes/${won.id}`, { method: 'PATCH', as: NEW_OWNER, body: { desc: 'edited' } })).status, 200)
+	const afterEdit = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	assert.equal(afterEdit.status, 201, 'editing the original frees its retry claim')
+	assert.equal((await h.send(`/mixtapes/${afterEdit.body.id}`, { method: 'DELETE', as: NEW_OWNER })).status, 200)
+	const afterDelete = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	assert.equal(afterDelete.status, 201, 'deleting it frees the claim too')
+	assert.notEqual(afterDelete.body.id, afterEdit.body.id)
 })
 
 test('P2-2 / P2-3: pointers only target listed keepers; 3+ track reorders reach Tier 2', async () => {
@@ -874,6 +895,16 @@ test('P2-4: the clef-flash parser rejects error envelopes and malformed payloads
 		['wrong type', { ...valid, answers: { is_duplicate: { type: 'score', noul: 0.9 } } }],
 		['out of range', clefAnswer(1.2)],
 	]
+	const nest = (node: unknown, levels: number, inner: Record<string, unknown> = {}): unknown => (levels === 0 ? node : { success: true, errors: [], ...inner, result: nest(node, levels - 1, inner) })
+	malformed.push(
+		['4x nested, inner success:false', nest({ success: false, errors: [{ code: 1 }], result: valid }, 3)],
+		['3 envelopes (excess nesting)', nest(valid, 3)],
+		['string success "false"', { success: 'false', errors: [], result: valid }],
+		['string success "true"', { success: 'true', result: valid }],
+		['terminal success:false', { ...valid, success: false }],
+		['terminal errors', { ...valid, errors: ['boom'] }],
+	)
+	assert.equal(parseMixtapeDedupeResponse(nest(valid, 2))?.pDuplicate, 0.99, 'two envelopes are accepted')
 	for (const [label, payload] of malformed) assert.equal(parseMixtapeDedupeResponse(payload), null, label)
 
 	// End to end: a success:false envelope with a duplicate probability fails open.
@@ -906,4 +937,95 @@ test('P2-5: owner-route errors (401/400/403/404/409) carry private no-store head
 	const mine = await h.send('/mixtapes/mine', { as: NEW_OWNER })
 	assert.deepEqual([mine.status, mine.headers.get('Cache-Control')], [200, 'private, no-store'])
 	assert.match((await h.send('/mixtapes')).headers.get('Cache-Control')!, /^public/, 'public GETs stay cacheable')
+})
+
+// ---------------------------------------------------------------------------
+// Pass-2 regressions (reports/25b-review-mixtape-be.md §Pass 2)
+// ---------------------------------------------------------------------------
+
+test('Pass 2 P1-1: a competing merge returns 409 without touching the winner\'s target', async () => {
+	const h = buildHarness()
+	const create = async (title: string, smols: string[]) => (await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title, smols } })).body.id as string
+	const target = await create('Target', [SYN(1), SYN(2)])
+	const source = await create('Source', [SYN(3), SYN(4)])
+	let winner: Awaited<ReturnType<typeof h.json>> | null = null
+	h.hooks.onStatement = async (sql) => {
+		if (!winner && sql.includes('SET Smols = ?1, Title = ?2, Desc = ?3')) {
+			// The loser has read both rows; the winner merges the same source first.
+			winner = { status: 0 } as never
+			winner = await h.json(`/mixtapes/${source}/merge`, { method: 'POST', as: NEW_OWNER, body: { targetId: target, title: 'Winner title' } })
+		}
+	}
+	const loser = await h.json(`/mixtapes/${source}/merge`, { method: 'POST', as: NEW_OWNER, body: { targetId: target, title: 'Loser title' } })
+	h.hooks.onStatement = undefined
+	assert.equal(winner!.status, 200)
+	assert.equal(winner!.body.target.Revision, 2)
+	assert.deepEqual([loser.status, loser.body.code], [409, 'revision_conflict'])
+	const t = h.row(target)!
+	assert.deepEqual([t.Title, t.Revision, t.Smols], ['Winner title', 2, [1, 2, 3, 4].map(SYN).join(',')], 'loser never wrote the target')
+	const s = h.row(source)!
+	assert.deepEqual([s.Hidden_Reason, s.Related_Mixtape_Id, s.Revision], ['merged', target, 2], 'source tombstoned exactly once')
+})
+
+test('Pass 2 P1-2: a late fail-open evaluation of the same revisions cannot overwrite a committed 0.95 verdict', async () => {
+	let failFirst!: (error: Error) => void
+	let markFirstCalled!: () => void
+	const firstCalled = new Promise<void>((resolve) => { markFirstCalled = resolve })
+	let calls = 0
+	const h = buildHarness({
+		ai: async () => {
+			calls += 1
+			if (calls === 1) {
+				markFirstCalled()
+				return await new Promise((_, reject) => { failFirst = reject })
+			}
+			return clefAnswer(0.95)
+		},
+	})
+	// Hold X's cohort read until Y's content write has committed, and Y's until X is inferring:
+	// both evaluations then judge the same (X rev 1, Y rev 1) cohort.
+	let arrivals = 0
+	let markYRead!: () => void
+	const yRead = new Promise<void>((resolve) => { markYRead = resolve })
+	h.hooks.onStatement = async (sql, args) => {
+		if (!/"Address" = \?1 AND Deleted_At IS NULL AND Visibility != 'deleted'/.test(sql) || args[0] !== NEW_OWNER) return
+		arrivals += 1
+		if (arrivals === 1) await yRead
+		else if (arrivals === 2) {
+			markYRead()
+			await firstCalled
+		}
+	}
+	const pendingX = h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title: 'Drafts', smols: [1, 2, 3, 4, 5].map(SYN) } })
+	while (arrivals < 1) await tick()
+	const y = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title: 'Drafts final', smols: [1, 2, 3, 4, 6, 7, 8].map(SYN) } })
+	assert.deepEqual([y.status, y.body.visibility], [201, 'public'])
+	const xId = (h.db.prepare(`SELECT Id FROM Mixtapes WHERE Title = 'Drafts'`).get() as { Id: string }).Id
+	assert.equal(JSON.parse(h.row(xId)!.Ai_Verdict).p, 0.95, 'Y committed the duplicate verdict on X')
+
+	failFirst(new Error('5xx provider error'))
+	const x = await pendingX
+	h.hooks.onStatement = undefined
+	assert.equal(h.aiCalls.length, 2)
+	assert.equal(x.status, 201)
+	assert.deepEqual([x.body.visibility, x.body.hiddenReason, x.body.relatedMixtapeId], ['owner', 'semantic_duplicate', y.body.id], 'X reports the committed state')
+	const receipt = JSON.parse(h.row(xId)!.Ai_Verdict)
+	assert.deepEqual([receipt.p, receipt.dup, receipt.fallback], [0.95, true, undefined], 'the late fallback never overwrote the verdict')
+	assert.ok(!(await h.json<Array<{ Id: string }>>('/mixtapes')).body.some((m) => m.Id === xId))
+})
+
+test('Pass 2 P2-2: a song privacy flip during pending clef inference yields an accurate post-flip receipt', async () => {
+	let resolveAi!: (value: unknown) => void
+	const h = buildHarness({ ai: () => new Promise((resolve) => { resolveAi = resolve }) })
+	const a = (await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title: 'Season', smols: [1, 2, 3, 4, 5, 6].map(SYN) } })).body.id as string
+	h.backdate(a, 60)
+	const pending = h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title: 'Season II', smols: [1, 2, 3, 4, 7, 8].map(SYN) } })
+	while (h.aiCalls.length < 1) await tick()
+	h.db.prepare('UPDATE Smols SET Public = 0 WHERE Id IN (?, ?, ?, ?)').run(...[1, 2, 3, 4].map(SYN)) // trigger bumps the epoch
+	resolveAi(clefAnswer(0.9)) // verdict about inputs that no longer exist
+	const b = await pending
+	assert.deepEqual([b.status, b.body.visibility, b.body.hiddenReason, b.body.uniquenessScore], [201, 'public', null, 100])
+	assert.deepEqual([h.row(a)!.Visibility, h.row(a)!.Ai_Verdict], ['public', null], 'the stale duplicate verdict was never persisted')
+	assert.equal((await h.json(`/mixtapes/${a}`)).body.Visibility, 'public', 'receipt matches the next read')
+	assert.equal(h.aiCalls.length, 1)
 })

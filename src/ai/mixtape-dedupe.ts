@@ -132,20 +132,30 @@ function isTokenCount(value: unknown): value is number {
 	return typeof value === 'number' && Number.isInteger(value) && value >= 0
 }
 
+/** Cloudflare REST/gateway envelopes we accept around the binding payload (raw → result → result). */
+const MAX_ENVELOPES = 2
+
+/** Envelope status checks applied at EVERY level, including the terminal payload. */
+function envelopeOk(node: Record<string, unknown>): boolean {
+	if ('success' in node && node.success !== true) return false // must be the boolean true when present
+	if ('errors' in node && (!Array.isArray(node.errors) || node.errors.length > 0)) return false
+	if ('state' in node && node.state !== 'Completed') return false
+	return true
+}
+
 /**
  * Strict validation of a clef-flash payload. Accepts the direct binding shape
- * `{ model, answers, usage }` or up to three Cloudflare envelopes (`{ success, errors, result }`
- * / `{ state, result }`). Any reported error, non-completed state, missing model, malformed
- * answers or usage rejects the WHOLE response before a probability is used (fail open).
+ * `{ model, answers, usage }` or at most two Cloudflare envelopes (`{ success, errors, result }`
+ * / `{ state, result }`). Any reported failure at any level (including `success: "false"`),
+ * deeper nesting, missing model, malformed answers or usage rejects the WHOLE response before
+ * a probability is used (fail open to Tier 1).
  */
 export function parseMixtapeDedupeResponse(raw: unknown): Omit<SemanticVerdict, 'latencyMs'> | null {
 	let payload: unknown = raw
-	for (let depth = 0; depth < 4; depth += 1) {
-		if (!isRecord(payload)) return null
-		if (payload.success === false) return null
-		if (payload.errors !== undefined && (!Array.isArray(payload.errors) || payload.errors.length > 0)) return null
-		if (payload.state !== undefined && payload.state !== 'Completed') return null
-		if (payload.answers !== undefined || !('result' in payload)) break
+	for (let unwrapped = 0; ; unwrapped += 1) {
+		if (!isRecord(payload) || !envelopeOk(payload)) return null
+		if ('answers' in payload) break
+		if (!('result' in payload) || unwrapped >= MAX_ENVELOPES) return null
 		payload = payload.result
 	}
 	if (!isRecord(payload) || !isRecord(payload.answers)) return null

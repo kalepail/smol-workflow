@@ -93,12 +93,26 @@ ON Users("Address");
 -- so a delayed in-flight GET can never refill the key that is current after a mutation.
 -- Every mixtape write batch bumps it; the triggers below bump it when a song's public
 -- state changes (songs are resolved live into every mixtape response).
+-- Epoch >= 0 doubles as the abort switch for guarded write batches: a batch that must not
+-- commit runs `UPDATE MixtapeState SET Epoch = -1 ...`, and the CHECK rolls everything back.
 CREATE TABLE IF NOT EXISTS MixtapeState (
     Id INTEGER PRIMARY KEY CHECK (Id = 1),
-    Epoch INTEGER NOT NULL DEFAULT 0
+    Epoch INTEGER NOT NULL DEFAULT 0 CHECK (Epoch >= 0)
 );
 
 INSERT OR IGNORE INTO MixtapeState (Id, Epoch) VALUES (1, 0);
+
+-- Atomic idempotency claim for POST /mixtapes exact retries (15-minute window). The claim and
+-- the Mixtapes INSERT run in one batch, so simultaneous identical creates never produce a
+-- provisional duplicate row. Retry_Key = SHA-256(owner, ordered smols, normalized title/desc).
+CREATE TABLE IF NOT EXISTS MixtapeRetryClaim (
+    Retry_Key TEXT PRIMARY KEY,
+    Mixtape_Id TEXT NOT NULL,
+    Created_At DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_mixtape_retry_claim_created
+ON MixtapeRetryClaim(Created_At);
 
 CREATE TRIGGER IF NOT EXISTS trg_mixtape_epoch_smol_public
 AFTER UPDATE OF Public ON Smols
