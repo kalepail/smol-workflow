@@ -1412,3 +1412,111 @@ test('Pass 6 P2-2: an expired creator whose finalize affects 0 rows returns the 
 	assert.deepEqual([next.status, next.body.visibility], [200, 'owner'])
 	assert.equal(countTitled(h, 'Early set'), 1)
 })
+
+// ---------------------------------------------------------------------------
+// Pass-7 regressions (reports/25b-review-mixtape-be.md §Pass 7)
+// ---------------------------------------------------------------------------
+
+test('Pass 7 P2-1: an expired creator waking after recovery finalized never calls Clef nor rewrites the verdict', async () => {
+	let calls = 0
+	const h = buildHarness({
+		ai: async () => {
+			calls += 1
+			if (calls === 1) throw new Error('5xx provider error') // recovery's Clef call fails open → public
+			return clefAnswer(0.95) // what the expired creator would have received
+		},
+	})
+	await seedBiggerSibling(h)
+	let release!: () => void
+	const gate = new Promise<void>((resolve) => { release = resolve })
+	let held = false
+	h.hooks.onStatement = async (sql, args) => {
+		if (!held && OWNER_ROWS_READ.test(sql) && args[0] === NEW_OWNER) {
+			held = true
+			await gate // the creator stalls before its first cohort read
+		}
+	}
+	const body = { title: 'Early set', smols: [1, 2, 3, 4, 5].map(SYN) }
+	const pendingCreator = h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	while (!held) await tick()
+	const id = (h.db.prepare(`SELECT Id FROM Mixtapes WHERE Title = 'Early set'`).get() as { Id: string }).Id
+	h.db.prepare(`UPDATE MixtapeRetryClaim SET Created_At = datetime('now', '-60 seconds') WHERE Mixtape_Id = ?`).run(id)
+
+	const recovered = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	assert.deepEqual([recovered.status, recovered.body.id, recovered.body.visibility], [200, id, 'public'])
+	const committed = { claim: claimRow(h, id), row: h.row(id) }
+	assert.equal(committed.claim!.Finalized, 1)
+	assert.equal(JSON.parse(committed.row!.Ai_Verdict).fallback, 'error')
+
+	release()
+	const creator = await pendingCreator
+	h.hooks.onStatement = undefined
+	assert.equal(h.aiCalls.length, 1, 'the expired creator never invoked Clef')
+	assert.deepEqual([creator.status, creator.body.id, creator.body.visibility, creator.body.hiddenReason], [201, id, 'public', null], 'it reports the committed verdict')
+	assert.deepEqual({ claim: claimRow(h, id), row: h.row(id) }, committed, 'zero new writes: claim, visibility and receipt unchanged')
+	const next = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	assert.deepEqual([next.status, next.body.visibility], [200, 'public'])
+})
+
+test('Pass 7 P2-2: a superseded recovery never reports deduplicated:true for content the owner changed after takeover', async () => {
+	const h = buildHarness()
+	const body = { title: 'Morning set', smols: [SYN(1), SYN(2)] }
+	let failed = false
+	h.hooks.onStatement = (sql) => {
+		if (!failed && sql.includes(CLASSIFY_BATCH)) {
+			failed = true
+			throw new Error('D1_ERROR: transient')
+		}
+	}
+	assert.equal((await h.send('/mixtapes', { method: 'POST', as: NEW_OWNER, body })).status, 500)
+	const id = (h.db.prepare(`SELECT Id FROM Mixtapes WHERE Title = 'Morning set'`).get() as { Id: string }).Id
+	assert.equal(claimRow(h, id)!.Finalized, 2)
+
+	// Recovery R1 classifies, then stalls right before recording its outcome.
+	let release!: () => void
+	const gate = new Promise<void>((resolve) => { release = resolve })
+	let held = false
+	h.hooks.onStatement = async (sql) => {
+		if (!held && sql.includes('UPDATE MixtapeRetryClaim SET Finalized = ?4')) {
+			held = true
+			await gate
+		}
+	}
+	const pendingR1 = h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	while (!held) await tick()
+	h.db.prepare(`UPDATE MixtapeRetryClaim SET Created_At = datetime('now', '-60 seconds') WHERE Mixtape_Id = ?`).run(id)
+	const r2 = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body }) // takeover R2 finalizes
+	assert.deepEqual([r2.status, r2.body.id, r2.body.revision], [200, id, 1])
+
+	const edit = await h.json(`/mixtapes/${id}`, { method: 'PATCH', as: NEW_OWNER, body: { title: 'Evening set', smols: [SYN(3), SYN(4)] } })
+	assert.deepEqual([edit.status, edit.body.revision], [200, 2])
+
+	release()
+	const r1 = await pendingR1
+	h.hooks.onStatement = undefined
+	assert.ok(!(r1.status === 200 && r1.body.deduplicated), 'never a dedupe receipt for different content')
+	assert.ok([201, 409].includes(r1.status), `re-entered create or conflict, got ${r1.status}`)
+	if (r1.status === 201) {
+		assert.notEqual(r1.body.id, id)
+		assert.equal(h.row(r1.body.id)!.Title, 'Morning set', 'the new row has the requested content')
+	}
+	assert.deepEqual([h.row(id)!.Title, h.row(id)!.Revision], ['Evening set', 2], 'the edited mixtape is untouched')
+})
+
+test('Pass 7 P2-1b: losing the claim during inference (no epoch change) aborts the guarded write batch itself', async () => {
+	let resolveAi!: (value: unknown) => void
+	const h = buildHarness({ ai: () => new Promise((resolve) => { resolveAi = resolve }) })
+	await seedBiggerSibling(h)
+	const body = { title: 'Early set', smols: [1, 2, 3, 4, 5].map(SYN) }
+	const pending = h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	while (h.aiCalls.length < 1) await tick()
+	const id = (h.db.prepare(`SELECT Id FROM Mixtapes WHERE Title = 'Early set'`).get() as { Id: string }).Id
+	const epochBefore = h.epoch()
+	// Ownership moves to another attempt without touching any mixtape (so the epoch is unchanged).
+	h.db.prepare(`UPDATE MixtapeRetryClaim SET Attempt_Token = 'someone-else' WHERE Mixtape_Id = ?`).run(id)
+	resolveAi(clefAnswer(0.95))
+	const res = await pending
+	assert.equal(h.epoch(), epochBefore, 'nothing was committed')
+	assert.deepEqual([h.row(id)!.Ai_Verdict, h.row(id)!.Hidden_Reason], [null, null], 'the stale attempt wrote no verdict')
+	assert.deepEqual([res.status, res.body.code], [503, 'create_pending'], 'the new owner has not finalized yet')
+})

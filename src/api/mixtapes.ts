@@ -401,6 +401,25 @@ interface CohortResult {
 	changedIds: string[]
 	/** True when the derived state was written, or verified already current, at a stable epoch. */
 	committed: boolean
+	/** True when the create claim this evaluation ran under was taken over: nothing was written. */
+	superseded?: boolean
+}
+
+/** The create/recovery attempt an evaluation runs under (POST /mixtapes only). */
+interface ActiveClaim {
+	key: string
+	mixtapeId: string
+	token: string
+}
+
+const CLAIM_ACTIVE_SQL = `EXISTS (
+	SELECT 1 FROM MixtapeRetryClaim
+	WHERE Retry_Key = ?1 AND Mixtape_Id = ?2 AND Attempt_Token = ?3 AND Finalized = 0
+)`
+
+async function claimStillActive(env: Env, claim: ActiveClaim): Promise<boolean> {
+	const row = await env.SMOL_D1.prepare(`SELECT ${CLAIM_ACTIVE_SQL} AS active`).bind(claim.key, claim.mixtapeId, claim.token).first<{ active: number }>()
+	return row?.active === 1
 }
 
 /**
@@ -428,8 +447,15 @@ async function loadCohortSnapshot(env: Env, address: string) {
 async function reevaluateOwnerCohort(
 	env: Env,
 	address: string,
-	options: { subjectId?: string; allowAi: boolean },
+	options: { subjectId?: string; allowAi: boolean; claim?: ActiveClaim },
 ): Promise<CohortResult> {
+	const claim = options.claim
+	// Lost ownership of the create claim: report the committed state, write nothing, infer nothing.
+	const superseded = async (): Promise<CohortResult> => {
+		const { rows, publicSmols } = await loadCohortSnapshot(env, address)
+		const { decisions } = await deriveDecisions(rows, publicSmols)
+		return { rows, decisions, publicSmols, changedIds: [], committed: false, superseded: true }
+	}
 	// `captured` = both pair participants' Ai_Verdict as read before inference.
 	let fresh: { hostId: string; receipt: AiVerdictReceipt; captured: Map<string, string | null> } | null = null
 
@@ -480,6 +506,8 @@ async function reevaluateOwnerCohort(
 					.map((id) => parseReceipt(baseVerdictOf(id)))
 					.find((receipt) => adjudicates(receipt, ids, base.fp) && receiptRevisionsCurrent(receipt!, revisions))
 				const titles = new Map([...publicSmols.values()].map((smol) => [smol.Id, smol.Title]))
+				// An expired creator/recovery must never spend inference or act on its result.
+				if (!existing && claim && !await claimStillActive(env, claim)) return await superseded()
 				const verdict = existing
 					? { ok: false as const, reason: 'disabled' as const, latencyMs: 0 }
 					: await adjudicateMixtapePair(env, pair.a, pair.b, titles)
@@ -520,6 +548,10 @@ async function reevaluateOwnerCohort(
 		}
 
 		const statements: D1PreparedStatement[] = [env.SMOL_D1.prepare(ABORT_IF_EPOCH_MOVED_SQL).bind(epoch)]
+		if (claim) {
+			// The derived writes commit only while this exact attempt still owns the in-progress claim.
+			statements.push(env.SMOL_D1.prepare(`UPDATE MixtapeState SET Epoch = -1 WHERE Id = 1 AND NOT ${CLAIM_ACTIVE_SQL}`).bind(claim.key, claim.mixtapeId, claim.token))
+		}
 		const changedIds: string[] = []
 		const nextRows = rows.map((row) => {
 			const decision = decisions.get(row.Id)!
@@ -570,6 +602,7 @@ async function reevaluateOwnerCohort(
 			return result
 		} catch (error) {
 			if (!isGuardAbort(error)) throw error
+			if (claim && !await claimStillActive(env, claim)) return await superseded()
 			console.warn('mixtape_cohort_cas_retry', { address, attempt })
 		}
 	}
@@ -854,15 +887,21 @@ interface ClaimedClassification {
  * decision once that claim is finalized, otherwise the retryable pending response. Never the
  * superseded attempt's own, possibly stale, classification.
  */
-async function currentClaimResponse(c: Context<HonoEnv>, sub: string, key: string, mixtapeId: string, status: 200 | 201) {
+async function currentClaimResponse(c: Context<HonoEnv>, sub: string, key: string, mixtapeId: string, status: 200 | 201): Promise<Response | null> {
 	const claim = await c.env.SMOL_D1.prepare('SELECT Finalized FROM MixtapeRetryClaim WHERE Retry_Key = ?1 AND Mixtape_Id = ?2')
 		.bind(key, mixtapeId).first<{ Finalized: number }>()
-	if (claim?.Finalized !== CLAIM_FINALIZED) return createPending(c)
+	if (claim && claim.Finalized !== CLAIM_FINALIZED) return createPending(c)
+	// Same rule as every replay: one snapshot row, live, with this exact normalized content.
+	// Deleted, edited away, or claim replaced → null (caller re-enters create or answers 409).
 	const { rows, publicSmols } = await loadCohortSnapshot(c.env, sub)
 	const row = rows.find((candidate) => candidate.Id === mixtapeId)
-	if (!row) return createPending(c)
+	if (!claim || !row || await rowRetryKey(row) !== key) return null
 	const decision = (await deriveDecisions(rows, publicSmols)).decisions.get(mixtapeId)!
 	return privateJson(c, { ...writeReceipt(row, decision), deduplicated: status === 200 }, status)
+}
+
+function createConflict(c: Context<HonoEnv>) {
+	return privateJson(c, { error: 'This mixtape was changed or removed while it was being created; review it and try again', code: 'create_conflict' }, 409)
 }
 
 /**
@@ -873,7 +912,8 @@ async function currentClaimResponse(c: Context<HonoEnv>, sub: string, key: strin
  */
 async function classifyClaimedCreate(env: Env, sub: string, key: string, mixtapeId: string, token: string): Promise<ClaimedClassification> {
 	try {
-		const cohort = await reevaluateOwnerCohort(env, sub, { subjectId: mixtapeId, allowAi: true })
+		const cohort = await reevaluateOwnerCohort(env, sub, { subjectId: mixtapeId, allowAi: true, claim: { key, mixtapeId, token } })
+		if (cohort.superseded) return { cohort, outcome: 'superseded' }
 		const owned = await markClaim(env, key, mixtapeId, token, cohort.committed ? CLAIM_FINALIZED : CLAIM_FAILED)
 		// A recovery took this claim over meanwhile: our classification is no longer authoritative.
 		return { cohort, outcome: !owned ? 'superseded' : cohort.committed ? 'finalized' : 'not_committed' }
@@ -957,7 +997,7 @@ mixtapes.post('/', parseAuth, async (c) => {
 				cohort.changedIds.forEach((changed) => purgeIds.add(changed))
 				// Never report a classification that never committed; the row stays recoverable.
 				if (outcome === 'not_committed') return createPending(c)
-				if (outcome === 'superseded') return await currentClaimResponse(c, sub, key, id, 201)
+				if (outcome === 'superseded') return await currentClaimResponse(c, sub, key, id, 201) ?? createConflict(c)
 				const { row, decision } = cohortView(cohort, id)
 				return privateJson(c, { ...writeReceipt(row, decision), deduplicated: false }, 201)
 			})
@@ -982,7 +1022,13 @@ mixtapes.post('/', parseAuth, async (c) => {
 					return result
 				})
 				if (recovery.outcome === 'not_committed') return createPending(c)
-				if (recovery.outcome === 'superseded') return await currentClaimResponse(c, sub, key, recoveredId, 200)
+				if (recovery.outcome === 'superseded') {
+					const current = await currentClaimResponse(c, sub, key, recoveredId, 200)
+					if (current) return current
+					cohort = null
+					wait = { state: 'gone' }
+					break // re-enter the bounded, atomic claim check
+				}
 				cohort = recovery.cohort
 				wait = { state: 'finalized', mixtapeId: recoveredId }
 				break
