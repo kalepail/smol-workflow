@@ -129,7 +129,7 @@ function buildMockAuthenticationResponse(params: {
 }
 
 test('resolvePasskeyVerificationTarget maps approved smol.xyz hosts and local dev origins accurately', () => {
-	assert.deepEqual(APPROVED_SMOL_RP_HOSTS, ['smol.xyz', 'next.smol.xyz', 'noot.smol.xyz', 'app.smol.xyz'])
+	assert.deepEqual(APPROVED_SMOL_RP_HOSTS, ['smol.xyz', 'next.smol.xyz', 'noot.smol.xyz'])
 
 	assert.deepEqual(resolvePasskeyVerificationTarget('https://smol.xyz'), {
 		expectedOrigin: 'https://smol.xyz',
@@ -143,28 +143,32 @@ test('resolvePasskeyVerificationTarget maps approved smol.xyz hosts and local de
 		expectedOrigin: 'https://noot.smol.xyz',
 		expectedRPID: ['smol.xyz', 'noot.smol.xyz'],
 	})
-	assert.deepEqual(resolvePasskeyVerificationTarget('https://app.smol.xyz'), {
-		expectedOrigin: 'https://app.smol.xyz',
-		expectedRPID: ['smol.xyz', 'app.smol.xyz'],
-	})
-	assert.deepEqual(resolvePasskeyVerificationTarget('http://localhost:4321'), {
+	assert.deepEqual(resolvePasskeyVerificationTarget('http://localhost:4321', { allowLocalhost: true }), {
 		expectedOrigin: 'http://localhost:4321',
 		expectedRPID: ['localhost'],
 	})
-	assert.deepEqual(resolvePasskeyVerificationTarget('https://localhost:5173'), {
+	assert.deepEqual(resolvePasskeyVerificationTarget('https://localhost:5173', { allowLocalhost: true }), {
 		expectedOrigin: 'https://localhost:5173',
 		expectedRPID: ['localhost'],
 	})
-	assert.deepEqual(resolvePasskeyVerificationTarget('http://127.0.0.1:3000'), {
+	assert.deepEqual(resolvePasskeyVerificationTarget('http://127.0.0.1:3000', { allowLocalhost: true }), {
 		expectedOrigin: 'http://127.0.0.1:3000',
 		expectedRPID: ['127.0.0.1'],
 	})
+	for (const localOrigin of ['http://localhost:4321', 'https://localhost:5173', 'http://127.0.0.1:3000']) {
+		assert.throws(
+			() => resolvePasskeyVerificationTarget(localOrigin),
+			(err: unknown) => err instanceof Error && 'status' in err && (err as { status: number }).status === 400,
+			`Expected localhost origin to be rejected when allowLocalhost is unset: ${localOrigin}`
+		)
+	}
 })
 
 test('resolvePasskeyVerificationTarget rejects disallowed origins, non-HTTPS prod hosts, and malformed URLs', () => {
 	const rejected = [
 		'https://evil.com',
 		'https://evil.smol.xyz',
+		'https://app.smol.xyz',
 		'https://sub.next.smol.xyz',
 		'http://smol.xyz',
 		'http://next.smol.xyz',

@@ -20,6 +20,8 @@ interface Env {
 declare namespace Cloudflare {
 	interface Env {
 		SECRET: string
+		ADMIN_SECRET?: string
+		ALLOW_LOCALHOST_ORIGINS?: string
 		SK: string
 		PIXELLAB_KEY: string
 		CF_API_TOKEN: string

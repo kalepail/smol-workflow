@@ -1110,10 +1110,12 @@ test('Post-review P0/P1 regressions: published smol protected even with override
 			Mint_Token: null,
 		})
 		await delHarness.r2.bucket.put('bulk-shared-mp3.mp3', new Uint8Array([3, 4, 5]))
+		const testAdminSecret = 'bulk-admin-secret-distinct'
+		;(delHarness.env as unknown as Record<string, unknown>).ADMIN_SECRET = testAdminSecret
 		const bulkRes = await appModule.app.fetch(
 			new Request('https://api.smol.xyz/admin/bulk', {
 				method: 'DELETE',
-				headers: { Authorization: `Bearer ${TEST_SECRET}`, 'Content-Type': 'application/json' },
+				headers: { Authorization: `Bearer ${testAdminSecret}`, 'Content-Type': 'application/json' },
 				body: JSON.stringify({ ids: [bulkId] }),
 			}),
 			delHarness.env,

@@ -3,7 +3,7 @@ import { isWorkflowAlreadyExistsError, isWorkflowNotFoundError } from '../utils/
 import { HTTPException } from 'hono/http-exception'
 import { cache } from 'hono/cache'
 import type { HonoEnv } from '../types'
-import { parseAuth, optionalAuth } from '../middleware/auth'
+import { parseAuth, optionalAuth, requireAdmin } from '../middleware/auth'
 import {
 	parsePaginationParams,
 	buildCursorWhereClause,
@@ -66,6 +66,28 @@ interface SmolFailure {
 	title: string
 	message: string
 	retryable: boolean
+	suggestAlternate?: boolean
+}
+
+const SAME_PROVIDER_DEAD = new Set([
+	'provider_misconfigured',
+	'provider_auth_error',
+	'provider_quota_exceeded',
+	'credits_exhausted',
+])
+const CONFIG_ERROR_RE = /\b(?:provider_misconfigured|not configured|missing\s+[A-Z0-9_]+|BYOK)\b/i
+const SAFE_WORKFLOW_ERROR_NAMES = new Set(['Error', 'NonRetryableError', 'WorkflowFatalError'])
+
+function sanitizeWorkflowStatusForDetail(wfStatus: InstanceStatus | null | undefined) {
+	if (!wfStatus) {
+		return wfStatus
+	}
+	const rawName = wfStatus.error?.name?.trim()
+	const safeName = rawName && SAFE_WORKFLOW_ERROR_NAMES.has(rawName) ? rawName : 'Error'
+	return {
+		status: wfStatus.status,
+		...(wfStatus.error ? { error: { name: safeName } } : {}),
+	}
 }
 
 function runBackground(c: Context<HonoEnv>, task: Promise<unknown>): void {
@@ -82,6 +104,8 @@ function runBackground(c: Context<HonoEnv>, task: Promise<unknown>): void {
 function sanitizeKvDoForDetail(raw: Record<string, any> | null | undefined, failure?: SmolFailure) {
 	const {
 		image_base64,
+		search: _search,
+		songs,
 		provider_attempt: _providerAttempt,
 		retry_successor_id: _retrySuccessorId,
 		retry_reservation: _retryReservation,
@@ -102,8 +126,17 @@ function sanitizeKvDoForDetail(raw: Record<string, any> | null | undefined, fail
 		...rest
 	} = raw || {}
 
+	const sanitizedSongs = Array.isArray(songs)
+		? songs.map((song: unknown) => {
+			if (!song || typeof song !== 'object') return song
+			const { error_message: _errorMessage, ...safeSong } = song as Record<string, unknown>
+			return safeSong
+		})
+		: songs
+
 	return {
 		...rest,
+		...(songs !== undefined ? { songs: sanitizedSongs } : {}),
 		image: Boolean(image_base64 || rest.image),
 		...(failure ? { failure } : {}),
 	}
@@ -116,22 +149,37 @@ function normalizeD1DetailRow(row: SmolD1Record): SmolD1Record {
 	}
 }
 
-function getSmolFailure(steps: any, wfStatus?: InstanceStatus | null): SmolFailure | undefined {
+export function getSmolFailure(steps: any, wfStatus?: InstanceStatus | null): SmolFailure | undefined {
 	const failedSong = Array.isArray(steps?.songs)
 		? steps.songs.find((song: any) => typeof song?.status === 'number' && song.status < 0)
 		: undefined
+	const attemptErrorCode = typeof steps?.provider_attempt?.error_code === 'string'
+		? steps.provider_attempt.error_code
+		: undefined
+	const attemptDead = attemptErrorCode !== undefined && SAME_PROVIDER_DEAD.has(attemptErrorCode)
 
 	if (failedSong) {
-		const rawErrorMessage = typeof failedSong.error_message === 'string' && failedSong.error_message.trim()
-			? failedSong.error_message.trim().slice(0, 240)
+		const rawTrimmed = typeof failedSong.error_message === 'string' && failedSong.error_message.trim()
+			? failedSong.error_message.trim()
 			: undefined
+		const dead = attemptDead || (rawTrimmed !== undefined && CONFIG_ERROR_RE.test(rawTrimmed))
 
-		if (failedSong.status === -1 || isContentPolicyMessage(rawErrorMessage)) {
+		if (failedSong.status === -1 || attemptErrorCode === 'content_policy' || isContentPolicyMessage(rawTrimmed)) {
 			return {
 				code: 'content_policy',
 				title: 'Song provider rejected this generation',
-				message: rawErrorMessage || 'One generated song was rejected by the song provider content policy. Try again with a less sensitive prompt or lyrics.',
+				message: 'One generated song was rejected by the song provider content policy. Try again with a less sensitive prompt or lyrics.',
 				retryable: false,
+			}
+		}
+
+		if (dead) {
+			return {
+				code: failedSong.status === -3 ? 'provider_unavailable' : 'generation_failed',
+				title: 'This model is temporarily unavailable',
+				message: 'This song model is temporarily unavailable. Try again later or switch to another model.',
+				retryable: false,
+				suggestAlternate: true,
 			}
 		}
 
@@ -140,21 +188,21 @@ function getSmolFailure(steps: any, wfStatus?: InstanceStatus | null): SmolFailu
 				return {
 					code: 'generation_timeout',
 					title: 'Song generation timed out',
-					message: rawErrorMessage || 'The song provider did not finish this generation in time. Retrying usually fixes this.',
+					message: 'The song provider did not finish this generation in time. Retrying usually fixes this.',
 					retryable: true,
 				}
 			case -3:
 				return {
 					code: 'provider_unavailable',
 					title: 'Song provider is temporarily unavailable',
-					message: rawErrorMessage || 'The song provider reported a temporary issue. Retrying later is the best next step.',
+					message: 'The song provider reported a temporary issue. Retrying later is the best next step.',
 					retryable: true,
 				}
 			default:
 				return {
 					code: 'generation_failed',
 					title: 'Song generation failed',
-					message: rawErrorMessage || 'The song provider could not complete this generation. Try again or adjust the prompt.',
+					message: 'The song provider could not complete this generation. Try again or adjust the prompt.',
 					retryable: true,
 				}
 		}
@@ -170,6 +218,15 @@ function getSmolFailure(steps: any, wfStatus?: InstanceStatus | null): SmolFailu
 	}
 
 	if (wfStatus?.status === 'errored') {
+		if (attemptDead) {
+			return {
+				code: 'generation_failed',
+				title: 'This model is temporarily unavailable',
+				message: 'This song model is temporarily unavailable. Try again later or switch to another model.',
+				retryable: false,
+				suggestAlternate: true,
+			}
+		}
 		return {
 			code: 'generation_failed',
 			title: 'Generation failed',
@@ -533,7 +590,7 @@ smols.get(
 
 		const response = c.json({
 			kv_do,
-			wf: wfStatus,
+			wf: sanitizeWorkflowStatusForDetail(wfStatus),
 			liked,
 		})
 
@@ -1593,12 +1650,8 @@ smols.put('/:smol_id/:song_id', parseAuth, async (c) => {
 	return c.body(null, 204)
 })
 
-// Admin bulk delete (gated behind SECRET token, skips minted/public)
-smols.delete('/admin/bulk', parseAuth, async (c) => {
-	if (!c.get('isAdmin')) {
-		throw new HTTPException(403, { message: 'Admin access required' })
-	}
-
+// Admin bulk delete (gated behind dedicated ADMIN_SECRET, skips minted/public)
+smols.delete('/admin/bulk', requireAdmin, async (c) => {
 	const { env } = c
 	const { ids, allowPublic }: { ids: string[]; allowPublic?: boolean } = await c.req.json()
 

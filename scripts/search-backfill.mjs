@@ -238,7 +238,7 @@ async function main() {
 	}
 
 	if (!options.adminSecret) {
-		throw new Error('Missing admin secret. Set SMOL_ADMIN_SECRET or pass --admin-secret=...')
+		throw new Error('Missing admin secret. Set SMOL_ADMIN_SECRET (matching Worker ADMIN_SECRET) or pass --admin-secret=...')
 	}
 
 	if (!Number.isFinite(options.pageLimit) || options.pageLimit < 1) {

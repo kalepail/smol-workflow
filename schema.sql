@@ -89,6 +89,10 @@ ON Mixtapes("Address", Created_At DESC, Id DESC);
 CREATE INDEX IF NOT EXISTS idx_users_address
 ON Users("Address");
 
+-- Mirrors migrations/0004_users_address_unique.sql.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_address_unique
+ON Users("Address");
+
 -- Mirrors migrations/0002_mixtapes_lifecycle.sql.
 -- Monotonic cache epoch for public mixtape reads. Public GET cache keys embed this value,
 -- so a delayed in-flight GET can never refill the key that is current after a mutation.

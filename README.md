@@ -60,7 +60,7 @@ ext/smol-sdk/                # Soroban smart contract SDK (built via scripts/bui
 ## API Endpoints
 
 ### Auth
-- `POST /login` — Passkey registration (`create`) or authentication (`connect`) across `smol.xyz`, `next.smol.xyz`, `noot.smol.xyz`, `app.smol.xyz`, and local dev hosts
+- `POST /login` — Passkey registration (`create`) or authentication (`connect`) across `smol.xyz`, `next.smol.xyz`, `noot.smol.xyz` (plus local dev hosts when `ALLOW_LOCALHOST_ORIGINS=true`)
 - `POST /logout` — Clear `smol_token` cookie
 
 ### Smols
@@ -73,7 +73,7 @@ ext/smol-sdk/                # Soroban smart contract SDK (built via scripts/bui
 - `PUT /:id` — Toggle public/private visibility (blocked when NSFW is unsafe or unclassified)
 - `PUT /:smol_id/:song_id` — Swap `Song_1`/`Song_2` on 2-track Smols (guarded against `NULL`/empty `Song_2` on 1-track Smols)
 - `DELETE /:id` — Delete owned Smol, clean `Likes`/`Playlists`, protect shared MP3s, purge caches
-- `DELETE /admin/bulk` — Admin bulk delete (Bearer `SECRET`, skips minted and by default public rows)
+- `DELETE /admin/bulk` — Admin bulk delete (gated behind dedicated `ADMIN_SECRET` via `x-admin-secret` or `Authorization: Bearer`; fails closed with 404 when unset; skips minted and by default public rows)
 
 ### Media, Likes, Playlists, Mixtapes, Artists, Search, Minting
 - `GET` / `HEAD /song/:id.mp3` — RFC 9110 Range/206, suffix & EOF-clamped ranges, `416` with `Content-Range`, `If-None-Match` (`304`), `If-Range`, edge caching without partial-body poisoning, play counting excluding `HEAD` and `bytes=0-1` probes
@@ -88,7 +88,8 @@ ext/smol-sdk/                # Soroban smart contract SDK (built via scripts/bui
 ## Bindings, Vars & Secrets
 
 ### Secrets (`wrangler secret put`)
-- `SECRET` — JWT signing secret & admin token
+- `SECRET` — User JWT signing secret (never valid for admin routes)
+- `ADMIN_SECRET` — Dedicated optional admin token (`x-admin-secret` or `Authorization: Bearer`) for `DELETE /admin/bulk` and `/search/admin/*`; admin routes fail closed with `404` when unset
 - `SK` — Stellar secret key for mint auth-entry signing
 - `PIXELLAB_KEY` — Pixellab API key
 - `CF_API_TOKEN` / `CF_ZONE_ID` — Cloudflare zone cache tag purge credentials

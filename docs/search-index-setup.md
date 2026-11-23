@@ -65,7 +65,7 @@ SMOL_ADMIN_SECRET=... npm run backfill:search -- --resume-from-state --max-waves
 
 This script requires:
 - local Wrangler auth, because it polls `wrangler vectorize info`
-- `SMOL_ADMIN_SECRET`, because it calls the admin backfill/reconcile routes
+- `SMOL_ADMIN_SECRET` (matching the Worker's dedicated `ADMIN_SECRET` secret; admin routes return 404 when `ADMIN_SECRET` is unset), because it calls the admin backfill/reconcile routes
 
 By default it now:
 - polls every 30 seconds

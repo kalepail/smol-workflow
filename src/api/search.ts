@@ -1,6 +1,6 @@
-import { Context, Hono } from 'hono'
-import { HTTPException } from 'hono/http-exception'
+import { Hono } from 'hono'
 import type { HonoEnv } from '../types'
+import { requireAdmin } from '../middleware/auth'
 import { parsePaginationParams } from '../utils/pagination'
 import { getSearchBackfillCronStatus, getSearchBackfillPage, queueSearchIndexingBatchById, queueSearchIndexingById, reconcileSearchIndexingBatchById, searchPublicSmols, searchSimilarSmols } from '../utils/search'
 
@@ -22,12 +22,7 @@ function parseBooleanParam(value: string | null): boolean | undefined {
 	return undefined
 }
 
-function assertAdminSecret(c: Context<HonoEnv>) {
-	const token = c.req.header('x-admin-secret')
-	if (!token || token !== c.env.SECRET) {
-		throw new HTTPException(401, { message: 'Unauthorized' })
-	}
-}
+search.use('/admin/*', requireAdmin)
 
 search.get('/', async (c) => {
 	const url = new URL(c.req.url)
@@ -54,8 +49,6 @@ search.get('/:id/similar', async (c) => {
 })
 
 search.post('/admin/reindex/:id', async (c) => {
-	assertAdminSecret(c)
-
 	const ok = await queueSearchIndexingById(c.env, c.req.param('id'))
 	if (!ok) {
 		return c.body(null, 404)
@@ -66,15 +59,11 @@ search.post('/admin/reindex/:id', async (c) => {
 })
 
 search.get('/admin/backfill/status', async (c) => {
-	assertAdminSecret(c)
-
 	c.header('Cache-Control', 'no-store')
 	return c.json(await getSearchBackfillCronStatus(c.env))
 })
 
 search.post('/admin/backfill', async (c) => {
-	assertAdminSecret(c)
-
 	const url = new URL(c.req.url)
 	const { limit, cursor } = parsePaginationParams(url)
 	const force = parseBooleanParam(url.searchParams.get('force')) === true
@@ -90,8 +79,6 @@ search.post('/admin/backfill', async (c) => {
 })
 
 search.post('/admin/reconcile', async (c) => {
-	assertAdminSecret(c)
-
 	const url = new URL(c.req.url)
 	const { limit, cursor } = parsePaginationParams(url)
 	const page = await getSearchBackfillPage(c.env, { limit, cursor })

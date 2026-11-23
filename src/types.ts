@@ -6,7 +6,6 @@ export type Bindings = Env
 
 export type Variables = {
 	jwtPayload?: JWTPayload
-	isAdmin?: boolean
 }
 
 export type JWTPayload = {

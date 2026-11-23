@@ -1,9 +1,9 @@
 import { verifyRegistrationResponse, verifyAuthenticationResponse, AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server"
-import { xdr } from "@stellar/stellar-sdk/minimal";
+import { Address, hash, Keypair, Networks, StrKey, xdr } from "@stellar/stellar-sdk/minimal";
 import { Server } from "@stellar/stellar-sdk/minimal/rpc";
 import base64url from "base64url";
 import { HTTPException } from "hono/http-exception";
-import { contractDataKey, decodeLedgerPage, LEDGER_KEY_LIMIT, storageKey, type MainnetChainReads } from "./utils/chain";
+import { contractDataKey, decodeLedgerPage, instanceKey, LEDGER_KEY_LIMIT, storageKey, type MainnetChainReads } from "./utils/chain";
 
 // Protocol types for different smart account implementations
 export type Protocol = 'passkey-kit' | 'smart-account-kit';
@@ -11,11 +11,15 @@ export type Protocol = 'passkey-kit' | 'smart-account-kit';
 // Constants
 const SECP256R1_PUBLIC_KEY_SIZE = 65; // Uncompressed EC point: 0x04 + 32 bytes X + 32 bytes Y
 const ROOT_SMOL_RP_ID = 'smol.xyz';
+const PASSKEY_KIT_DEPLOYER_ADDRESS = Address.fromString(
+    Keypair.fromRawEd25519Seed(hash(Buffer.from('kalepail'))).publicKey()
+).toScAddress();
+const MAINNET_NETWORK_ID = hash(Buffer.from(Networks.PUBLIC));
+
 export const APPROVED_SMOL_RP_HOSTS = [
     'smol.xyz',
     'next.smol.xyz',
     'noot.smol.xyz',
-    'app.smol.xyz',
 ] as const;
 
 const APPROVED_SMOL_RP_HOST_SET = new Set<string>(APPROVED_SMOL_RP_HOSTS);
@@ -26,15 +30,101 @@ export interface PasskeyVerificationTarget {
     expectedRPID: string[];
 }
 
+export interface PasskeyOriginOptions {
+    allowLocalhost?: boolean;
+}
+
+export interface VerifyRegistrationOptions extends PasskeyOriginOptions {
+    expectedKeyId?: string;
+}
+
+export function normalizeBase64UrlId(value: unknown): { canonical: string; buffer: Buffer } | null {
+    if (typeof value !== 'string') {
+        return null;
+    }
+    const stripped = value.replace(/=+$/, '');
+    if (!stripped || value.length - stripped.length > 2 || !/^[A-Za-z0-9_-]+$/.test(stripped)) {
+        return null;
+    }
+    const buffer = base64url.toBuffer(stripped);
+    if (buffer.length === 0 || base64url.encode(buffer) !== stripped) {
+        return null;
+    }
+    return { canonical: stripped, buffer };
+}
+
+/**
+ * Derive the deterministic mainnet passkey-kit@0.12.0 wallet contract address
+ * for a WebAuthn credential ID (deployer seed hash('kalepail'), salt hash(keyId)).
+ */
+export function derivePasskeyKitContractId(keyId: string | Buffer): string {
+    const keyIdBuffer = typeof keyId === 'string'
+        ? (normalizeBase64UrlId(keyId)?.buffer ?? base64url.toBuffer(keyId))
+        : keyId;
+    const preimage = xdr.HashIdPreimage.envelopeTypeContractId(
+        new xdr.HashIdPreimageContractId({
+            networkId: MAINNET_NETWORK_ID,
+            contractIdPreimage: xdr.ContractIdPreimage.contractIdPreimageFromAddress(
+                new xdr.ContractIdPreimageFromAddress({
+                    address: PASSKEY_KIT_DEPLOYER_ADDRESS,
+                    salt: hash(keyIdBuffer),
+                })
+            ),
+        })
+    );
+    return StrKey.encodeContract(hash(preimage.toXDR()));
+}
+
+/**
+ * Verify on mainnet that a wallet contract instance does not yet exist on-chain.
+ * Requires an authoritative archive-aware absence reply from KALE_WORKER.readEntries.
+ * - 409 if the contract instance already exists (live or archived; existing accounts must use type='connect').
+ * - 503 if KALE_WORKER.readEntries is unavailable, throws, or cannot prove archive-aware absence (fail closed).
+ */
+export async function assertContractUndeployed(
+    contractId: string,
+    binding?: MainnetChainReads,
+): Promise<void> {
+    const gateway = typeof binding?.readEntries === 'function' ? binding : undefined;
+    if (!gateway) {
+        throw new HTTPException(503, { message: 'Unable to verify contract state; please try again' });
+    }
+
+    const key = instanceKey(contractId);
+    const keyXdr = key.toXDR('base64');
+
+    let state: 'present' | 'absent' | 'unknown';
+    try {
+        const page = await gateway.readEntries({ keys: [keyXdr] });
+        const { values } = decodeLedgerPage(page, [keyXdr]);
+        state = values.get(keyXdr)?.state ?? 'unknown';
+    } catch (err) {
+        if (err instanceof HTTPException) {
+            throw err;
+        }
+        throw new HTTPException(503, { message: 'Unable to verify contract state; please try again' });
+    }
+
+    if (state === 'present') {
+        throw new HTTPException(409, { message: 'Account already exists; please sign in instead' });
+    }
+    if (state !== 'absent') {
+        throw new HTTPException(503, { message: 'Unable to verify contract state; please try again' });
+    }
+}
+
 /**
  * Resolve exact expected origin and allowed RP IDs for WebAuthn verification.
  * - Approved https://*.smol.xyz hosts accept the shared registrable RP ID 'smol.xyz'
  *   (used by smol-fe and smol-native) as well as their exact hostname for host-scoped credentials.
  * - https://smol.xyz accepts 'smol.xyz'.
- * - Local dev hosts (localhost / 127.0.0.1) accept their own hostname.
+ * - Local dev hosts (localhost / 127.0.0.1) are accepted only when allowLocalhost is true.
  * - Any other origin is rejected with HTTP 400.
  */
-export function resolvePasskeyVerificationTarget(host: string): PasskeyVerificationTarget {
+export function resolvePasskeyVerificationTarget(
+    host: string,
+    options: PasskeyOriginOptions = {},
+): PasskeyVerificationTarget {
     let url: URL;
     try {
         url = new URL(host);
@@ -54,7 +144,7 @@ export function resolvePasskeyVerificationTarget(host: string): PasskeyVerificat
         };
     }
 
-    if ((url.protocol === 'http:' || url.protocol === 'https:') && LOCAL_DEV_HOSTS.has(hostname)) {
+    if (options.allowLocalhost && (url.protocol === 'http:' || url.protocol === 'https:') && LOCAL_DEV_HOSTS.has(hostname)) {
         return {
             expectedOrigin: url.origin,
             expectedRPID: [hostname],
@@ -75,11 +165,15 @@ function isValidChallenge(challenge: string): boolean {
     }
 }
 
-export async function verifyRegistration(host: string, response: RegistrationResponseJSON) {
-    const { expectedOrigin, expectedRPID } = resolvePasskeyVerificationTarget(host);
+export async function verifyRegistration(
+    host: string,
+    response: RegistrationResponseJSON,
+    options: VerifyRegistrationOptions = {},
+) {
+    const { expectedOrigin, expectedRPID } = resolvePasskeyVerificationTarget(host, options);
 
     try {
-        await verifyRegistrationResponse({
+        const verification = await verifyRegistrationResponse({
             response,
             // Use function to validate challenge from response
             expectedChallenge: isValidChallenge,
@@ -88,6 +182,16 @@ export async function verifyRegistration(host: string, response: RegistrationRes
             requireUserPresence: false,
             requireUserVerification: false,
         });
+        if (!verification.verified) {
+            throw new HTTPException(400, { message: 'Could not verify authentication' });
+        }
+        if (options.expectedKeyId) {
+            const expected = normalizeBase64UrlId(options.expectedKeyId);
+            const attested = normalizeBase64UrlId(verification.registrationInfo?.credential.id);
+            if (!expected || !attested || !expected.buffer.equals(attested.buffer)) {
+                throw new HTTPException(400, { message: 'Passkey credential ID mismatch' });
+            }
+        }
     } catch(err) {
         if (err instanceof HTTPException) {
             throw err;
@@ -214,8 +318,9 @@ export async function verifyAuthentication(
     rpcUrl: string,
     protocol: Protocol = 'passkey-kit',
     binding?: MainnetChainReads,
+    options: PasskeyOriginOptions = {},
 ) {
-    const { expectedOrigin, expectedRPID } = resolvePasskeyVerificationTarget(host);
+    const { expectedOrigin, expectedRPID } = resolvePasskeyVerificationTarget(host, options);
 
     try {
         const gateway = typeof binding?.readEntries === 'function' ? binding : undefined;
@@ -229,7 +334,7 @@ export async function verifyAuthentication(
         // Build COSE key from raw public key
         const publicKey = buildCoseKey(rawpk);
 
-        await verifyAuthenticationResponse({
+        const verification = await verifyAuthenticationResponse({
             response,
             // Use function to validate challenge from response
             expectedChallenge: isValidChallenge,
@@ -245,6 +350,9 @@ export async function verifyAuthentication(
             },
             requireUserVerification: false,
         });
+        if (!verification.verified) {
+            throw new HTTPException(400, { message: 'Could not verify authentication' });
+        }
     } catch(err) {
         if (err instanceof HTTPException) {
             throw err;

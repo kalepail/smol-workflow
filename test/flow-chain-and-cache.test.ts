@@ -487,7 +487,7 @@ test('a mainnet mint signs with a gateway tip, confirms the relay hash and purge
 	}
 })
 
-test('mainnet login accepts archived signers for both protocols and testnet retains sequential RPC reads', async () => {
+test('mainnet login accepts archived signers for both protocols and rejects testnet logins', async () => {
 	const { env, db, send } = harness()
 	const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' })
 	const publicJwk = publicKey.export({ format: 'jwk' })
@@ -520,10 +520,6 @@ test('mainnet login accepts archived signers for both protocols and testnet reta
 		entry(rule(200), externalSigner),
 		entry(legacy, xdr.ScVal.scvVec([xdr.ScVal.scvVoid(), xdr.ScVal.scvBytes(rawKey)])),
 	]
-	const testnetEntries = [
-		entry(ids, xdr.ScVal.scvVec([xdr.ScVal.scvU32(0), xdr.ScVal.scvU32(1), xdr.ScVal.scvU32(2)])),
-		entry(rule(1), externalSigner),
-	]
 	const mainnet: Array<[number, number | undefined]> = []
 	env.KALE_WORKER = { readEntries: async ({ keys, minLedger }) => {
 		mainnet.push([keys.length, minLedger])
@@ -533,18 +529,14 @@ test('mainnet login accepts archived signers for both protocols and testnet reta
 	env.RPC_URL_TESTNET = 'https://testnet-fixture.invalid'
 	const testnet: number[] = []
 	const fetchBefore = globalThis.fetch
-	globalThis.fetch = (async (input, init) => {
-		assert.equal(new URL(String(input)).origin, env.RPC_URL_TESTNET)
-		const body = JSON.parse(String(init?.body))
-		assert.equal(body.method, 'getLedgerEntries')
-		testnet.push(body.params.keys.length)
-		return Response.json({ jsonrpc: '2.0', id: body.id, result: {
-			latestLedger: LEDGER, entries: testnetEntries.filter(({ key }) => body.params.keys.includes(key)),
-		} })
+	globalThis.fetch = (async () => {
+		testnet.push(1)
+		throw new Error('Testnet RPC must never be called')
 	}) as typeof fetch
 	try {
 		const response = await send('/login', authBody, undefined, { Origin: origin })
 		assert.equal(response.status, 200)
+		assert.equal(response.headers.get('Cache-Control'), 'no-store')
 		assert.deepEqual(mainnet, [[1, undefined], [200, LEDGER], [1, LEDGER]])
 		assert.equal(testnet.length, 0)
 
@@ -554,8 +546,8 @@ test('mainnet login accepts archived signers for both protocols and testnet reta
 			assert.equal((await send('/login', { ...authBody, protocol: 'passkey-kit' }, undefined, { Origin: origin })).status, 200)
 		}
 		mainnet.length = 0
-		assert.equal((await send('/login', { ...authBody, network: 'testnet' }, undefined, { Origin: origin })).status, 200)
-		assert.deepEqual(testnet, [1, 1, 1])
+		assert.equal((await send('/login', { ...authBody, network: 'testnet' }, undefined, { Origin: origin })).status, 400)
+		assert.equal(testnet.length, 0)
 		assert.equal(mainnet.length, 0)
 	} finally {
 		globalThis.fetch = fetchBefore
