@@ -1,256 +1,135 @@
 # Smol Workflow
 
-An AI-powered music generation platform built on Cloudflare Workers that transforms text prompts into complete musical compositions with AI-generated artwork, lyrics, and songs.
-
-## Overview
-
-Smol Workflow uses [Cloudflare Workflows](https://developers.cloudflare.com/workflows/) to orchestrate a complex, multi-step AI generation pipeline that creates "Smols" - unique music experiences combining:
-
-- **AI-Generated Pixel Art** (via Pixellab)
-- **AI-Described Image Metadata** (via Cloudflare AI)
-- **AI-Generated Lyrics** (via AI Song Generator)
-- **AI-Generated Songs** (via AI Song Generator / DiffRhythm)
-- **NSFW Content Detection** (via Cloudflare AI)
-- **Stellar Blockchain Integration** for minting songs as tokens
+Backend API and Cloudflare Workflows orchestration engine for [SMOL](https://smol.xyz) (`api.smol.xyz`). Transforms text prompts into complete musical compositions with AI-generated pixel art, descriptions, lyrics, audio tracks, semantic search indexing, and Stellar token minting.
 
 ## Architecture
 
-### Core Technologies
+```
+smol-fe (smol.xyz / next.smol.xyz)  ──┐
+smol-native-api (SONG_GENERATOR)    ──┼──► smol-workflow (Hono + Workflows + DO)
+                                           ├─► Pixellab (64x64 pixel art)
+                                           ├─► Cloudflare Workers AI (moondream3.1, llama-guard-3-8b, gemma-4, bge-m3)
+                                           ├─► aisonggenerator-worker (HTTP Service Binding: lyrics + AISG v6 2-track music)
+                                           ├─► Cloudflare AI Gateway BYOK -> ElevenLabs Music v2.5 (1-track direct MP3 to R2)
+                                           ├─► kale-worker (RPC Service Binding: Stellar relay submitTransaction)
+                                           └─► D1 (smol-d1) · KV (SMOL_KV) · R2 (smol-r2) · Vectorize · Queues
+```
 
-- **[Cloudflare Workers](https://workers.cloudflare.com/)** - Serverless compute platform
-- **[Cloudflare Workflows](https://developers.cloudflare.com/workflows/)** - Durable execution engine for complex, multi-step processes
-- **[Cloudflare Durable Objects](https://developers.cloudflare.com/durable-objects/)** - Stateful storage for workflow steps
-- **[Hono](https://hono.dev/)** - Lightweight web framework
-- **[Stellar SDK](https://github.com/stellar/js-stellar-sdk)** - Blockchain integration
-
-### Storage & Data
-
-- **D1** (SQLite) - Relational database for Smols, Users, Likes, Mixtapes
-- **KV** - Key-value store for workflow state
-- **R2** - Object storage for images and audio files
-
-### AI Services
-
-- **Pixellab** - Pixel art generation
-- **Cloudflare AI** - Image description and NSFW detection
-- **AI Song Generator** - Lyrics and music generation
-- **DiffRhythm** - Fallback music generation service
+### Music Providers & Track Shapes
+- **AISG v6 (`aisonggenerator`, default)**: 2 tracks per generation. Uses split `POST /api/tasks` + read-only `GET /api/tasks/:id` discovery, bounded deterministic polling, 2-track audio swap fingerprinting, and explicit post-swap R2 persistence.
+- **ElevenLabs Music v2.5 (`elevenlabs`)**: 1 track per generation (`model_id: "music_v2_5"`). Routed through Cloudflare AI Gateway BYOK (`.../elevenlabs/v1/music`, `cf-aig-no-wholesale: true`, no `xi-api-key` in Worker), streaming MP3 directly into `SMOL_BUCKET` (`el-<smolId>.mp3`) with canonical `https://api.smol.xyz/song/el-<smolId>.mp3` audio URL. Skips AISG polling and swap detection completely.
+- **Automatic Fallback (`aisonggenerator` → `elevenlabs`)**: Triggered once on confirmed AISG submit rejection (e.g., outage, credits exhausted, auth failure) or terminal non-policy poll failure. Never triggered on content-policy rejection, invalid prompt, or ambiguous submission outcomes. Preserves original creator visibility and records `requested_provider`, `actual_provider`, `fallback_from`, and `fallback_reason`.
 
 ## Project Structure
 
 ```
 src/
-├── index.ts              # Main application entry point
-├── workflow.ts           # Main Smol generation workflow
-├── tx-workflow.ts        # Stellar blockchain transaction workflow
-├── do.ts                 # Durable Objects for state management
-├── types.ts              # TypeScript type definitions
-├── utils.ts              # Utility functions
-├── utils/
-│   └── pagination.ts     # Pagination helpers
-├── middleware/
-│   └── auth.ts           # JWT authentication middleware
+├── index.ts                 # Hono entrypoint, CORS (exposing Range/ETag headers), Queue & Cron handlers
+├── passkey.ts               # WebAuthn registration/auth verification (approved smol.xyz RP IDs)
+├── workflow.ts              # Main Smol generation Workflow (replay-safe, 1- & 2-track)
+├── tx-workflow.ts           # Stellar minting Workflow (split sign -> submit -> confirm -> persist)
+├── do.ts                    # Durable Objects: SmolDurableObject (v1) & SmolState (v2, retained)
+├── utils.ts                 # RFC 9110 byte-range parser
+├── ai/
+│   ├── pixellab.ts          # Pixel art generation (pixflux, timeout + NonRetryableError)
+│   ├── cf.ts                # Image description (@cf/moondream/moondream3.1-9B-A2B)
+│   ├── nsfw.ts              # Fail-closed NSFW classification (@cf/meta/llama-guard-3-8b)
+│   ├── aisonggenerator.ts   # AISG v6 HTTP Service Binding client (lyrics, split tasks, songs)
+│   └── elevenlabs.ts        # ElevenLabs Music v2.5 via Cloudflare AI Gateway BYOK -> R2
 ├── api/
-│   ├── auth.ts           # Authentication endpoints (login/logout)
-│   ├── smols.ts          # Smol CRUD operations
-│   ├── likes.ts          # Like/unlike functionality
-│   ├── mixtapes.ts       # Mixtape creation and retrieval
-│   ├── mint.ts           # Stellar blockchain minting
-│   ├── media.ts          # Audio/image serving with range requests
-│   └── playlists.ts      # Playlist management
-└── ai/
-    ├── pixellab.ts       # Pixel art generation
-    ├── cf.ts             # Cloudflare AI integration
-    ├── aisonggenerator.ts # Song and lyrics generation
-    └── nsfw.ts           # NSFW content detection
-
-ext/
-└── smol-sdk/             # Stellar smart contract SDK
+│   ├── auth.ts              # POST /login, POST /logout
+│   ├── smols.ts             # CRUD, provider create/retry, guarded 1-/2-track swap, bulk delete
+│   ├── media.ts             # RFC 9110 Range/206, HEAD, ETag/If-Range, edge cache, play counting
+│   ├── mint.ts              # Deduped single & batch Stellar mint submission
+│   ├── likes.ts             # Likes endpoints
+│   ├── mixtapes.ts          # Mixtape CRUD
+│   ├── playlists.ts         # Playlist reads
+│   ├── artists.ts           # Artist public Smols
+│   └── search.ts            # Semantic search, similar tracks, admin backfill/reconcile
+└── utils/
+    ├── songs.ts             # Provider strategy, retry reuse, fallback, bounded polling, R2 commit
+    ├── audio-fingerprint.ts # Stream-capped 32KB audio swap fingerprinting (2-track AISG only)
+    ├── search.ts            # Vectorize v2 indexing, queue consumer, DLQ recovery, cron backfill
+    ├── cache.ts             # Cloudflare cache tag invalidation
+    └── pagination.ts        # Cursor-based pagination
+migrations/
+└── 0001_smol_music_providers.sql  # Nullable Song_2 + Requested_Provider / Actual_Provider migration
+ext/smol-sdk/                # Soroban smart contract SDK (built via scripts/build-sdk.mjs)
 ```
-
-## Workflow Pipeline
-
-The main workflow (`src/workflow.ts`) executes the following steps:
-
-1. **Validate Input** - Ensure address and prompt are provided
-2. **Save Payload** - Store initial parameters in Durable Object
-3. **Generate Image** - Create pixel art based on prompt
-4. **Describe Image** - Generate metadata description
-5. **Generate Lyrics** - Create title, lyrics, and style
-6. **Check NSFW** - Validate content safety
-7. **Generate Songs** - Create 2 song variations
-8. **Wait for Completion** - Poll until songs finish processing
-9. **Store Results** - Save to D1, KV, and R2
-10. **Complete Workflow** - Clean up and optionally add to playlist
-
-Each step is retryable with exponential backoff and has a 5-minute timeout.
 
 ## API Endpoints
 
-### Authentication
-- `POST /login` - Create account or authenticate with passkey
-- `POST /logout` - Clear authentication
+### Auth
+- `POST /login` — Passkey registration (`create`) or authentication (`connect`) across `smol.xyz`, `next.smol.xyz`, `noot.smol.xyz`, `app.smol.xyz`, and local dev hosts
+- `POST /logout` — Clear `smol_token` cookie
 
 ### Smols
-- `GET /` - List all public Smols (paginated)
-- `GET /created` - List authenticated user's Smols
-- `GET /liked` - List authenticated user's liked Smols
-- `GET /:id` - Get specific Smol with workflow status
-- `POST /` - Create new Smol (starts workflow)
-- `POST /retry/:id` - Retry failed Smol generation
-- `PUT /:id` - Toggle public/private visibility
-- `PUT /:smol_id/:song_id` - Swap song order
-- `DELETE /:id` - Delete Smol and associated media
+- `GET /` — List public Smols (cursor-paginated)
+- `GET /created` — List authenticated user's Smols
+- `GET /liked` — List authenticated user's liked Smols
+- `GET /:id` — Fetch completed or in-progress Smol (`d1.Song_2` normalized to `null` for 1-track Smols; `kv_do` exposes `payload.provider`, `actual_provider`, `generation_meta`)
+- `POST /` — Create Smol (`{ prompt, public?, instrumental?, playlist?, provider?: 'aisonggenerator' | 'elevenlabs' }`) → `200 text/plain` instance ID
+- `POST /retry/:id` — Retry failed Smol (caller-independent, deduplicated, preserves original creator & provider; optional `{ override_provider }` or `{ provider }`) → `200 text/plain` instance ID
+- `PUT /:id` — Toggle public/private visibility (blocked when NSFW is unsafe or unclassified)
+- `PUT /:smol_id/:song_id` — Swap `Song_1`/`Song_2` on 2-track Smols (guarded against `NULL`/empty `Song_2` on 1-track Smols)
+- `DELETE /:id` — Delete owned Smol, clean `Likes`/`Playlists`, protect shared MP3s, purge caches
+- `DELETE /admin/bulk` — Admin bulk delete (Bearer `SECRET`, skips minted and by default public rows)
 
-### Likes
-- `GET /likes` - Get authenticated user's liked Smol IDs
-- `PUT /likes/:id` - Toggle like on a Smol
+### Media, Likes, Playlists, Mixtapes, Artists, Search, Minting
+- `GET` / `HEAD /song/:id.mp3` — RFC 9110 Range/206, suffix & EOF-clamped ranges, `416` with `Content-Range`, `If-None-Match` (`304`), `If-Range`, edge caching without partial-body poisoning, play counting excluding `HEAD` and `bytes=0-1` probes
+- `GET` / `HEAD /image/:id.png[?scale=1..32]` — Pixel art serving with nearest-neighbor scaling and per-scale edge caching
+- `GET /likes`, `PUT /likes/:id` — User likes
+- `GET /playlist/:title` — Public playlist feed
+- `GET /mixtapes`, `GET /mixtapes/:id`, `POST /mixtapes` — Public mixtapes
+- `GET /artists/:address/smols` — Public artist feed
+- `GET /search`, `GET /search/:id/similar`, `POST /search/admin/{reindex/:id,backfill,reconcile}`, `GET /search/admin/backfill/status` — Semantic search & indexing ops
+- `POST /mint/:id`, `POST /mint` — Deduplicated single & batch Stellar minting (`202`)
 
-### Mixtapes
-- `GET /mixtapes` - List all mixtapes
-- `GET /mixtapes/:id` - Get specific mixtape
-- `POST /mixtapes` - Create new mixtape (collection of Smols)
+## Bindings, Vars & Secrets
 
-### Media
-- `GET /song/:id.mp3` - Stream song with range request support
-- `GET /image/:id.png` - Serve image with optional scaling
+### Secrets (`wrangler secret put`)
+- `SECRET` — JWT signing secret & admin token
+- `SK` — Stellar secret key for mint auth-entry signing
+- `PIXELLAB_KEY` — Pixellab API key
+- `CF_API_TOKEN` / `CF_ZONE_ID` — Cloudflare zone cache tag purge credentials
+- `CF_AIG_TOKEN` — Cloudflare AI Gateway Run token for ElevenLabs BYOK (fail-closed if missing)
 
-### Minting
-- `POST /mint/:id` - Mint single Smol as Stellar token
-- `POST /mint` - Batch mint multiple Smols
-
-## Database Schema
-
-### Smols
-```sql
-Id              TEXT PRIMARY KEY
-Title           TEXT NOT NULL
-Song_1          TEXT NOT NULL
-Song_2          TEXT NOT NULL
-Created_At      DATETIME DEFAULT CURRENT_TIMESTAMP
-Public          BOOLEAN DEFAULT 1
-Instrumental    BOOLEAN DEFAULT 0
-Plays           INTEGER DEFAULT 0
-Views           INTEGER DEFAULT 0
-Address         TEXT NOT NULL
-Mint_Token      TEXT DEFAULT NULL
-Mint_Amm        TEXT DEFAULT NULL
-```
-
-### Users
-```sql
-Username        TEXT NOT NULL
-Address         TEXT NOT NULL
-UNIQUE (Username, Address)
-```
-
-### Likes
-```sql
-Id              TEXT NOT NULL
-Address         TEXT NOT NULL
-UNIQUE (Id, Address)
-```
-
-### Mixtapes
-```sql
-Id              TEXT PRIMARY KEY
-Title           TEXT NOT NULL
-Desc            TEXT NOT NULL
-Smols           TEXT NOT NULL  -- Comma-separated list
-Address         TEXT NOT NULL
-Created_At      DATETIME DEFAULT CURRENT_TIMESTAMP
-```
-
-## Development
-
-### Prerequisites
-- Node.js 18+
-- Wrangler CLI
-- Cloudflare account
-
-### Setup
-
-```sh
-# Install dependencies
-npm install
-
-# Start local development server
-npm start
-
-# Start with remote bindings (production-like environment)
-npm run start:remote
-
-# Type check
-npm run typecheck
-
-# Deploy to Cloudflare
-npm run deploy
-```
-
-### Environment Variables
-
-Required secrets (set via `wrangler secret put`):
-- `SECRET` - JWT signing secret
-- `SK` - Stellar secret key for transaction signing
-- `LAUNCHTUBE_TOKEN` - Authorization token for Launchtube service
-
-Environment variables (in `wrangler.jsonc`):
-- `RPC_URL` - Stellar RPC endpoint
-- `NETWORK_PASSPHRASE` - Stellar network identifier
-- `SMOL_CONTRACT_ID` - Deployed smart contract address
+### Variables (`wrangler.jsonc` `vars`)
+- `CF_AI_GATEWAY_ID` — AI Gateway ID configured with ElevenLabs BYOK stored key (`smol`, `byok_only: true`)
+- `CF_AIG_BYOK_ALIAS` — BYOK key alias (default: `default`)
+- `ELEVENLABS_MUSIC_LENGTH_MS` — Server-enforced track duration in ms (default: `120000`, bounded `3000..600000`)
+- `ELEVENLABS_OUTPUT_FORMAT` — Audio format (default: `mp3_44100_128`)
+- `ELEVENLABS_FALLBACK_ENABLED` — Enable automatic AISG → ElevenLabs fallback (`true` / `false`)
+- `RPC_URL`, `RPC_URL_TESTNET`, `NETWORK_PASSPHRASE`, `SMOL_CONTRACT_ID` — Stellar RPC & contract config
+- `SEARCH_BACKFILL_CRON_*` — Search backfill cron controls
 
 ### Bindings
+- **Workflows**: `WORKFLOW` (`Workflow`), `TX_WORKFLOW` (`TxWorkflow`)
+- **Durable Objects**: `DURABLE_OBJECT` (`SmolDurableObject`, v1) and `DO_STATE` (`SmolState`, v2 — retained; live namespace contains stored data)
+- **Storage**: `SMOL_D1` (`smol-d1`), `SMOL_KV`, `SMOL_BUCKET` (`smol-r2`), `SMOL_SEARCH_INDEX` (`smol-search-index`), `SEARCH_QUEUE` (`smol-search-queue` + `smol-search-queue-dlq`)
+- **Services & AI**: `AI`, `AISONGGENERATOR` (`aisonggenerator-worker`), `KALE_WORKER` (`kale-worker`)
 
-**Workflows:**
-- `WORKFLOW` - Main Smol generation workflow
-- `TX_WORKFLOW` - Stellar transaction workflow
+## Development & Verification
 
-**Durable Objects:**
-- `DURABLE_OBJECT` (SmolDurableObject) - Workflow state storage
-- `DO_STATE` (SmolState) - Additional state management
+```sh
+# Build local ext/smol-sdk artifacts
+pnpm run build:sdk
 
-**Storage:**
-- `SMOL_D1` - D1 database
-- `SMOL_KV` - KV namespace
-- `SMOL_BUCKET` - R2 bucket
+# Type check (builds ext/smol-sdk automatically before tsc)
+pnpm run typecheck
 
-**AI & Services:**
-- `AI` - Cloudflare AI binding
-- `AISONGGENERATOR` - Song generation service binding
-- `LAUNCHTUBE` - Stellar transaction submission service
+# Run full test suite (zero paid calls)
+pnpm test
 
-## Stellar Integration
+# Dry-run Wrangler bundle verification
+npx wrangler deploy --dry-run
 
-The project includes a custom SDK (`ext/smol-sdk`) for interacting with Stellar smart contracts. The `TxWorkflow` handles:
+# Local dev
+pnpm start
+```
 
-- **Single Mints** - Create token and AMM for individual Smols
-- **Batch Mints** - Efficiently mint multiple Smols in one transaction
-- **Auth Entry Signing** - Sign Stellar transactions with stored keypair
-
-Minted tokens are recorded in the database (`Mint_Token`, `Mint_Amm`) for future reference.
-
-## Features
-
-### Workflow Retry System
-Failed workflows can be retried while preserving completed steps, saving time and API credits.
-
-### Pagination
-All list endpoints support cursor-based pagination via `limit` and `cursor` query parameters.
-
-### Media Streaming
-Songs support HTTP range requests for efficient streaming and seeking.
-
-### Image Scaling
-Images can be scaled on-demand via the `scale` query parameter using nearest-neighbor interpolation.
-
-### NSFW Protection
-Content is automatically analyzed and flagged/hidden if deemed unsafe.
-
-### Durable State Management
-Workflow state is persisted in Durable Objects and auto-cleaned after completion via scheduled alarms.
+See [docs/workflows-and-media.md](./docs/workflows-and-media.md) and [docs/search-index-setup.md](./docs/search-index-setup.md) for detailed workflow, media streaming, migration, and search index operations.
 
 ## License
 
-Apache 2.0 - See [LICENSE](./LICENSE) file for details.
-
-Copyright 2024, Cloudflare.
+Apache 2.0 — see [LICENSE](./LICENSE).

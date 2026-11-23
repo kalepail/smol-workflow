@@ -1,40 +1,27 @@
 import { WorkflowEntrypoint, WorkflowStep, WorkflowEvent, WorkflowStepConfig } from 'cloudflare:workers';
+import type { SmolDurableObject } from './do';
 import { pixellab } from './ai/pixellab';
 import { imageDescribe } from './ai/cf';
 import { generateLyrics } from './ai/aisonggenerator';
-import { checkNSFW } from './ai/nsfw';
+import { checkNSFW, isNsfwBlocked, normalizeNsfwResult } from './ai/nsfw';
 import { NonRetryableError } from 'cloudflare:workflows';
-import { purgeArtistSmolsCache, purgePlaylistCache, purgeUserCreatedCache, purgePublicSmolsCache } from './utils/cache';
-import { decideSongsStrategy, pollUntilComplete } from './utils/songs';
+import { purgeCacheByTags } from './utils/cache';
+import { artistSmolsCacheTag } from './utils/cache-tags';
+import { generateOrReuseSongs, isValidMusicProvider, normalizeMusicProvider } from './utils/songs';
 import { isDurableObjectId } from './utils/durable-object-id';
-import { createHiddenSearchState, createQueuedSearchState, queueSearchDeletionById, queueSearchIndexingById } from './utils/search';
+import { createHiddenSearchState, createQueuedSearchState, queueSearchIndexingById } from './utils/search';
 
 /**
  * Smol Generation Workflow
  *
- * This workflow generates a "smol" - a combination of:
- * - AI-generated image (via Pixellab)
- * - Image description (via CF AI)
- * - Lyrics with title and style (via AI)
- * - NSFW check
- * - Two songs (via aisonggenerator or diffrhythm)
- *
- * RETRY HANDLING
- * --------------
- * When retry_id is provided, this workflow attempts to reuse work from a
- * previous failed run:
- * - Image, description, lyrics, NSFW check: reused if available
- * - Songs: complex logic in decideSongsStrategy() handles:
- *   - Complete songs: reused with fingerprint validation
- *   - Pending songs: quick-check if completed, else regenerate
- *   - No songs: generate new ones
- *
- * SONG SWAP DETECTION
- * -------------------
- * The aisonggenerator API can swap audio between songs during streaming.
- * This is handled by capturing fingerprints when we first see audio for
- * each song, then comparing on every poll to detect and correct swaps.
- * See src/utils/songs.ts for detailed documentation.
+ * Generates a "smol" combining:
+ * - AI-generated pixel art (via Pixellab)
+ * - Image description (via Cloudflare Workers AI)
+ * - Lyrics, title, and style tags (via AISG lyrics route / Workers AI fallback)
+ * - NSFW classification (via Cloudflare Workers AI Llama Guard, fail-closed)
+ * - Music generation:
+ *   - Primary: AISG v6 (2 tracks, split submit + paginated discovery + bounded poll + swap validation)
+ *   - Explicit or Automatic Fallback: ElevenLabs Music v2.5 via Cloudflare AI Gateway BYOK (1 track, direct to R2)
  */
 
 const config: WorkflowStepConfig = {
@@ -44,16 +31,19 @@ const config: WorkflowStepConfig = {
 		backoff: 'exponential',
 	},
 	timeout: '5 minutes',
-}
+};
 
 // Non-stream step results are capped at 1 MiB. Leave headroom for encoding.
 const MAX_RETRY_SNAPSHOT_BYTES = 900 * 1024;
 
+function isSchemaCompatError(error: unknown): boolean {
+	const msg = error instanceof Error ? error.message : String(error);
+	return /no such column|has no column named|NOT NULL constraint failed:\s*Smols\.Song_2/i.test(msg);
+}
+
 /**
- * Reduce restored retry state to the fields `run` and `decideSongsStrategy`
- * read, as a plain JSON value safe to persist as a step result. If the
- * snapshot would exceed the step result limit, drop the image so the retry
- * regenerates it instead of failing the step.
+ * Reduce restored retry state to the fields `run` and `generateOrReuseSongs`
+ * read, as a plain JSON value safe to persist as a step result.
  */
 export function toRetrySnapshot(restored: WorkflowSteps | null | undefined, retry_id: string): WorkflowSteps | null {
 	if (!restored?.payload) {
@@ -68,6 +58,13 @@ export function toRetrySnapshot(restored: WorkflowSteps | null | undefined, retr
 		nsfw: restored.nsfw,
 		song_ids: restored.song_ids,
 		songs: restored.songs,
+		requested_provider: restored.requested_provider,
+		active_provider: restored.active_provider,
+		actual_provider: restored.actual_provider,
+		fallback_from: restored.fallback_from,
+		fallback_reason: restored.fallback_reason,
+		generation_meta: restored.generation_meta,
+		provider_attempt: restored.provider_attempt,
 		original_fingerprints: restored.original_fingerprints,
 	})) as WorkflowSteps;
 
@@ -79,76 +76,193 @@ export function toRetrySnapshot(restored: WorkflowSteps | null | undefined, retr
 	return snapshot;
 }
 
+async function persistSmolAndPlaylistD1(params: {
+	env: Env;
+	id: string;
+	title: string;
+	song1: string;
+	song2: string | null;
+	address: string;
+	isSearchPublic: boolean;
+	isInstrumental: boolean;
+	requestedProvider: MusicProvider;
+	actualProvider: MusicProvider | null;
+	playlist?: string;
+}): Promise<void> {
+	const {
+		env,
+		id,
+		title,
+		song1,
+		song2,
+		address,
+		isSearchPublic,
+		isInstrumental,
+		requestedProvider,
+		actualProvider,
+		playlist,
+	} = params;
+
+	const runStatements = async (statements: D1PreparedStatement[]) => {
+		if (typeof env.SMOL_D1.batch === 'function' && statements.length > 1) {
+			await env.SMOL_D1.batch(statements);
+			return;
+		}
+		for (const stmt of statements) {
+			await stmt.run();
+		}
+	};
+
+	const playlistStmt = playlist
+		? env.SMOL_D1.prepare(`INSERT OR IGNORE INTO Playlists (Id, Title) VALUES (?1, ?2)`).bind(id, playlist)
+		: null;
+
+	// Post-migration schema (nullable Song_2 + Requested_Provider + Actual_Provider)
+	const postMigrationInsert = env.SMOL_D1.prepare(`
+		INSERT INTO Smols (Id, Title, Song_1, Song_2, Address, Public, Instrumental, Requested_Provider, Actual_Provider)
+		VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+		ON CONFLICT (Id) DO NOTHING
+	`).bind(
+		id,
+		title,
+		song1,
+		song2,
+		address,
+		isSearchPublic,
+		isInstrumental,
+		requestedProvider,
+		actualProvider,
+	);
+
+	try {
+		await runStatements(playlistStmt ? [postMigrationInsert, playlistStmt] : [postMigrationInsert]);
+		return;
+	} catch (err) {
+		if (!isSchemaCompatError(err)) {
+			throw err;
+		}
+	}
+
+	// Pre-migration compatibility fallback (Song_2 TEXT NOT NULL -> '' for 1-track Smols, no provider columns)
+	const preMigrationInsert = env.SMOL_D1.prepare(`
+		INSERT INTO Smols (Id, Title, Song_1, Song_2, Address, Public, Instrumental)
+		VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+		ON CONFLICT (Id) DO NOTHING
+	`).bind(
+		id,
+		title,
+		song1,
+		song2 ?? '',
+		address,
+		isSearchPublic,
+		isInstrumental,
+	);
+
+	await runStatements(playlistStmt ? [preMigrationInsert, playlistStmt] : [preMigrationInsert]);
+}
+
 export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 	async run(event: WorkflowEvent<WorkflowParams>, step: WorkflowStep) {
 		let retry_steps: WorkflowSteps | undefined;
-		let payload = event.payload;
+		const initialPayload = event.payload;
+		let payload: WorkflowParams = { ...initialPayload };
 
-		const { retry_id } = payload;
+		const { retry_id, override_provider } = initialPayload;
 
 		// =====================================================================
 		// STEP 1: Load retry state (if this is a retry)
-		//
-		// The restored state MUST be the step's return value. On replay (after a
-		// step retry, sleep or hibernation) Workflows return the cached result
-		// without re-running the callback, so assignments made inside the
-		// callback would be lost and `payload` would only hold `{ retry_id }`.
 		// =====================================================================
-			if (retry_id) {
-				const restoredSteps = await step.do(
-					'retry workflow',
-					config,
-					async () => {
-						let restored: WorkflowSteps | null | undefined;
+		if (retry_id) {
+			const restoredSteps = await step.do(
+				'retry workflow',
+				config,
+				async () => {
+					let restored: WorkflowSteps | null | undefined;
 
-						if (isDurableObjectId(retry_id)) {
-							try {
-								const retry_doid = this.env.DURABLE_OBJECT.idFromString(retry_id);
-								const retry_stub = this.env.DURABLE_OBJECT.get(retry_doid);
+					if (isDurableObjectId(retry_id)) {
+						try {
+							const retry_doid = this.env.DURABLE_OBJECT.idFromString(retry_id);
+							const retry_stub = this.env.DURABLE_OBJECT.get(retry_doid);
 
-								restored = await retry_stub.getSteps() as WorkflowSteps;
-							} catch (err) {
-								console.warn('Retry DO lookup failed, falling back to KV', retry_id, err);
-							}
+							restored = await retry_stub.getSteps() as WorkflowSteps;
+						} catch (err) {
+							console.warn('Retry DO lookup failed, falling back to KV', retry_id, err);
 						}
-
-						if (!restored?.payload) {
-							// Fallback for legacy gens and invalid/non-DO IDs
-							restored = await this.env.SMOL_KV.get(retry_id, 'json') as WorkflowSteps | null;
-						}
-
-						return toRetrySnapshot(restored, retry_id);
 					}
-				);
 
-				retry_steps = restoredSteps ?? undefined;
+					if (!restored?.payload) {
+						restored = await this.env.SMOL_KV.get(retry_id, 'json') as WorkflowSteps | null;
+					}
 
-				payload = {
-					...payload, // original payload
-					// Retry can be started by anyone; attribution intentionally stays
-					// with the original smol creator from the saved payload.
-					...retry_steps?.payload
-				};
-			}
+					return toRetrySnapshot(restored, retry_id);
+				}
+			);
 
-		const { address, prompt, playlist, public: is_public = true, instrumental: is_instrumental = false } = payload;
+			retry_steps = restoredSteps ?? undefined;
+
+			// Retry can be started by anyone; attribution intentionally stays
+			// with the original smol creator from the saved payload.
+			const restoredProvider = isValidMusicProvider(retry_steps?.payload?.provider)
+				? retry_steps!.payload!.provider
+				: isValidMusicProvider(retry_steps?.requested_provider)
+					? retry_steps!.requested_provider
+					: undefined;
+			const effectiveProvider = isValidMusicProvider(override_provider)
+				? override_provider
+				: restoredProvider ?? normalizeMusicProvider(initialPayload.provider);
+
+			const { retry_id: _droppedRetryId, override_provider: _droppedOverride, ...restoredCleanPayload } = retry_steps?.payload ?? {};
+			payload = {
+				...initialPayload,
+				...restoredCleanPayload,
+				provider: effectiveProvider,
+				retry_id,
+				...(isValidMusicProvider(override_provider) ? { override_provider } : {}),
+			};
+		} else {
+			payload = {
+				...payload,
+				provider: normalizeMusicProvider(payload.provider),
+			};
+		}
+
+		const {
+			address,
+			prompt,
+			playlist,
+			public: is_public = true,
+			instrumental: is_instrumental = false,
+		} = payload;
+		const requested_provider = normalizeMusicProvider(payload.provider);
 
 		if (!address) {
-			throw new NonRetryableError("Missing address: unable to start workflow without user authentication");
+			throw new NonRetryableError('Missing address: unable to start workflow without user authentication');
 		}
 
 		if (!prompt) {
-			throw new NonRetryableError("Missing prompt: please provide a description for your smol");
+			throw new NonRetryableError('Missing prompt: please provide a description for your smol');
 		}
 
-			if (!isDurableObjectId(event.instanceId)) {
-				throw new NonRetryableError(`Invalid workflow instance ID: ${event.instanceId}`);
-			}
+		if (!isDurableObjectId(event.instanceId)) {
+			throw new NonRetryableError(`Invalid workflow instance ID: ${event.instanceId}`);
+		}
 
-			const doid = this.env.DURABLE_OBJECT.idFromString(event.instanceId);
-			const stub = this.env.DURABLE_OBJECT.get(doid);
+		const doid = this.env.DURABLE_OBJECT.idFromString(event.instanceId);
+		const stub = this.env.DURABLE_OBJECT.get(doid);
 
-		await step.do('save payload', config, async () => stub.saveStep('payload', payload));
+		const persistedPayload: WorkflowParams = {
+			address,
+			prompt,
+			public: is_public,
+			instrumental: is_instrumental,
+			...(playlist ? { playlist } : {}),
+			provider: requested_provider,
+			...(payload.workflow_version ? { workflow_version: payload.workflow_version } : {}),
+		};
+
+		await step.do('save payload', config, async () => {
+			await stub.saveStep('payload', persistedPayload);
+		});
 
 		// =====================================================================
 		// STEP 2: Generate image (or reuse from retry)
@@ -159,7 +273,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 				...config,
 				retries: {
 					...config.retries,
-					limit: 6,  // ~10 min with exponential backoff
+					limit: 6, // ~10 min with exponential backoff
 				},
 			} as WorkflowStepConfig,
 			async () => {
@@ -179,177 +293,215 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 		await step.do('save image description', config, () => stub.saveStep('description', description));
 
 		// =====================================================================
-		// STEP 4: Generate lyrics (or reuse from retry)
+		// STEP 4: Generate lyrics / title / style (or reuse from retry)
 		// =====================================================================
 		const lyrics = retry_steps?.lyrics || await step.do('generate lyrics', config, async () => {
-			const lyrics = await generateLyrics(this.env, prompt, description);
+			const generated = await generateLyrics(this.env, prompt, description);
 
+			const missingLyrics = !is_instrumental && !generated.lyrics?.trim();
 			if (
-				!lyrics.title
-				|| !lyrics.lyrics
-				|| (lyrics.style?.length ?? 0) < 2
+				!generated.title?.trim()
+				|| missingLyrics
+				|| (generated.style?.length ?? 0) < 2
 			) {
 				const missing = [
-					!lyrics.title && 'title',
-					!lyrics.lyrics && 'lyrics',
-					(lyrics.style?.length ?? 0) < 2 && 'style'
+					!generated.title?.trim() && 'title',
+					missingLyrics && 'lyrics',
+					(generated.style?.length ?? 0) < 2 && 'style',
 				].filter(Boolean).join(', ');
 				throw new Error(`Lyrics generation incomplete (missing: ${missing}). Try a different prompt.`);
 			}
 
-			return lyrics;
+			return {
+				title: generated.title.trim(),
+				style: generated.style,
+				lyrics: generated.lyrics ?? '',
+			};
 		});
 
 		await step.do('save generated lyrics', config, () => stub.saveStep('lyrics', lyrics));
 
 		// =====================================================================
-		// STEP 5: Check NSFW (or reuse from retry)
+		// STEP 5: Check NSFW (or reuse from retry), always normalized fail-closed
 		// =====================================================================
-		const nsfw = retry_steps?.nsfw || await step.do('check nsfw', config, async () => {
-			return await checkNSFW(this.env, prompt, description, JSON.stringify(lyrics.lyrics));
-		});
+		const nsfw = retry_steps?.nsfw !== undefined
+			? normalizeNsfwResult(retry_steps.nsfw)
+			: await step.do('check nsfw', config, async () => {
+				return await checkNSFW(this.env, prompt, description, JSON.stringify(lyrics.lyrics ?? ''));
+			});
 
 		await step.do('save nsfw check', config, () => stub.saveStep('nsfw', nsfw));
 
 		// =====================================================================
-		// STEP 6: Handle songs (complex - see decideSongsStrategy)
-		//
-		// This decides whether to:
-		// - Reuse complete songs from a retry (with fingerprint validation)
-		// - Quick-check if pending songs completed (with fingerprint validation)
-		// - Generate new songs and poll for completion
+		// STEP 6: Generate or reuse songs (AISG v6 2-track / ElevenLabs 1-track)
 		// =====================================================================
-		const songsDecision = await decideSongsStrategy({
+		const musicOutcome = await generateOrReuseSongs({
 			env: this.env,
 			stub,
 			step,
 			config,
+			smolId: event.instanceId,
+			retry_id,
 			retry_steps,
 			prompt,
 			description,
 			lyrics,
 			is_public,
 			is_instrumental,
+			requested_provider,
+			override_provider,
 		});
 
-		let songs: AiSongGeneratorSong[];
-		const song_ids = songsDecision.song_ids;
+		const {
+			songs,
+			song_ids,
+			active_provider,
+			actual_provider,
+			fallback_from,
+			fallback_reason,
+			generation_meta,
+		} = musicOutcome;
 
-		if (songsDecision.needsPolling) {
-			// Poll for songs with swap detection on every snapshot
-			songs = await pollUntilComplete({
-				env: this.env,
-				stub,
-				step,
-				config,
-				song_ids: songsDecision.song_ids,
-				source: songsDecision.source,
-			});
-		} else {
-			// Songs already available (from retry)
-			songs = songsDecision.songs;
+		if (songs.length < 1 || !songs[0]?.music_id) {
+			throw new NonRetryableError('Workflow produced no playable songs');
 		}
 
-		// Track whether we reused complete songs (for cleanup logic)
-		const hasCompleteSongs = retry_steps?.songs?.length === 2
-			&& retry_steps?.song_ids?.length === 2
-			&& retry_steps.songs.every(s => s.status >= 4 && s.audio);
+		const isSearchPublic = isNsfwBlocked(nsfw) ? false : is_public;
 
 		// =====================================================================
-		// STEP 7: Complete workflow - save to D1/KV and cleanup retry if needed
+		// STEP 7A: Publish durable detail KV + D1 Smols/Playlists (checkpointed)
+		// Preserves any newer existing search revision on step replay.
 		// =====================================================================
-		await step.do('complete workflow', config, async () => {
-			await stub.setToFlush();
-			const isSearchPublic = typeof nsfw !== 'string' && nsfw?.safe === false ? false : is_public;
+		await step.do('publish smol', config, async () => {
+			const song1 = songs[0].music_id;
+			const song2 = songs.length > 1 && songs[1]?.music_id ? songs[1].music_id : null;
 
-			// Insert into D1
-			await this.env.SMOL_D1.prepare(`
-                INSERT INTO Smols (Id, Title, Song_1, Song_2, Address, Public, Instrumental)
-				VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-				ON CONFLICT (Id) DO NOTHING
-            `)
-				.bind(
-					event.instanceId,
-					lyrics.title,
-					songs[0].music_id,
-					songs[1].music_id,
-					address,
-					isSearchPublic,
-					is_instrumental,
-				)
-				.run();
+			const existingKv = await this.env.SMOL_KV.get(event.instanceId, 'json') as WorkflowSteps | null;
+			const preservedSearch = existingKv?.search
+				?? (isSearchPublic ? createQueuedSearchState() : createHiddenSearchState());
 
-			// Save to KV for quick lookups
+			// Write durable detail KV BEFORE D1 so GET /:id immediately sees KV once D1 row exists
 			await this.env.SMOL_KV.put(event.instanceId, JSON.stringify({
-				payload,
+				payload: persistedPayload,
 				image_base64,
+				image: true,
 				description,
 				lyrics,
 				nsfw,
 				song_ids,
 				songs,
-				search: isSearchPublic ? createQueuedSearchState() : createHiddenSearchState(),
+				requested_provider,
+				active_provider,
+				actual_provider,
+				...(fallback_from ? { fallback_from } : {}),
+				...(fallback_reason ? { fallback_reason } : {}),
+				generation_meta,
+				search: preservedSearch,
 			}));
 
-			if (isSearchPublic) {
-				try {
-					await queueSearchIndexingById(this.env, event.instanceId);
-				} catch (error) {
-					console.error(JSON.stringify({
-						event: 'search_sync_failed',
-						operation: 'indexing_on_creation',
-						smolId: event.instanceId,
-						intendedVisibility: 'public',
-						error: error instanceof Error ? { message: error.message, stack: error.stack } : String(error),
-					}));
-				}
-			}
+			// Write D1 Smols row + conflict-safe Playlist insert in one batch (pre- and post-migration safe)
+			await persistSmolAndPlaylistD1({
+				env: this.env,
+				id: event.instanceId,
+				title: lyrics.title,
+				song1,
+				song2,
+				address,
+				isSearchPublic,
+				isInstrumental: is_instrumental,
+				requestedProvider: requested_provider,
+				actualProvider: actual_provider,
+				playlist,
+			});
+		});
 
-				// Cleanup old retry data if this is a retry
-				if (retry_id) {
-					if (isDurableObjectId(retry_id)) {
-						try {
-							const retry_doid = this.env.DURABLE_OBJECT.idFromString(retry_id);
-							const retry_stub = this.env.DURABLE_OBJECT.get(retry_doid);
-							await retry_stub.setToFlush();
-						} catch (err) {
-							console.warn('Retry DO cleanup failed, continuing', retry_id, err);
+		// =====================================================================
+		// STEP 7B: Enqueue search indexing (separate retryable checkpoint, fail-loud!)
+		// Retries if KV record is not yet visible so enqueue never silently skips sending.
+		// =====================================================================
+		if (isSearchPublic) {
+			await step.do('enqueue search indexing', config, async () => {
+				const queued = await queueSearchIndexingById(this.env, event.instanceId);
+				if (!queued) {
+					throw new Error(`Search indexing enqueue skipped: KV record not yet visible for ${event.instanceId}`);
+				}
+			});
+		}
+
+		// =====================================================================
+		// STEP 7C: Retire ONLY positively identified UNPUBLISHED, TERMINAL retry state
+		// Never deletes any existing published D1 Smols row, its playlists/likes,
+		// its detail KV, its search index, any active/still-running source workflow's
+		// assets, or any shared/active MP3s.
+		// Fails closed on D1 or Workflow status read errors.
+		// =====================================================================
+		if (retry_id && retry_id !== event.instanceId) {
+			await step.do('cleanup retry state', config, async () => {
+				// 1. Positively verify retry_id is NOT published in D1 (do NOT swallow D1 errors!)
+				const publishedRow = await this.env.SMOL_D1.prepare(
+					`SELECT Id FROM Smols WHERE Id = ?1`
+				)
+					.bind(retry_id)
+					.first<{ Id: string }>();
+
+				if (publishedRow) {
+					// Published row exists (whether minted or unminted): preserve D1 row,
+					// likes, mixtape/playlist references, KV detail, search vectors, and image.
+					return;
+				}
+
+				// 2. Positively verify source workflow is NOT still active/complete before retiring its assets
+				if (typeof this.env.WORKFLOW?.get === 'function') {
+					try {
+						const sourceInstance = await this.env.WORKFLOW.get(retry_id);
+						const sourceStatus = await sourceInstance.status();
+						if (sourceStatus.status !== 'errored' && sourceStatus.status !== 'terminated') {
+							// Source is still running or already completed — never delete its KV/image/DO!
+							return;
+						}
+					} catch (err) {
+						const msg = err instanceof Error ? `${err.name} ${err.message}` : String(err);
+						const isNotFound = /instance\.not_found|not[\s_-]*found|does\s*not\s*exist|unknown\s*instance|\b404\b/i.test(msg);
+						if (!isNotFound) {
+							// Indeterminate workflow lookup error: fail closed & retry step
+							throw err;
 						}
 					}
+				}
 
-					await this.env.SMOL_D1.prepare(`DELETE FROM Smols WHERE Id = ?1`).bind(retry_id).run();
-					await this.env.SMOL_KV.delete(retry_id);
-					await queueSearchDeletionById(this.env, retry_id);
-
-				// Clean up orphaned R2 files from retry
+				// Confirmed unpublished, terminal/missing transient retry state: retire KV, image, and DO.
+				await this.env.SMOL_KV.delete(retry_id);
 				await this.env.SMOL_BUCKET.delete(`${retry_id}.png`);
 
-				// Clean up old song mp3s if we regenerated (not reusing hasCompleteSongs)
-				if (!hasCompleteSongs && retry_steps?.songs) {
-					for (const song of retry_steps.songs) {
-						if (song.status >= 4 && song.music_id) {
-							await this.env.SMOL_BUCKET.delete(`${song.music_id}.mp3`);
-						}
-					}
+				if (isDurableObjectId(retry_id)) {
+					const retry_doid = this.env.DURABLE_OBJECT.idFromString(retry_id);
+					const retry_stub = this.env.DURABLE_OBJECT.get(retry_doid);
+					await retry_stub.setToFlush();
 				}
-			}
+			});
+		}
 
-			// Handle playlist if specified
-			if (playlist) {
-				await this.env.SMOL_D1.prepare(`INSERT INTO Playlists (Id, Title) VALUES (?1, ?2)`).bind(event.instanceId, playlist).run();
-				await purgePlaylistCache(playlist);
-			}
-
-			// Purge caches so the smol appears immediately
-			await Promise.all([
-				purgeArtistSmolsCache(address),
-				purgeUserCreatedCache(address),
-				purgePublicSmolsCache(),
+		// =====================================================================
+		// STEP 7D: Batched cache purge + schedule new DO flush alarm LAST
+		// =====================================================================
+		await step.do('finalize workflow', config, async () => {
+			const purgeTags = new Set<string>([
+				`user:${address}:created`,
 			]);
+			if (isSearchPublic) {
+				purgeTags.add('public-smols');
+				purgeTags.add(artistSmolsCacheTag(address));
+			}
+			if (playlist) {
+				purgeTags.add(`playlist:${playlist}`);
+			}
+
+			await purgeCacheByTags([...purgeTags]);
+			await stub.setToFlush();
 		});
 
 		return [
-			payload,
+			persistedPayload,
 			image_base64,
 			description,
 			lyrics,

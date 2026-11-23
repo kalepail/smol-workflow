@@ -107,6 +107,11 @@
         "RPC_URL_TESTNET": "https://soroban-testnet.stellar.org",
         "NETWORK_PASSPHRASE": "Public Global Stellar Network ; September 2015",
         "SMOL_CONTRACT_ID": "CBRNUVLGFM5OYWAGZVGU7CTMP2UJLKZCLFY2ANUCK5UGKND6BBAA5PLA",
+        "CF_AI_GATEWAY_ID": "smol",
+        "CF_AIG_BYOK_ALIAS": "default",
+        "ELEVENLABS_MUSIC_LENGTH_MS": "120000",
+        "ELEVENLABS_OUTPUT_FORMAT": "mp3_44100_128",
+        "ELEVENLABS_FALLBACK_ENABLED": "true",
         "SEARCH_BACKFILL_CRON_ENABLED": "true",
         "SEARCH_BACKFILL_CRON_PAGE_LIMIT": "20",
         "SEARCH_BACKFILL_CRON_STALL_RUNS": "6",
@@ -116,7 +121,7 @@
    * Note: Use secrets to store sensitive data.
    * https://developers.cloudflare.com/workers/configuration/secrets/
    */
-    // Required Worker secrets: SECRET, SK, PIXELLAB_KEY, CF_API_TOKEN, CF_ZONE_ID.
+    // Required Worker secrets: SECRET, SK, PIXELLAB_KEY, CF_API_TOKEN, CF_ZONE_ID, CF_AIG_TOKEN (and CF_AI_GATEWAY_ID var/secret for ElevenLabs BYOK).
     /**
    * Static Assets
    * https://developers.cloudflare.com/workers/static-assets/binding/

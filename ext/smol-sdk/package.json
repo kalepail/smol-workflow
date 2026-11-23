@@ -2,10 +2,19 @@
   "version": "0.0.0",
   "name": "smol-sdk",
   "type": "module",
-  "exports": "./dist/index.js",
-  "typings": "dist/index.d.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "typings": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "prepare": "tsc"
   },
   "dependencies": {
     "@stellar/stellar-sdk": "^14.2.0",

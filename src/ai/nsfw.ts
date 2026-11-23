@@ -1,4 +1,90 @@
-export async function checkNSFW(env: Env, prompt: string, description: string, lyrics: string) {
+/**
+ * Normalize legacy and current NSFW classifier responses into a strict object.
+ * Requires an unambiguous safe result to mark `safe: true`.
+ * Fails closed (`safe: false, unknown: true`) on contradictory, unparseable, or missing output
+ * so unclassified items remain unlisted pending classification.
+ */
+export function normalizeNsfwResult(raw: unknown): NormalizedNsfwResult {
+	if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+		const candidate = raw as { safe?: unknown; categories?: unknown; unknown?: unknown };
+		const categories = Array.isArray(candidate.categories)
+			? candidate.categories
+				.map((item) => (typeof item === 'string' ? item.trim() : String(item ?? '').trim()))
+				.filter(Boolean)
+			: [];
+
+		// Never treat an object flagged `unknown: true` as safe
+		if (candidate.unknown === true) {
+			return { safe: false, categories, unknown: true };
+		}
+
+		if (typeof candidate.safe === 'boolean') {
+			return {
+				safe: candidate.safe,
+				categories,
+			};
+		}
+
+		return { safe: false, categories, unknown: true };
+	}
+
+	if (typeof raw === 'string') {
+		const trimmed = raw.trim();
+		if (!trimmed) {
+			return { safe: false, categories: [], unknown: true };
+		}
+
+		// Try JSON string format first (e.g. '{"safe":false,"categories":["S12"]}')
+		if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+			try {
+				const parsed = JSON.parse(trimmed) as unknown;
+				return normalizeNsfwResult(parsed);
+			} catch {
+				// Fall through to Llama Guard plain-text parsing
+			}
+		}
+
+		// Llama Guard plain text format:
+		// - Exactly one line "safe" (no trailing contradictory lines or categories) -> safe
+		// - First line "unsafe" (optionally followed by category codes) -> unsafe
+		const lines = trimmed
+			.split(/\r?\n/)
+			.map((line) => line.trim())
+			.filter(Boolean);
+		const firstLine = (lines[0] ?? '').toLowerCase();
+
+		if (firstLine === 'safe' && lines.length === 1) {
+			return { safe: true, categories: [] };
+		}
+
+		if (firstLine === 'unsafe' || firstLine.startsWith('unsafe ')) {
+			const restText = [
+				firstLine.startsWith('unsafe ') ? lines[0].slice('unsafe'.length).trim() : '',
+				...lines.slice(1),
+			]
+				.filter(Boolean)
+				.join(',');
+			const categories = restText
+				.split(/[\s,]+/)
+				.map((part) => part.trim())
+				.filter(Boolean);
+			return { safe: false, categories };
+		}
+
+		return { safe: false, categories: [], unknown: true };
+	}
+
+	return { safe: false, categories: [], unknown: true };
+}
+
+/**
+ * Returns true if the NSFW result blocks public listing (explicitly unsafe OR unknown/unclassified).
+ */
+export function isNsfwBlocked(raw: unknown): boolean {
+	return !normalizeNsfwResult(raw).safe;
+}
+
+export async function checkNSFW(env: Env, prompt: string, description: string, lyrics: string): Promise<NormalizedNsfwResult> {
 	const response = await env.AI.run("@cf/meta/llama-guard-3-8b", {
 		response_format: { type: 'json_object' },
 		messages: [
@@ -38,5 +124,5 @@ export async function checkNSFW(env: Env, prompt: string, description: string, l
 		]
 	});
 
-	return response.response;
+	return normalizeNsfwResult(response?.response);
 }

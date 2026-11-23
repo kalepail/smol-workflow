@@ -9,6 +9,7 @@ const mixtapes = new Hono<HonoEnv>()
 const MAX_MIXTAPE_TITLE_LENGTH = 120
 const MAX_MIXTAPE_DESC_LENGTH = 1000
 const MAX_MIXTAPE_SMOLS = 100
+const D1_IN_CHUNK_SIZE = 90
 
 interface MixtapeRow {
 	Id: string
@@ -68,8 +69,8 @@ async function loadPublicSmolRows(env: Env, ids: string[]): Promise<Map<string, 
 	const rows = new Map<string, MixtapeSmolRow>()
 	const batches: string[][] = []
 
-	for (let index = 0; index < uniqueIds.length; index += MAX_MIXTAPE_SMOLS) {
-		batches.push(uniqueIds.slice(index, index + MAX_MIXTAPE_SMOLS))
+	for (let index = 0; index < uniqueIds.length; index += D1_IN_CHUNK_SIZE) {
+		batches.push(uniqueIds.slice(index, index + D1_IN_CHUNK_SIZE))
 	}
 
 	const results = await Promise.all(batches.map((batch) => {
@@ -149,7 +150,7 @@ mixtapes.get(
 		const { results } = await env.SMOL_D1.prepare(`
 			SELECT Id, Title, Desc, Smols, "Address", Created_At
 			FROM Mixtapes
-			ORDER BY Created_At DESC
+			ORDER BY Created_At DESC, Id DESC
 			LIMIT 100
 		`).all<MixtapeRow>()
 

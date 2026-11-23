@@ -1,6 +1,14 @@
-// Augment the Cloudflare.Env interface with secrets not in wrangler.jsonc
+// Augment the Cloudflare.Env interface with secrets and runtime bindings not in wrangler.jsonc
 // This ensures the global `env` from cloudflare:workers has the right types
 // These secrets are managed via `wrangler secret put` or `.dev.vars`
+interface KaleWorkerBinding extends Fetcher {
+	submitTransaction(input: { xdr: string }): Promise<{
+		hash?: string
+		error?: string
+		errorCode?: string
+	}>
+}
+
 declare namespace Cloudflare {
 	interface Env {
 		SECRET: string
@@ -8,6 +16,12 @@ declare namespace Cloudflare {
 		PIXELLAB_KEY: string
 		CF_API_TOKEN: string
 		CF_ZONE_ID: string
+		CF_AI_GATEWAY_ID?: string
+		CF_AIG_TOKEN?: string
+		CF_AIG_BYOK_ALIAS?: string
+		ELEVENLABS_MUSIC_LENGTH_MS?: string
+		ELEVENLABS_OUTPUT_FORMAT?: string
+		ELEVENLABS_FALLBACK_ENABLED?: string
 		SEARCH_BACKFILL_CRON_ENABLED: string
 		SEARCH_BACKFILL_CRON_PAGE_LIMIT: string
 		SEARCH_BACKFILL_CRON_STALL_RUNS: string
@@ -16,6 +30,8 @@ declare namespace Cloudflare {
 		SEARCH_QUEUE: Queue<SearchQueueMessage>
 	}
 }
+
+type MusicProvider = 'aisonggenerator' | 'elevenlabs'
 
 interface AiSongGeneratorLyrics {
 	title: string
@@ -27,6 +43,39 @@ interface AiSongGeneratorSong {
 	music_id: string
 	status: number
 	audio: string
+	service?: string
+	provider?: string
+	duration?: number
+	error_message?: string
+}
+
+interface NormalizedNsfwResult {
+	safe: boolean
+	categories: string[]
+	unknown?: boolean
+}
+
+interface GenerationMeta {
+	requested_provider: MusicProvider
+	actual_provider: MusicProvider | null
+	fallback_from?: MusicProvider
+	fallback_reason?: string
+}
+
+interface ProviderAttemptState {
+	provider: MusicProvider
+	status: 'claimed' | 'submitted' | 'committed' | 'failed' | 'ambiguous'
+	attempt_id?: string
+	source_smol_id?: string
+	task_id?: string
+	workspace_id?: string
+	song_ids?: string[]
+	r2_keys?: string[]
+	upstream_song_id?: string
+	gateway_log_id?: string
+	error_code?: string
+	error_message?: string
+	updated_at: string
 }
 
 type SearchStatus = 'queued' | 'processing' | 'ready' | 'hidden' | 'failed'
@@ -69,6 +118,8 @@ type SearchQueueMessage =
 		type: 'finalize'
 		smolId: string
 		vectorIds: string[]
+		mutationId?: string
+		sourceHash?: string
 	}
 	| {
 		type: 'delete'
@@ -76,17 +127,44 @@ type SearchQueueMessage =
 		vectorIds?: string[]
 	}
 
+interface RetryReservation {
+	successorId: string
+	predecessorId: string
+}
+
+interface RetrySuccessorInspection {
+	state: 'empty' | 'seeded_unstarted' | 'executed'
+	retrySourceId?: string
+	provider?: MusicProvider
+	overrideProvider?: MusicProvider
+	existingAttempt?: ProviderAttemptState
+}
+
 interface WorkflowSteps {
 	payload: WorkflowParams
 	image_base64: string | undefined
+	image?: boolean
 	description: string | undefined
 	lyrics: AiSongGeneratorLyrics | undefined
-	nsfw: string | {
+	nsfw: NormalizedNsfwResult | string | {
 		safe?: boolean
 		categories?: string[]
 	} | undefined
 	song_ids: number[] | string[] | undefined
 	songs: AiSongGeneratorSong[] | undefined
+	requested_provider?: MusicProvider
+	active_provider?: MusicProvider
+	actual_provider?: MusicProvider | null
+	fallback_from?: MusicProvider
+	fallback_reason?: string
+	generation_meta?: GenerationMeta
+	provider_attempt?: ProviderAttemptState
+	retry_successor_id?: string
+	retry_reservation?: RetryReservation
+	retry_chain_root_id?: string
+	retry_source_id?: string
+	retry_seed_pending?: boolean
+	workflow_executed?: boolean
 	streaming_fingerprints?: Record<string, {
 		hash: string
 		byteLength: number
@@ -120,6 +198,9 @@ type WorkflowParams = {
 	public?: boolean
 	instrumental?: boolean
 	playlist?: string
+	provider?: MusicProvider
+	override_provider?: MusicProvider
+	workflow_version?: number
 }
 
 type WorkflowTxParams = {

@@ -6,9 +6,8 @@ import { parseAuth } from '../middleware/auth'
 
 const mint = new Hono<HonoEnv>()
 const MAX_BATCH_MINT_IDS = 100
+const D1_IN_CHUNK_SIZE = 90
 // Current Mainnet Soroban contract_bandwidth_v0.tx_max_size_bytes.
-// Verified with `stellar network settings` on 2026-05-14; update if validators
-// change network transaction bandwidth limits.
 const MAX_SIGNED_XDR_BYTES = 132096
 
 function assertSignedXdr(value: unknown): string {
@@ -54,6 +53,37 @@ function assertMintIds(value: unknown): string[] {
 	return ids
 }
 
+async function computeMintWorkflowId(prefix: string, parts: string[]): Promise<string> {
+	const digest = await crypto.subtle.digest(
+		'SHA-256',
+		new TextEncoder().encode(parts.join(':'))
+	)
+	const hex = Array.from(new Uint8Array(digest))
+		.map((b) => b.toString(16).padStart(2, '0'))
+		.join('')
+	return `${prefix}-${hex.slice(0, 48)}`
+}
+
+function isDuplicateWorkflowError(error: unknown): boolean {
+	const msg = error instanceof Error ? error.message : String(error)
+	return /already\s*exists|duplicate|instance.*exists/i.test(msg)
+}
+
+async function createDedupedTxWorkflow(
+	env: Env,
+	id: string,
+	params: WorkflowTxParams
+): Promise<void> {
+	try {
+		await env.TX_WORKFLOW.create({ id, params })
+	} catch (err) {
+		if (isDuplicateWorkflowError(err)) {
+			return
+		}
+		throw err
+	}
+}
+
 mint.post('/', parseAuth, async (c) => {
 	const { env, req } = c
 	const payload = c.get('jwtPayload')!
@@ -61,27 +91,34 @@ mint.post('/', parseAuth, async (c) => {
 	const xdr = assertSignedXdr(body?.xdr)
 	const ids = assertMintIds(body?.ids)
 
-	const smolRecords = await env.SMOL_D1.prepare(
-		`SELECT Id, Title, Address, Mint_Token, Mint_Amm FROM Smols WHERE Id IN (${ids.map(() => '?').join(', ')})`
-	)
-		.bind(...ids)
-		.all<{
-			Id: string
-			Title: string
-			Address: string | null
-			Mint_Token: string | null
-			Mint_Amm: string | null
-		}>()
+	type MintSmolRow = {
+		Id: string
+		Title: string
+		Address: string | null
+		Mint_Token: string | null
+		Mint_Amm: string | null
+	}
 
-	if (!smolRecords.results || smolRecords.results.length === 0) {
+	const allResults: MintSmolRow[] = []
+	for (let i = 0; i < ids.length; i += D1_IN_CHUNK_SIZE) {
+		const chunk = ids.slice(i, i + D1_IN_CHUNK_SIZE)
+		const chunkResult = await env.SMOL_D1.prepare(
+			`SELECT Id, Title, Address, Mint_Token, Mint_Amm FROM Smols WHERE Id IN (${chunk.map(() => '?').join(', ')})`
+		)
+			.bind(...chunk)
+			.all<MintSmolRow>()
+		allResults.push(...(chunkResult.results ?? []))
+	}
+
+	if (allResults.length === 0) {
 		throw new HTTPException(404, { message: 'No smols found' })
 	}
 
-	if (smolRecords.results.length !== ids.length) {
+	if (allResults.length !== ids.length) {
 		throw new HTTPException(404, { message: 'Some smols not found' })
 	}
 
-	const recordsById = new Map(smolRecords.results.map((record) => [record.Id, record]))
+	const recordsById = new Map(allResults.map((record) => [record.Id, record]))
 	const ownerSubsById: Record<string, string> = {}
 	const mintableIds: string[] = []
 	const alreadyMintedIds: string[] = []
@@ -110,18 +147,18 @@ mint.post('/', parseAuth, async (c) => {
 		})
 	}
 
+	const workflowId = await computeMintWorkflowId('batch-mint', [mintableIds.join(','), xdr])
+
 	// Do not require Smols.Address to match the authenticated user. Minting is
 	// intentionally an artist/collector action, and public smols may be minted by
 	// people who did not create the original generated smol.
-	await env.TX_WORKFLOW.create({
-		params: {
-			type: 'batch-mint',
-			xdr,
-			ids,
-			mintableIds,
-			sub: payload.sub,
-			ownerSubsById,
-		},
+	await createDedupedTxWorkflow(env, workflowId, {
+		type: 'batch-mint',
+		xdr,
+		ids,
+		mintableIds,
+		sub: payload.sub,
+		ownerSubsById,
 	})
 
 	return c.json({
@@ -166,17 +203,14 @@ mint.post('/:id', parseAuth, async (c) => {
 		throw new HTTPException(404, { message: 'Smol not found' })
 	}
 
-	// Do not require Smols.Address to match the authenticated user. Minting is
-	// intentionally an artist/collector action, and public smols may be minted by
-	// people who did not create the original generated smol.
-	await env.TX_WORKFLOW.create({
-		params: {
-			type: 'mint',
-			xdr,
-			entropy: id,
-			sub: payload.sub,
-			ownerSub: smolRecord.Address,
-		},
+	const workflowId = await computeMintWorkflowId('mint', [id, xdr])
+
+	await createDedupedTxWorkflow(env, workflowId, {
+		type: 'mint',
+		xdr,
+		entropy: id,
+		sub: payload.sub,
+		ownerSub: smolRecord.Address,
 	})
 
 	return c.body(null, 202)

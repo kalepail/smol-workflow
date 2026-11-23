@@ -9,6 +9,59 @@ export type Protocol = 'passkey-kit' | 'smart-account-kit';
 
 // Constants
 const SECP256R1_PUBLIC_KEY_SIZE = 65; // Uncompressed EC point: 0x04 + 32 bytes X + 32 bytes Y
+const ROOT_SMOL_RP_ID = 'smol.xyz';
+export const APPROVED_SMOL_RP_HOSTS = [
+    'smol.xyz',
+    'next.smol.xyz',
+    'noot.smol.xyz',
+    'app.smol.xyz',
+] as const;
+
+const APPROVED_SMOL_RP_HOST_SET = new Set<string>(APPROVED_SMOL_RP_HOSTS);
+const LOCAL_DEV_HOSTS = new Set(['localhost', '127.0.0.1']);
+
+export interface PasskeyVerificationTarget {
+    expectedOrigin: string;
+    expectedRPID: string[];
+}
+
+/**
+ * Resolve exact expected origin and allowed RP IDs for WebAuthn verification.
+ * - Approved https://*.smol.xyz hosts accept the shared registrable RP ID 'smol.xyz'
+ *   (used by smol-fe and smol-native) as well as their exact hostname for host-scoped credentials.
+ * - https://smol.xyz accepts 'smol.xyz'.
+ * - Local dev hosts (localhost / 127.0.0.1) accept their own hostname.
+ * - Any other origin is rejected with HTTP 400.
+ */
+export function resolvePasskeyVerificationTarget(host: string): PasskeyVerificationTarget {
+    let url: URL;
+    try {
+        url = new URL(host);
+    } catch {
+        throw new HTTPException(400, { message: 'Passkey origin does not match this domain' });
+    }
+
+    const hostname = url.hostname.toLowerCase();
+
+    if (url.protocol === 'https:' && url.port === '' && APPROVED_SMOL_RP_HOST_SET.has(hostname)) {
+        const expectedRPID = hostname === ROOT_SMOL_RP_ID
+            ? [ROOT_SMOL_RP_ID]
+            : [ROOT_SMOL_RP_ID, hostname];
+        return {
+            expectedOrigin: url.origin,
+            expectedRPID,
+        };
+    }
+
+    if ((url.protocol === 'http:' || url.protocol === 'https:') && LOCAL_DEV_HOSTS.has(hostname)) {
+        return {
+            expectedOrigin: url.origin,
+            expectedRPID: [hostname],
+        };
+    }
+
+    throw new HTTPException(400, { message: 'Passkey origin does not match this domain' });
+}
 
 // Validate challenge: accept any valid base64url challenge >= 16 bytes
 // Works for both passkey-kit (static) and smart-account-kit (random) flows
@@ -22,21 +75,24 @@ function isValidChallenge(challenge: string): boolean {
 }
 
 export async function verifyRegistration(host: string, response: RegistrationResponseJSON) {
-    try {
-        const url = new URL(host);
+    const { expectedOrigin, expectedRPID } = resolvePasskeyVerificationTarget(host);
 
+    try {
         await verifyRegistrationResponse({
             response,
             // Use function to validate challenge from response
             expectedChallenge: isValidChallenge,
-            expectedOrigin: url.origin,
-            expectedRPID: url.hostname,
+            expectedOrigin,
+            expectedRPID,
             requireUserPresence: false,
             requireUserVerification: false,
         });
     } catch(err) {
+        if (err instanceof HTTPException) {
+            throw err;
+        }
         const message = err instanceof Error ? err.message : String(err);
-        if (message.includes('Unexpected RP ID hash')) {
+        if (message.includes('Unexpected RP ID hash') || message.includes('origin')) {
             throw new HTTPException(400, { message: 'Passkey origin does not match this domain' });
         }
         throw new HTTPException(400, { message: 'Could not verify authentication' });
@@ -191,8 +247,9 @@ export async function verifyAuthentication(
     rpcUrl: string,
     protocol: Protocol = 'passkey-kit'
 ) {
+    const { expectedOrigin, expectedRPID } = resolvePasskeyVerificationTarget(host);
+
     try {
-        const url = new URL(host);
         const rpc = new Server(rpcUrl);
 
         // Get raw public key based on protocol
@@ -207,8 +264,8 @@ export async function verifyAuthentication(
             response,
             // Use function to validate challenge from response
             expectedChallenge: isValidChallenge,
-            expectedOrigin: url.origin,
-            expectedRPID: url.hostname,
+            expectedOrigin,
+            expectedRPID,
             credential: {
                 id: keyId,
                 publicKey: new Uint8Array(publicKey),
@@ -220,8 +277,11 @@ export async function verifyAuthentication(
             requireUserVerification: false,
         });
     } catch(err) {
+        if (err instanceof HTTPException) {
+            throw err;
+        }
         const message = err instanceof Error ? err.message : String(err);
-        if (message.includes('Unexpected RP ID hash')) {
+        if (message.includes('Unexpected RP ID hash') || message.includes('origin')) {
             throw new HTTPException(400, { message: 'Passkey origin does not match this domain' });
         }
         throw new HTTPException(400, { message: 'Could not verify authentication' });

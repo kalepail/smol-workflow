@@ -1,5 +1,5 @@
 import { Keypair, scValToNative, xdr } from "@stellar/stellar-sdk/minimal";
-import { rpc } from "@stellar/stellar-sdk";
+import { Server } from "@stellar/stellar-sdk/minimal/rpc";
 import { basicNodeSigner } from "@stellar/stellar-sdk/minimal/contract";
 import { WorkflowEntrypoint, WorkflowEvent, WorkflowStep, WorkflowStepConfig } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
@@ -7,197 +7,387 @@ import { Client as SmolClient } from "smol-sdk";
 import { purgeCacheByTags } from "./utils/cache";
 import { artistSmolsCacheTag } from "./utils/cache-tags";
 
-type KaleWorkerBinding = Fetcher & {
-	submitTransaction(input: { xdr: string }): Promise<{
-		hash?: string
-		error?: string
-		errorCode?: string
-	}>
-}
-
 const config: WorkflowStepConfig = {
-    retries: {
-        limit: 5,
-        delay: '10 second',
-        backoff: 'exponential',
-    },
-    timeout: '5 minutes',
+	retries: {
+		limit: 5,
+		delay: '10 second',
+		backoff: 'exponential',
+	},
+	timeout: '5 minutes',
+};
+
+const submitConfig: WorkflowStepConfig = {
+	// Never blindly re-submit a signed Stellar transaction if a relay response is lost;
+	// reconciliation must inspect relay/on-chain state instead of sending a duplicate tx.
+	retries: {
+		limit: 0,
+		delay: '1 second',
+	},
+	timeout: '2 minutes',
+};
+
+const confirmConfig: WorkflowStepConfig = {
+	retries: {
+		limit: 6,
+		delay: '5 second',
+		backoff: 'exponential',
+	},
+	timeout: '5 minutes',
+};
+
+/**
+ * Extract the ordered list of 32-byte hex salts from a signed `coin_them` Soroban invocation XDR.
+ * The `smol` contract's `coin_them(user, asset_bytes, salts, fee_rules)` builds its return vector
+ * via `results.push_front(...)`, which REVERSES the returned tuples relative to `salts`.
+ * Extracting `salts` from the signed invocation ensures exact attribution even if payload IDs
+ * differ in ordering or padding.
+ */
+export function extractCoinThemSaltHexes(xdrEnvelope: string): string[] {
+	let envelope: xdr.TransactionEnvelope;
+	try {
+		envelope = xdr.TransactionEnvelope.fromXDR(xdrEnvelope, 'base64');
+	} catch {
+		throw new NonRetryableError('Invalid batch-mint transaction XDR');
+	}
+
+	let operations: xdr.Operation[] = [];
+	const switchName = envelope.switch().name;
+	if (switchName === 'envelopeTypeTx') {
+		operations = envelope.v1().tx().operations();
+	} else if (switchName === 'envelopeTypeTxV0') {
+		operations = envelope.v0().tx().operations();
+	} else if (switchName === 'envelopeTypeTxFeeBump') {
+		operations = envelope.feeBump().tx().innerTx().v1().tx().operations();
+	}
+
+	for (const op of operations) {
+		if (op.body().switch().name !== 'invokeHostFunction') {
+			continue;
+		}
+		const hostFn = op.body().invokeHostFunctionOp().hostFunction();
+		if (hostFn.switch().name !== 'hostFunctionTypeInvokeContract') {
+			continue;
+		}
+		const invokeArgs = hostFn.invokeContract();
+		const fnName = invokeArgs.functionName().toString('utf8');
+		if (fnName !== 'coin_them') {
+			continue;
+		}
+
+		// coin_them(user, asset_bytes, salts, fee_rules) -> args[2] is Vec<BytesN<32>>
+		const args = invokeArgs.args();
+		if (args.length < 3 || args[2].switch().name !== 'scvVec') {
+			throw new NonRetryableError('Batch-mint coin_them invocation is missing salts vector');
+		}
+		const saltVals = args[2].vec() ?? [];
+		const hexSalts: string[] = [];
+		for (const val of saltVals) {
+			if (val.switch().name !== 'scvBytes') {
+				throw new NonRetryableError('Batch-mint coin_them salt entry is not bytes');
+			}
+			const bytes = val.bytes();
+			if (bytes.length !== 32) {
+				throw new NonRetryableError(`Batch-mint coin_them salt must be 32 bytes (got ${bytes.length})`);
+			}
+			hexSalts.push(Buffer.from(bytes).toString('hex').toLowerCase());
+		}
+		return hexSalts;
+	}
+
+	throw new NonRetryableError('Batch-mint XDR does not contain a coin_them contract invocation');
 }
 
 /**
- * Poll Stellar RPC for transaction result and extract returnValue.
- * Waits for the transaction to be confirmed on-chain.
+ * Map `coin_them` results (which the contract produces in REVERSE salt order via `push_front`)
+ * back to the exact smol IDs from the signed invocation's salts.
  */
-async function getTransactionResult(hash: string, rpcUrl: string): Promise<string> {
-    const rpcServer = new rpc.Server(rpcUrl);
-    const timeout = 30000;
-    const pollInterval = 1000;
-    const startTime = Date.now();
+export function pairBatchMintResults(params: {
+	xdrEnvelope: string;
+	rawResults: unknown[];
+	requestedIds: string[];
+	mintableIds: string[];
+}): Array<{ id: string; token: string; amm: string }> {
+	const { xdrEnvelope, rawResults, requestedIds, mintableIds } = params;
+	const saltHexes = extractCoinThemSaltHexes(xdrEnvelope);
 
-    while (Date.now() - startTime < timeout) {
-        const result = await rpcServer.getTransaction(hash);
+	if (saltHexes.length !== rawResults.length) {
+		throw new NonRetryableError(
+			`Batch mint result count (${rawResults.length}) does not match signed coin_them salts (${saltHexes.length})`
+		);
+	}
 
-        if (result.status === 'SUCCESS') {
-            if (!result.returnValue) {
-                throw new Error(`Transaction ${hash} succeeded but has no returnValue`);
-            }
-            return result.returnValue.toXDR('base64');
-        } else if (result.status === 'FAILED') {
-            throw new Error(`Transaction ${hash} failed on-chain`);
-        }
+	const candidateIds = [...new Set([...requestedIds, ...mintableIds])];
+	const idBySaltHex = new Map<string, string>();
+	for (const id of candidateIds) {
+		const normalized = id.trim().toLowerCase().padStart(64, '0');
+		idBySaltHex.set(normalized, id);
+	}
 
-        // NOT_FOUND - transaction not yet in ledger, keep polling
-        await new Promise(resolve => setTimeout(resolve, pollInterval));
-    }
+	const paired: Array<{ id: string; token: string; amm: string }> = [];
+	const seenIds = new Set<string>();
+	const count = saltHexes.length;
 
-    throw new Error(`Timeout waiting for transaction ${hash} confirmation`);
+	for (let i = 0; i < count; i++) {
+		const saltHex = saltHexes[i];
+		const id = idBySaltHex.get(saltHex);
+		if (!id) {
+			throw new NonRetryableError(`Signed coin_them salt ${saltHex} does not match any requested smol ID`);
+		}
+		if (seenIds.has(id)) {
+			throw new NonRetryableError(`Duplicate smol salt ${saltHex} in coin_them invocation`);
+		}
+		seenIds.add(id);
+
+		// Contract `coin_them` calls `results.push_front(coin_it(...))` for each salt in forward order,
+		// so the tuple for `saltHexes[i]` is at index `count - 1 - i` in `rawResults`.
+		const resultForSalt = rawResults[count - 1 - i];
+		const [token, amm] = assertMintPair(resultForSalt, id);
+		paired.push({ id, token, amm });
+	}
+
+	return paired;
+}
+
+/**
+ * Poll Stellar RPC for a submitted relay transaction hash and return its base64 returnValue.
+ */
+export async function confirmTransactionOnRpc(
+	hash: string,
+	rpcUrl: string,
+	options?: { timeoutMs?: number; pollIntervalMs?: number }
+): Promise<string> {
+	const rpcServer = new Server(rpcUrl);
+	const timeoutMs = options?.timeoutMs ?? 25_000;
+	const pollIntervalMs = options?.pollIntervalMs ?? 1_000;
+	const deadline = Date.now() + timeoutMs;
+
+	while (true) {
+		const result = await rpcServer.getTransaction(hash);
+
+		if (result.status === 'SUCCESS') {
+			if (!result.returnValue) {
+				throw new NonRetryableError(`Transaction ${hash} succeeded on-chain but has no returnValue`);
+			}
+			return result.returnValue.toXDR('base64');
+		}
+
+		if (result.status === 'FAILED') {
+			throw new NonRetryableError(`Transaction ${hash} failed on-chain`);
+		}
+
+		if (Date.now() >= deadline) {
+			throw new Error(`Transaction ${hash} still pending on Stellar RPC (NOT_FOUND)`);
+		}
+
+		await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+	}
+}
+
+function assertMintPair(pair: unknown, label: string): [string, string] {
+	if (
+		!Array.isArray(pair)
+		|| pair.length < 2
+		|| typeof pair[0] !== 'string'
+		|| !pair[0].trim()
+		|| typeof pair[1] !== 'string'
+		|| !pair[1].trim()
+	) {
+		throw new NonRetryableError(`Invalid mint result tuple for ${label}`);
+	}
+	return [pair[0], pair[1]];
+}
+
+async function verifyExistingMintRow(
+	env: Env,
+	id: string,
+	expectedToken: string,
+	expectedAmm: string
+): Promise<void> {
+	const existing = await env.SMOL_D1.prepare(
+		`SELECT Mint_Token, Mint_Amm FROM Smols WHERE Id = ?1`
+	)
+		.bind(id)
+		.first<{ Mint_Token: string | null; Mint_Amm: string | null }>();
+
+	if (!existing) {
+		throw new NonRetryableError(`Smol ${id} not found during mint persistence`);
+	}
+
+	if (existing.Mint_Token === expectedToken && existing.Mint_Amm === expectedAmm) {
+		return;
+	}
+
+	throw new NonRetryableError(
+		`Mint metadata conflict for smol ${id}: stored (${existing.Mint_Token}, ${existing.Mint_Amm}) != (${expectedToken}, ${expectedAmm})`
+	);
 }
 
 export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
-    async run(event: WorkflowEvent<WorkflowTxParams>, step: WorkflowStep) {
-        const res = await step.do(
-            'submit transaction',
-            config,
-            async (): Promise<{ hash: string; returnValue: string }> => {
-                let xdrEnvelope: string
+	async run(event: WorkflowEvent<WorkflowTxParams>, step: WorkflowStep) {
+		if (event.payload.type !== 'mint' && event.payload.type !== 'batch-mint') {
+			throw new NonRetryableError(`Invalid transaction type: ${String((event.payload as { type?: unknown }).type)}`);
+		}
 
-                switch (event.payload.type) {
-                    case 'mint':
-                        xdrEnvelope = await this.signTransaction(event.payload.xdr!)
-                        break;
-                    case 'batch-mint':
-                        xdrEnvelope = await this.signTransaction(event.payload.xdr!)
-                        break;
-                    default:
-                        throw new Error('Invalid transaction type');
-                }
+		// Step 1: Deterministic auth-entry signing (checkpointed before relay submit)
+		const signedXdr = await step.do('sign transaction', config, async (): Promise<string> => {
+			if (!event.payload.xdr) {
+				throw new NonRetryableError('Missing transaction XDR');
+			}
+			return await this.signTransaction(event.payload.xdr);
+		});
 
-                // Submit via kale-worker service binding (bypasses Turnstile auth)
-                const result = await (this.env.KALE_WORKER as KaleWorkerBinding).submitTransaction({ xdr: xdrEnvelope });
+		// Step 2: Single non-retried submission to kale-worker relay; checkpoints returned relay hash.
+		const submitted = await step.do(
+			'submit transaction',
+			submitConfig,
+			async (): Promise<{ hash: string }> => {
+				let result: { hash?: string; error?: string; errorCode?: string };
+				try {
+					result = await (this.env.KALE_WORKER as KaleWorkerBinding).submitTransaction({ xdr: signedXdr });
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					throw new NonRetryableError(
+						`Relay submission outcome unknown (requires reconciliation, refusing duplicate submit): ${message}`
+					);
+				}
 
-                if (result.error) {
-                    throw new Error(`Transaction failed: ${result.error} (${result.errorCode})`);
-                }
+				if (result?.error) {
+					throw new NonRetryableError(`Transaction rejected by relay: ${result.error} (${result.errorCode ?? 'unknown'})`);
+				}
 
-                if (!result.hash) {
-                    throw new Error('Transaction submitted but no hash returned');
-                }
+				if (!result?.hash || typeof result.hash !== 'string') {
+					throw new NonRetryableError(
+						'Relay response missing transaction hash (ambiguous submission, refusing duplicate submit)'
+					);
+				}
 
-                // Fetch the returnValue from Stellar RPC using the transaction hash
-                const returnValue = await getTransactionResult(result.hash, this.env.RPC_URL);
+				return { hash: result.hash };
+			}
+		);
 
-                return { hash: result.hash, returnValue };
-            }
-        );
+		// Step 3: Read-only confirmation step using the durable relay hash
+		const returnValue = await step.do(
+			'confirm transaction',
+			confirmConfig,
+			async (): Promise<string> => {
+				return await confirmTransactionOnRpc(submitted.hash, this.env.RPC_URL);
+			}
+		);
 
-        if (event.payload.type === 'mint') {
-            // TODO if this fails we're kinda eff'ed. Either need a way to retry just this step or we should consider saving this step first
-            // as contract addresses are deterministic and we could get the values from the simulation
-            await step.do('persist mint metadata', config, async () => {
-                const [tokenSACAddress, cometAMMAddress] = scValToNative(xdr.ScVal.fromXDR(res.returnValue, 'base64'));
-                const id = event.payload.entropy!;
+		const res = { hash: submitted.hash, returnValue };
 
-                const result = await this.env.SMOL_D1.prepare(`
-                    UPDATE Smols
-                    SET Mint_Token = ?1, Mint_Amm = ?2
-                    WHERE Id = ?3 AND Mint_Token IS NULL AND Mint_Amm IS NULL
-                `)
-                    .bind(tokenSACAddress, cometAMMAddress, id)
-                    .run();
+		// Step 4: Idempotent D1 persistence + narrowed cache invalidation
+		if (event.payload.type === 'mint') {
+			await step.do('persist mint metadata', config, async () => {
+				const decoded = scValToNative(xdr.ScVal.fromXDR(res.returnValue, 'base64'));
+				const [tokenSACAddress, cometAMMAddress] = assertMintPair(decoded, event.payload.entropy ?? 'single-mint');
+				const id = event.payload.entropy;
+				if (!id) {
+					throw new NonRetryableError('Missing smol entropy id for mint persistence');
+				}
 
-                if (result.meta.changes === 0) {
-                    throw new NonRetryableError('Smol already has mint metadata');
-                }
+				const result = await this.env.SMOL_D1.prepare(`
+					UPDATE Smols
+					SET Mint_Token = ?1, Mint_Amm = ?2
+					WHERE Id = ?3 AND Mint_Token IS NULL AND Mint_Amm IS NULL
+				`)
+					.bind(tokenSACAddress, cometAMMAddress, id)
+					.run();
 
-                const ownerSub = event.payload.ownerSub ?? event.payload.sub;
-                const userTags = new Set([
-                    artistSmolsCacheTag(ownerSub),
-                    `user:${ownerSub}:created`,
-                    `user:${ownerSub}:smol:${id}`,
-                    `user:${event.payload.sub}:smol:${id}`,
-                ]);
+				if (result.meta.changes === 0) {
+					await verifyExistingMintRow(this.env, id, tokenSACAddress, cometAMMAddress);
+				}
 
-                // Avoid global list purges for common mint writes; short-lived
-                // public/mixtape list caches can refresh naturally.
-                await purgeCacheByTags([
-                    ...userTags,
-                    `smol:${id}:anonymous`,
-                ]);
-            });
-        } else if (event.payload.type === 'batch-mint') {
-            await step.do('persist batch mint metadata', config, async () => {
-                const results = scValToNative(xdr.ScVal.fromXDR(res.returnValue, 'base64')) as [string, string][];
-                const requestedIds = event.payload.ids ?? [];
-                const mintableIds = event.payload.mintableIds ?? requestedIds;
+				const ownerSub = event.payload.ownerSub ?? event.payload.sub;
+				const userTags = new Set([
+					artistSmolsCacheTag(ownerSub),
+					`user:${ownerSub}:created`,
+					`user:${ownerSub}:smol:${id}`,
+					`user:${event.payload.sub}:smol:${id}`,
+				]);
 
-                if (!Array.isArray(results)) {
-                    throw new NonRetryableError('Batch mint result is not a list');
-                }
+				await purgeCacheByTags([
+					...userTags,
+					`smol:${id}:anonymous`,
+				]);
+			});
+		} else if (event.payload.type === 'batch-mint') {
+			await step.do('persist batch mint metadata', config, async () => {
+				const rawResults = scValToNative(xdr.ScVal.fromXDR(res.returnValue, 'base64'));
+				const requestedIds = event.payload.ids ?? [];
+				const mintableIds = event.payload.mintableIds ?? requestedIds;
 
-                const resultIds = results.length === requestedIds.length
-                    ? requestedIds
-                    : results.length === mintableIds.length
-                        ? mintableIds
-                        : null;
+				if (!Array.isArray(rawResults)) {
+					throw new NonRetryableError('Batch mint result is not a list');
+				}
 
-                if (!resultIds) {
-                    throw new NonRetryableError('Batch mint result count does not match requested smol count');
-                }
+				// Map reversed `coin_them` push_front tuples to the signed invocation's exact salt order
+				const verifiedPairs = pairBatchMintResults({
+					xdrEnvelope: event.payload.xdr,
+					rawResults,
+					requestedIds,
+					mintableIds,
+				});
 
-                const smolCacheTags = new Set<string>();
+				const statements = verifiedPairs.map(({ id, token, amm }) =>
+					this.env.SMOL_D1.prepare(`
+						UPDATE Smols
+						SET Mint_Token = ?1, Mint_Amm = ?2
+						WHERE Id = ?3 AND Mint_Token IS NULL AND Mint_Amm IS NULL
+					`).bind(token, amm, id)
+				);
 
-                for (let i = 0; i < results.length; i++) {
-                    const [tokenSACAddress, cometAMMAddress] = results[i];
-                    // The contract returns one result per submitted smol in the same order.
-                    const id = resultIds[i];
+				let runResults: Array<{ meta?: { changes?: number } }>;
+				if (typeof this.env.SMOL_D1.batch === 'function') {
+					runResults = await this.env.SMOL_D1.batch(statements);
+				} else {
+					runResults = [];
+					for (const stmt of statements) {
+						runResults.push(await stmt.run());
+					}
+				}
 
-                    const result = await this.env.SMOL_D1.prepare(`
-                        UPDATE Smols
-                        SET Mint_Token = ?1, Mint_Amm = ?2
-                        WHERE Id = ?3 AND Mint_Token IS NULL AND Mint_Amm IS NULL
-                    `)
-                        .bind(tokenSACAddress, cometAMMAddress, id)
-                        .run();
+				const smolCacheTags = new Set<string>();
+				for (let i = 0; i < verifiedPairs.length; i++) {
+					const { id, token, amm } = verifiedPairs[i];
+					const changes = runResults[i]?.meta?.changes ?? 0;
+					if (changes === 0) {
+						await verifyExistingMintRow(this.env, id, token, amm);
+					}
 
-                    if (result.meta.changes === 0) {
-                        console.warn(`Smol ${id} already has mint metadata`);
-                    }
+					const ownerSub = event.payload.ownerSubsById?.[id] ?? event.payload.sub;
+					smolCacheTags.add(artistSmolsCacheTag(ownerSub));
+					smolCacheTags.add(`user:${ownerSub}:created`);
+					smolCacheTags.add(`user:${ownerSub}:smol:${id}`);
+					smolCacheTags.add(`user:${event.payload.sub}:smol:${id}`);
+					smolCacheTags.add(`smol:${id}:anonymous`);
+				}
 
-                    const ownerSub = event.payload.ownerSubsById?.[id] ?? event.payload.sub;
+				if (smolCacheTags.size > 0) {
+					await purgeCacheByTags([...smolCacheTags]);
+				}
+			});
+		}
 
-                    // Collect cache tags for list/detail payloads that include mint metadata.
-                    smolCacheTags.add(artistSmolsCacheTag(ownerSub));
-                    smolCacheTags.add(`user:${ownerSub}:created`);
-                    smolCacheTags.add(`user:${ownerSub}:smol:${id}`);
-                    smolCacheTags.add(`user:${event.payload.sub}:smol:${id}`);
-                    smolCacheTags.add(`smol:${id}:anonymous`);
-                }
+		return res;
+	}
 
-                if (smolCacheTags.size > 0) {
-                    await purgeCacheByTags([...smolCacheTags]);
-                }
-            });
-        }
+	async signTransaction(xdrEnvelope: string) {
+		const signerKeypair = Keypair.fromSecret(this.env.SK);
+		const signerPublicKey = signerKeypair.publicKey();
+		const contract = new SmolClient({
+			contractId: this.env.SMOL_CONTRACT_ID,
+			rpcUrl: this.env.RPC_URL,
+			networkPassphrase: this.env.NETWORK_PASSPHRASE,
+		});
 
-        return res;
-    }
+		const at = contract.txFromXDR(xdrEnvelope);
 
-    async signTransaction(xdr: string) {
-        const signerKeypair = Keypair.fromSecret(this.env.SK);
-        const signerPublicKey = signerKeypair.publicKey();
-        const contract = new SmolClient({
-            contractId: this.env.SMOL_CONTRACT_ID,
-            rpcUrl: this.env.RPC_URL,
-            networkPassphrase: this.env.NETWORK_PASSPHRASE,
-        });
+		await at.signAuthEntries({
+			address: signerPublicKey,
+			signAuthEntry: basicNodeSigner(signerKeypair, this.env.NETWORK_PASSPHRASE).signAuthEntry,
+		});
 
-        const at = contract.txFromXDR(xdr);
-
-        await at.signAuthEntries({
-            address: signerPublicKey,
-            signAuthEntry: basicNodeSigner(signerKeypair, this.env.NETWORK_PASSPHRASE).signAuthEntry
-        });
-
-        return at.built!.toXDR();
-    }
+		return at.built!.toXDR();
+	}
 }

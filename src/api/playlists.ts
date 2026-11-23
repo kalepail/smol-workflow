@@ -79,13 +79,17 @@ playlists.get(
 			)
 
 			if (creatorAddresses.length > 0) {
-				const placeholders = creatorAddresses.map(() => '?').join(',')
-				const usersD1Result = await env.SMOL_D1.prepare(
-					`SELECT Username, Address FROM Users WHERE Address IN (${placeholders})`
-				)
-					.bind(...creatorAddresses)
-					.all<User>()
-				users = usersD1Result.results || []
+				const D1_IN_CHUNK_SIZE = 90
+				for (let index = 0; index < creatorAddresses.length; index += D1_IN_CHUNK_SIZE) {
+					const chunk = creatorAddresses.slice(index, index + D1_IN_CHUNK_SIZE)
+					const placeholders = chunk.map(() => '?').join(',')
+					const usersD1Result = await env.SMOL_D1.prepare(
+						`SELECT Username, Address FROM Users WHERE Address IN (${placeholders})`
+					)
+						.bind(...chunk)
+						.all<User>()
+					users.push(...(usersD1Result.results || []))
+				}
 			}
 		}
 

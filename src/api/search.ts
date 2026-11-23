@@ -3,7 +3,6 @@ import { HTTPException } from 'hono/http-exception'
 import type { HonoEnv } from '../types'
 import { parsePaginationParams } from '../utils/pagination'
 import { getSearchBackfillCronStatus, getSearchBackfillPage, queueSearchIndexingBatchById, queueSearchIndexingById, reconcileSearchIndexingBatchById, searchPublicSmols, searchSimilarSmols } from '../utils/search'
-import { optionalAuth } from '../middleware/auth'
 
 const search = new Hono<HonoEnv>()
 
@@ -30,7 +29,7 @@ function assertAdminSecret(c: Context<HonoEnv>) {
 	}
 }
 
-search.get('/', optionalAuth, async (c) => {
+search.get('/', async (c) => {
 	const url = new URL(c.req.url)
 	const results = await searchPublicSmols(c.env, {
 		query: url.searchParams.get('q') ?? '',
@@ -42,7 +41,7 @@ search.get('/', optionalAuth, async (c) => {
 	return c.json(results)
 })
 
-search.get('/:id/similar', optionalAuth, async (c) => {
+search.get('/:id/similar', async (c) => {
 	const url = new URL(c.req.url)
 	const results = await searchSimilarSmols(c.env, {
 		id: c.req.param('id'),

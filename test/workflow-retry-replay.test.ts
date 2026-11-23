@@ -176,10 +176,16 @@ function createEnv(options: { flushedDurableObject?: boolean } = {}) {
 					run: async () => {
 						calls.d1.push({ sql, args })
 					},
+					first: async () => null,
 				}),
 			}),
 		},
 		SMOL_BUCKET: {
+			head: async (key: string) => ({
+				key,
+				size: 1234,
+				customMetadata: { sourceUrl: key === 'song-1.mp3' ? 'https://example.com/1.mp3' : 'https://example.com/2.mp3' },
+			}),
 			delete: async (key: string) => {
 				calls.r2Delete.push(key)
 			},
@@ -209,8 +215,8 @@ test('retry workflow restores payload and reused state when the cached retry ste
 	console.warn = () => {}
 
 	try {
-		// First execution hibernates before the final step.
-		const first = createStep(cache, 'complete workflow')
+		// First execution hibernates before the publish step.
+		const first = createStep(cache, 'publish smol')
 		await assert.rejects(
 			workflow.run(event as never, first.step as never),
 			SuspendSignal
@@ -221,7 +227,7 @@ test('retry workflow restores payload and reused state when the cached retry ste
 		const replay = createStep(cache)
 		const result = await workflow.run(event as never, replay.step as never) as [WorkflowParams, string]
 
-		assert.deepEqual(replay.executed, ['complete workflow'])
+		assert.deepEqual(replay.executed, ['publish smol', 'enqueue search indexing', 'cleanup retry state', 'finalize workflow'])
 		assert.equal(calls.retryGetSteps, 1, 'retry state must not be re-read on replay')
 
 		const [payload, image_base64] = result
@@ -231,12 +237,12 @@ test('retry workflow restores payload and reused state when the cached retry ste
 		assert.equal(image_base64, 'aW1hZ2UtYnl0ZXM=')
 
 		const insert = calls.d1.find((call) => call.sql.includes('INSERT INTO Smols'))
-		assert.deepEqual(insert?.args, [NEW_ID, 'Parrot Dusk', 'song-1', 'song-2', 'GORIGINALCREATOR', true, false])
+		assert.deepEqual(insert?.args, [NEW_ID, 'Parrot Dusk', 'song-1', 'song-2', 'GORIGINALCREATOR', true, false, 'aisonggenerator', null])
 
-		const playlistInsert = calls.d1.find((call) => call.sql.includes('INSERT INTO Playlists'))
+		const playlistInsert = calls.d1.find((call) => call.sql.includes('INSERT OR IGNORE INTO Playlists'))
 		assert.deepEqual(playlistInsert?.args, [NEW_ID, 'playlist-1'])
 
-		assert.ok(calls.d1.some((call) => call.sql.includes('DELETE FROM Smols') && call.args[0] === RETRY_ID))
+		assert.equal(calls.d1.some((call) => call.sql.includes('DELETE FROM Smols')), false, 'retry cleanup must never delete D1 Smols rows')
 		assert.deepEqual(calls.kvDelete, [RETRY_ID])
 		assert.deepEqual(calls.r2Delete, [`${RETRY_ID}.png`], 'reused complete songs must not be deleted')
 
@@ -259,7 +265,7 @@ test('retry workflow falls back to KV when the durable object has flushed, and s
 
 	try {
 		await assert.rejects(
-			workflow.run(event as never, createStep(cache, 'complete workflow').step as never),
+			workflow.run(event as never, createStep(cache, 'publish smol').step as never),
 			SuspendSignal
 		)
 		const [payload, image_base64] = await workflow.run(event as never, createStep(cache).step as never) as [WorkflowParams, string]

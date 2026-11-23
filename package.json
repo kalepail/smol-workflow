@@ -4,10 +4,11 @@
 	"scripts": {
 		"start": "wrangler dev --test-scheduled",
 		"start:remote": "wrangler dev --remote --env dev",
-		"deploy": "wrangler deploy",
+		"build:sdk": "node scripts/build-sdk.mjs",
+		"deploy": "node scripts/build-sdk.mjs && wrangler deploy",
 		"backfill:search": "node scripts/search-backfill.mjs",
 		"typegen": "wrangler types --strict-vars=false",
-		"typecheck": "tsc --noEmit",
+		"typecheck": "node scripts/build-sdk.mjs && tsc --noEmit",
 		"test": "tsx --test test/**/*.test.ts"
 	},
 	"devDependencies": {

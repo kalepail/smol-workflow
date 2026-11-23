@@ -873,7 +873,7 @@ test('finalize queue message keeps retrying when only the processed timestamp ha
 	assert.equal(getRecord().search?.status, 'processing')
 })
 
-test('upsert queue message retries when D1 exists but KV payload is not yet visible', async () => {
+test('upsert queue message retries on the same message when D1 exists but KV payload is not yet visible', async () => {
 	const { env, getQueuedMessages } = createUpsertRetryEnv()
 	const queued = createQueueMessage({
 		type: 'upsert',
@@ -886,11 +886,10 @@ test('upsert queue message retries when D1 exists but KV payload is not yet visi
 		{} as ExecutionContext
 	)
 
-	assert.equal(queued.acked, 1)
-	assert.equal(queued.retried.length, 0)
-	assert.equal(getQueuedMessages().length, 1)
-	assert.equal(getQueuedMessages()[0]?.message.type, 'upsert')
-	assert.equal(getQueuedMessages()[0]?.delaySeconds, 5)
+	assert.equal(queued.acked, 0)
+	assert.equal(queued.retried.length, 1)
+	assert.equal(queued.retried[0]?.delaySeconds, 5)
+	assert.equal(getQueuedMessages().length, 0)
 })
 
 test('upsert queue message indexes an instrumental smol even when lyrics are missing', async () => {

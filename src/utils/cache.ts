@@ -57,7 +57,7 @@ export async function purgeCacheByTags(tags: string[]): Promise<boolean> {
 			return result.success
 		}))
 
-		console.log('Cache purged for tags:', uniqueTags)
+		console.log('Cache purged', { tagCount: uniqueTags.length, chunkCount: tagChunks.length })
 		return results.every(Boolean)
 	} catch (error) {
 		console.warn('Cache purge error:', error)

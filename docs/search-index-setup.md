@@ -1,6 +1,6 @@
 # Search Index Setup
 
-This search implementation expects a single Vectorize V2 index named `smol-search-index` and the queue resources declared in [wrangler.jsonc](/Users/kalepail/Desktop/Web/Soroban/SMOL/smol-workflow/wrangler.jsonc).
+This search implementation expects a single Vectorize V2 index named `smol-search-index` and the queue resources declared in [wrangler.jsonc](../wrangler.jsonc).
 
 ## 1. Confirm the embedding dimension
 
@@ -86,7 +86,7 @@ It is intended as a safe maintenance pass, not a high-throughput bulk loader:
 - it records health, recent run history, and Vectorize watermark snapshots for monitoring
 - once a full pass completes for the current `SEARCH_INDEX_VERSION`, it stops re-scanning
 
-The default production config runs every 5 minutes with a page limit of 20 and up to 5
+The default production config runs hourly (`0 * * * *`) with a page limit of 20 and up to 5
 stable pages per invocation:
 
 ```jsonc
@@ -97,7 +97,7 @@ stable pages per invocation:
   "SEARCH_BACKFILL_CRON_MAX_WAVES": "5"
 },
 "triggers": {
-  "crons": ["*/5 * * * *"]
+  "crons": ["0 * * * *"]
 }
 ```
 

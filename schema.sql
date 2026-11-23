@@ -1,12 +1,8 @@
--- ALTER TABLE Smols ADD COLUMN Instrumental BOOLEAN DEFAULT 0;
-
--- DROP TABLE IF EXISTS Mixtapes;
-
 CREATE TABLE IF NOT EXISTS Smols (
     Id TEXT PRIMARY KEY,
     Title TEXT NOT NULL,
     Song_1 TEXT NOT NULL,
-    Song_2 TEXT NOT NULL,
+    Song_2 TEXT DEFAULT NULL,
     Created_At DATETIME DEFAULT CURRENT_TIMESTAMP,
     Public BOOLEAN DEFAULT 1,
     Instrumental BOOLEAN DEFAULT 0,
@@ -14,7 +10,9 @@ CREATE TABLE IF NOT EXISTS Smols (
     Views INTEGER DEFAULT 0,
     "Address" TEXT NOT NULL,
     Mint_Token TEXT DEFAULT NULL,
-    Mint_Amm TEXT DEFAULT NULL
+    Mint_Amm TEXT DEFAULT NULL,
+    Requested_Provider TEXT DEFAULT NULL CHECK(Requested_Provider IN ('aisonggenerator', 'elevenlabs')),
+    Actual_Provider TEXT DEFAULT NULL CHECK(Actual_Provider IN ('aisonggenerator', 'elevenlabs'))
 );
 
 CREATE TABLE IF NOT EXISTS Users (

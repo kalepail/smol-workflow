@@ -1,140 +1,579 @@
-import { Hono } from 'hono'
+import { Hono, type Context } from 'hono'
 import { HTTPException } from 'hono/http-exception'
 import { Jimp, ResizeStrategy } from 'jimp'
 import type { HonoEnv } from '../types'
-import { parseRange } from '../utils'
+import { parseByteRange, type ParsedByteRange } from '../utils'
 
 const media = new Hono<HonoEnv>()
-const MEDIA_CACHE_CONTROL = 'public, max-age=2592000, stale-while-revalidate=86400'
+export const MEDIA_CACHE_CONTROL = 'public, max-age=2592000, stale-while-revalidate=86400'
+const CANONICAL_MEDIA_ORIGIN = 'https://api.smol.xyz'
+const MAX_PROBE_BYTES = 2
 
-async function getSongSmolId(env: Env, musicId: string): Promise<string | null> {
-	const row = await env.SMOL_D1.prepare(`
-		SELECT Id
-		FROM Smols
-		WHERE Song_1 = ?1 OR Song_2 = ?1
-	`)
-		.bind(musicId)
-		.first<{ Id: string }>()
-
-	return row?.Id ?? null
+function getEdgeCache(): Cache | undefined {
+	if (typeof caches === 'undefined') {
+		return undefined
+	}
+	return (caches as unknown as { default?: Cache }).default
 }
 
-// Serve songs
-media.get('/:id{.+\\.mp3}', async (c) => {
-	const { env, req, executionCtx } = c
-	const id = req.param('id')
-	const musicId = id.replace(/\.mp3$/, '')
-	const rangeHeader = req.header('range')
-	const smolId = await getSongSmolId(env, musicId)
+function runInBackground(c: Context<HonoEnv>, task: Promise<unknown>): void {
+	const safeTask = task.catch((err) => {
+		console.warn('Media background task failed:', err)
+	})
+	try {
+		c.executionCtx.waitUntil(safeTask)
+	} catch {
+		void safeTask
+	}
+}
 
-	const objectMeta = await env.SMOL_BUCKET.head(id)
+function normalizeEtag(value: string | null | undefined): string | null {
+	if (!value) {
+		return null
+	}
+	const trimmed = value.trim()
+	return trimmed || null
+}
 
-	if (!objectMeta) {
-		throw new HTTPException(404, { message: 'Song not found' })
+function matchesIfNoneMatch(header: string | undefined, etag: string | null): boolean {
+	if (!header || !etag) {
+		return false
+	}
+	const trimmed = header.trim()
+	if (trimmed === '*') {
+		return true
+	}
+	const stripWeak = (tag: string) => tag.trim().replace(/^W\//i, '')
+	const target = stripWeak(etag)
+	return trimmed.split(',').some((candidate) => stripWeak(candidate) === target)
+}
+
+/**
+ * RFC 9110 §13.1.5 If-Range validator check.
+ * Returns true if Range should be applied, false if full 200 must be returned instead.
+ */
+function matchesIfRange(
+	ifRange: string | undefined,
+	etag: string | null,
+	lastModified: string | null
+): boolean {
+	if (!ifRange) {
+		return true
+	}
+	const trimmed = ifRange.trim()
+	if (!trimmed) {
+		return false
 	}
 
+	if (trimmed.startsWith('"') || trimmed.startsWith('W/') || trimmed.startsWith('w/')) {
+		if (!etag || trimmed.startsWith('W/') || trimmed.startsWith('w/') || etag.startsWith('W/') || etag.startsWith('w/')) {
+			return false
+		}
+		return trimmed === etag
+	}
+
+	if (!lastModified) {
+		return false
+	}
+	if (trimmed === lastModified) {
+		return true
+	}
+	const parsedIfRange = Date.parse(trimmed)
+	const parsedLastModified = Date.parse(lastModified)
+	return !Number.isNaN(parsedIfRange) && !Number.isNaN(parsedLastModified) && parsedIfRange === parsedLastModified
+}
+
+/**
+ * Determine whether a song request represents a real play start.
+ * Always evaluated against the ORIGINAL Range header so e.g. a `bytes=0-1` probe
+ * with a stale `If-Range` (which legitimately returns full 200) still counts zero plays.
+ */
+export function shouldIncrementSongPlays(
+	method: string,
+	parsedRange: ParsedByteRange | null,
+	objectSize: number
+): boolean {
+	if (method === 'HEAD' || objectSize <= 0) {
+		return false
+	}
+	if (!parsedRange || parsedRange.kind === 'ignore') {
+		return true
+	}
+	if (parsedRange.kind !== 'range') {
+		return false
+	}
+	if (parsedRange.isSuffix || parsedRange.offset !== 0) {
+		return false
+	}
+	if (!parsedRange.isOpenEnded && parsedRange.length <= MAX_PROBE_BYTES && objectSize > parsedRange.length) {
+		return false
+	}
+	return true
+}
+
+/**
+ * Stream-slice [offset, offset + length) from a ReadableStream in O(1) memory,
+ * cancelling the upstream reader immediately once `length` bytes have been emitted.
+ */
+function sliceReadableStream(
+	source: ReadableStream<Uint8Array>,
+	offset: number,
+	length: number
+): ReadableStream<Uint8Array> {
+	const reader = source.getReader()
+	let position = 0
+	let remaining = length
+
+	return new ReadableStream<Uint8Array>({
+		async pull(controller) {
+			try {
+				while (remaining > 0) {
+					const { done, value } = await reader.read()
+					if (done) {
+						controller.close()
+						return
+					}
+					if (!value || value.byteLength === 0) {
+						continue
+					}
+
+					const chunkStart = position
+					const chunkEnd = position + value.byteLength
+					position = chunkEnd
+
+					if (chunkEnd <= offset) {
+						continue
+					}
+
+					const sliceStart = Math.max(0, offset - chunkStart)
+					const sliceEnd = Math.min(value.byteLength, sliceStart + remaining)
+					if (sliceEnd > sliceStart) {
+						const out = value.subarray(sliceStart, sliceEnd)
+						remaining -= out.byteLength
+						controller.enqueue(out)
+						if (remaining <= 0) {
+							await reader.cancel('Requested byte range satisfied').catch(() => {})
+							controller.close()
+						}
+						return
+					}
+				}
+				await reader.cancel('Requested byte range satisfied').catch(() => {})
+				controller.close()
+			} catch (err) {
+				controller.error(err)
+			}
+		},
+		async cancel(reason) {
+			await reader.cancel(reason).catch(() => {})
+		},
+	})
+}
+
+function buildSongHeaders(musicId: string, objectMeta: R2Object): Headers {
 	const headers = new Headers()
 	objectMeta.writeHttpMetadata(headers)
 	headers.set('Accept-Ranges', 'bytes')
 	headers.set('Content-Type', 'audio/mpeg')
-	// Media URLs are intentionally link-shareable by opaque ID. Public/private
-	// controls listing and detail visibility, not direct asset playback.
 	headers.set('Cache-Control', MEDIA_CACHE_CONTROL)
+
+	const etag = normalizeEtag(objectMeta.httpEtag)
+	if (etag) {
+		headers.set('ETag', etag)
+	}
+	if (objectMeta.uploaded instanceof Date && !Number.isNaN(objectMeta.uploaded.getTime())) {
+		headers.set('Last-Modified', objectMeta.uploaded.toUTCString())
+	}
+
+	const tags = [`song:${musicId}:media`]
+	const smolId = objectMeta.customMetadata?.smolId
 	if (smolId) {
-		headers.set('Cache-Tag', `smol:${smolId}:media`)
+		tags.push(`smol:${smolId}:media`)
 	}
+	headers.set('Cache-Tag', tags.join(','))
 
-	let status = 200
-	let body: ReadableStream | null = null
+	return headers
+}
 
-	if (rangeHeader) {
-		const range = parseRange(rangeHeader, objectMeta.size)
-		if (range) {
-			const object = await env.SMOL_BUCKET.get(id, { range })
-			if (object) {
-				headers.set(
-					'Content-Range',
-					`bytes ${range.offset}-${range.offset + (range.length !== undefined ? range.length - 1 : objectMeta.size - 1 - range.offset)}/${objectMeta.size}`
-				)
-				body = object.body
-				status = 206
-			}
-		} else {
-			headers.set('Content-Range', `bytes */${objectMeta.size}`)
-			throw new HTTPException(416, { message: 'Range Not Satisfiable' })
+function stripOriginSpecificHeaders(headers: Headers): Headers {
+	const clean = new Headers(headers)
+	clean.delete('Access-Control-Allow-Origin')
+	clean.delete('Access-Control-Allow-Credentials')
+	clean.delete('Access-Control-Expose-Headers')
+	clean.delete('Vary')
+	return clean
+}
+
+function resolveR2Range(
+	object: R2ObjectBody,
+	fallback: { offset: number; end: number; length: number },
+	size: number
+): { offset: number; end: number; length: number } {
+	const range = object.range as { offset?: number; length?: number; suffix?: number } | undefined
+	if (!range) {
+		return fallback
+	}
+	if (typeof range.offset === 'number' && typeof range.length === 'number' && range.length > 0) {
+		const offset = range.offset
+		const length = Math.min(range.length, Math.max(0, size - offset))
+		if (length > 0) {
+			return { offset, end: offset + length - 1, length }
 		}
 	}
+	return fallback
+}
 
-	if (!body) {
-		const object = await env.SMOL_BUCKET.get(id)
-		if (object) {
-			body = object.body
-		} else {
-			throw new HTTPException(404, { message: 'Song not found after head request' })
+function recordSongPlay(c: Context<HonoEnv>, musicId: string): void {
+	runInBackground(
+		c,
+		c.env.SMOL_D1.prepare('UPDATE Smols SET Plays = Plays + 1 WHERE Song_1 = ?1 OR Song_2 = ?1')
+			.bind(musicId)
+			.run()
+	)
+}
+
+function notModifiedResponse(baseHeaders: Headers): Response {
+	const headers = new Headers()
+	for (const key of ['ETag', 'Last-Modified', 'Cache-Control', 'Accept-Ranges', 'Cache-Tag']) {
+		const value = baseHeaders.get(key)
+		if (value) {
+			headers.set(key, value)
 		}
 	}
+	return new Response(null, { status: 304, headers })
+}
 
-	const shouldIncrementPlays = !rangeHeader || (rangeHeader && rangeHeader.startsWith('bytes=0-'))
-
-	if (shouldIncrementPlays) {
-		executionCtx.waitUntil(
-			env.SMOL_D1.prepare('UPDATE Smols SET Plays = Plays + 1 WHERE Song_1 = ?1 OR Song_2 = ?1')
-				.bind(musicId)
-				.run()
-		)
-	}
-
-	return new Response(body, {
+function unsatisfiableRangeResponse(baseHeaders: Headers, size: number): Response {
+	const headers = new Headers(baseHeaders)
+	headers.delete('Content-Length')
+	headers.set('Cache-Control', 'no-store')
+	headers.set('Content-Range', `bytes */${size}`)
+	return new Response('Range Not Satisfiable', {
+		status: 416,
 		headers,
-		status,
+	})
+}
+
+// Serve songs (handles both GET and HEAD via Hono method dispatch)
+media.get('/:id{.+\\.mp3}', async (c) => {
+	const { env, req } = c
+	const isHead = req.method === 'HEAD'
+	const id = req.param('id')
+	const musicId = id.replace(/\.mp3$/, '')
+	if (!musicId) {
+		throw new HTTPException(404, { message: 'Song not found' })
+	}
+
+	const rangeHeader = isHead ? undefined : req.header('range')
+	const ifNoneMatch = req.header('if-none-match')
+	const ifRange = req.header('if-range')
+	const edgeCache = getEdgeCache()
+	const canonicalUrl = `${CANONICAL_MEDIA_ORIGIN}/song/${encodeURIComponent(id)}`
+	const cacheKey = new Request(canonicalUrl, { method: 'GET' })
+
+	// 1. Check canonical full-GET edge cache first (warm path)
+	if (edgeCache) {
+		const cached = await edgeCache.match(cacheKey)
+		if (cached && cached.status === 200) {
+			const contentLengthRaw = cached.headers.get('Content-Length')
+			const size = contentLengthRaw !== null && /^\d+$/.test(contentLengthRaw) ? Number(contentLengthRaw) : null
+			if (size !== null) {
+				const headers = stripOriginSpecificHeaders(cached.headers)
+				const etag = normalizeEtag(headers.get('ETag'))
+				const lastModified = headers.get('Last-Modified')
+				const originalParsedRange = rangeHeader ? parseByteRange(rangeHeader, size) : null
+
+				if (matchesIfNoneMatch(ifNoneMatch, etag)) {
+					await cached.body?.cancel().catch(() => {})
+					return notModifiedResponse(headers)
+				}
+
+				if (isHead) {
+					await cached.body?.cancel().catch(() => {})
+					headers.set('Content-Length', String(size))
+					return new Response(null, { status: 200, headers })
+				}
+
+				const effectiveRangeHeader = rangeHeader && matchesIfRange(ifRange, etag, lastModified)
+					? rangeHeader
+					: undefined
+
+				if (effectiveRangeHeader) {
+					const parsed = originalParsedRange ?? parseByteRange(effectiveRangeHeader, size)
+					if (parsed.kind === 'unsatisfiable') {
+						await cached.body?.cancel().catch(() => {})
+						return unsatisfiableRangeResponse(headers, size)
+					}
+					if (parsed.kind === 'range') {
+						// Prefer native Cache API ranged 206 match (zero full-body buffering in workerd),
+						// falling back to O(1)-memory stream slicing rather than buffering the full MP3.
+						const normalizedRange = `bytes=${parsed.offset}-${parsed.end}`
+						let rangeBody: ReadableStream<Uint8Array> | null = null
+
+						const expectedContentRange = `bytes ${parsed.offset}-${parsed.end}/${size}`
+						const rangedMatch = await edgeCache.match(
+							new Request(canonicalUrl, { method: 'GET', headers: { Range: normalizedRange } })
+						)
+						if (
+							rangedMatch
+							&& rangedMatch.status === 206
+							&& rangedMatch.body
+							&& rangedMatch.headers.get('Content-Range') === expectedContentRange
+						) {
+							await cached.body?.cancel().catch(() => {})
+							rangeBody = rangedMatch.body
+						} else {
+							await rangedMatch?.body?.cancel().catch(() => {})
+							if (cached.body) {
+								rangeBody = sliceReadableStream(cached.body, parsed.offset, parsed.length)
+							}
+						}
+
+						if (rangeBody) {
+							headers.set('Content-Range', `bytes ${parsed.offset}-${parsed.end}/${size}`)
+							headers.set('Content-Length', String(parsed.length))
+
+							if (shouldIncrementSongPlays(req.method, originalParsedRange, size)) {
+								recordSongPlay(c, musicId)
+							}
+
+							return new Response(rangeBody, { status: 206, headers })
+						}
+					}
+					// parsed.kind === 'ignore': fall through to full 200
+				}
+
+				headers.set('Content-Length', String(size))
+				// Use originalParsedRange so e.g. stale If-Range on bytes=0-1 probe still counts 0 plays!
+				if (shouldIncrementSongPlays(req.method, originalParsedRange, size)) {
+					recordSongPlay(c, musicId)
+				}
+
+				return new Response(cached.body, { status: 200, headers })
+			}
+			await cached.body?.cancel().catch(() => {})
+		}
+	}
+
+	// 2. Cold path: read R2 metadata via head() only
+	const objectMeta = await env.SMOL_BUCKET.head(id)
+	if (!objectMeta) {
+		throw new HTTPException(404, { message: 'Song not found' })
+	}
+
+	const headers = buildSongHeaders(musicId, objectMeta)
+	const etag = normalizeEtag(headers.get('ETag'))
+	const lastModified = headers.get('Last-Modified')
+	const size = objectMeta.size
+	const originalParsedRange = rangeHeader ? parseByteRange(rangeHeader, size) : null
+
+	if (matchesIfNoneMatch(ifNoneMatch, etag)) {
+		return notModifiedResponse(headers)
+	}
+
+	if (isHead) {
+		headers.set('Content-Length', String(size))
+		return new Response(null, { status: 200, headers })
+	}
+
+	const effectiveRangeHeader = rangeHeader && matchesIfRange(ifRange, etag, lastModified)
+		? rangeHeader
+		: undefined
+
+	if (effectiveRangeHeader) {
+		const parsed = originalParsedRange ?? parseByteRange(effectiveRangeHeader, size)
+		if (parsed.kind === 'unsatisfiable') {
+			return unsatisfiableRangeResponse(headers, size)
+		}
+		if (parsed.kind === 'range') {
+			const object = await env.SMOL_BUCKET.get(id, {
+				range: { offset: parsed.offset, length: parsed.length },
+			})
+			if (!object) {
+				throw new HTTPException(404, { message: 'Song not found after head request' })
+			}
+
+			const resolved = resolveR2Range(object, parsed, size)
+			headers.set('Content-Range', `bytes ${resolved.offset}-${resolved.end}/${size}`)
+			headers.set('Content-Length', String(resolved.length))
+
+			if (shouldIncrementSongPlays(req.method, originalParsedRange, size)) {
+				recordSongPlay(c, musicId)
+			}
+
+			return new Response(object.body, { status: 206, headers })
+		}
+		// parsed.kind === 'ignore': serve full 200 below
+	}
+
+	// Full 200 GET on cold miss
+	const object = await env.SMOL_BUCKET.get(id)
+	if (!object) {
+		throw new HTTPException(404, { message: 'Song not found after head request' })
+	}
+
+	const fullHeaders = buildSongHeaders(musicId, object)
+	fullHeaders.set('Content-Length', String(object.size))
+
+	let responseBody: ReadableStream | null = object.body
+	if (edgeCache && object.body) {
+		const [clientStream, cacheStream] = object.body.tee()
+		responseBody = clientStream
+		const cacheableResponse = new Response(cacheStream, {
+			status: 200,
+			headers: stripOriginSpecificHeaders(fullHeaders),
+		})
+		runInBackground(c, edgeCache.put(cacheKey, cacheableResponse))
+	} else if (edgeCache && object.size === 0) {
+		const cacheableResponse = new Response(new Uint8Array(0), {
+			status: 200,
+			headers: stripOriginSpecificHeaders(fullHeaders),
+		})
+		runInBackground(c, edgeCache.put(cacheKey, cacheableResponse))
+	}
+
+	// Preserve originalParsedRange so stale If-Range on a bytes=0-1 probe counts 0 plays!
+	if (shouldIncrementSongPlays(req.method, originalParsedRange, object.size)) {
+		recordSongPlay(c, musicId)
+	}
+
+	return new Response(responseBody, {
+		status: 200,
+		headers: fullHeaders,
 	})
 })
 
-// Serve images
-media.get(
-	'/:id{.+\\.png}',
-	async (c) => {
-		const { env, req } = c
-		const id = req.param('id')
-		const smolId = id.replace(/\.png$/, '')
-		const scale = req.query('scale')
+function buildImageHeaders(smolId: string, objectMeta: R2Object, size: number): Headers {
+	const headers = new Headers()
+	objectMeta.writeHttpMetadata(headers)
+	headers.set('Content-Type', 'image/png')
+	headers.set('Cache-Control', MEDIA_CACHE_CONTROL)
+	headers.set('Cache-Tag', `smol:${smolId}:media`)
+	headers.set('Content-Length', String(size))
 
-		const image = await env.SMOL_BUCKET.get(id)
+	const etag = normalizeEtag(objectMeta.httpEtag)
+	if (etag) {
+		headers.set('ETag', etag)
+	}
+	if (objectMeta.uploaded instanceof Date && !Number.isNaN(objectMeta.uploaded.getTime())) {
+		headers.set('Last-Modified', objectMeta.uploaded.toUTCString())
+	}
+	return headers
+}
 
-		if (!image) {
+// Serve images (handles both GET and HEAD)
+media.get('/:id{.+\\.png}', async (c) => {
+	const { env, req } = c
+	const isHead = req.method === 'HEAD'
+	const id = req.param('id')
+	const smolId = id.replace(/\.png$/, '')
+	const scale = req.query('scale')
+	let scaleValue: number | null = null
+
+	if (scale !== undefined) {
+		if (!/^\d+$/.test(scale)) {
+			throw new HTTPException(400, { message: 'Scale must be between 1 and 32' })
+		}
+		scaleValue = Number(scale)
+		if (!Number.isInteger(scaleValue) || scaleValue < 1 || scaleValue > 32) {
+			throw new HTTPException(400, { message: 'Scale must be between 1 and 32' })
+		}
+	}
+
+	const ifNoneMatch = req.header('if-none-match')
+	const edgeCache = getEdgeCache()
+	const cacheUrl = `${CANONICAL_MEDIA_ORIGIN}/image/${encodeURIComponent(id)}${scaleValue ? `?scale=${scaleValue}` : ''}`
+	const cacheKey = new Request(cacheUrl, { method: 'GET' })
+
+	if (edgeCache) {
+		const cached = await edgeCache.match(cacheKey)
+		if (cached && cached.status === 200) {
+			const headers = stripOriginSpecificHeaders(cached.headers)
+			if (matchesIfNoneMatch(ifNoneMatch, normalizeEtag(headers.get('ETag')))) {
+				await cached.body?.cancel().catch(() => {})
+				return notModifiedResponse(headers)
+			}
+			if (isHead) {
+				await cached.body?.cancel().catch(() => {})
+				return new Response(null, { status: 200, headers })
+			}
+			return new Response(cached.body, { status: 200, headers })
+		}
+	}
+
+	if (isHead && !scaleValue) {
+		const imageMeta = await env.SMOL_BUCKET.head(id)
+		if (!imageMeta) {
 			throw new HTTPException(404, { message: 'Image not found' })
 		}
+		const headers = buildImageHeaders(smolId, imageMeta, imageMeta.size)
+		if (matchesIfNoneMatch(ifNoneMatch, normalizeEtag(headers.get('ETag')))) {
+			return notModifiedResponse(headers)
+		}
+		return new Response(null, { status: 200, headers })
+	}
 
-		let scaled_image: Buffer | null = null
+	const image = await env.SMOL_BUCKET.get(id)
+	if (!image) {
+		throw new HTTPException(404, { message: 'Image not found' })
+	}
 
-		if (scale) {
-			const scaleValue = parseInt(scale)
-
-			// Prevent DoS via excessive scaling - cap at 32x (64px base * 32 = 2048px)
-			if (isNaN(scaleValue) || scaleValue < 1 || scaleValue > 32) {
-				throw new HTTPException(400, { message: 'Scale must be between 1 and 32' })
-			}
-
-			const jimp_image = await Jimp.fromBuffer(await image.arrayBuffer())
-
-			jimp_image.resize({
-				w: jimp_image.width * scaleValue,
-				h: jimp_image.height * scaleValue,
-				mode: ResizeStrategy.NEAREST_NEIGHBOR,
-			})
-
-			scaled_image = await jimp_image.getBuffer('image/png')
+	if (scaleValue) {
+		const jimpImage = await Jimp.fromBuffer(await image.arrayBuffer())
+		jimpImage.resize({
+			w: jimpImage.width * scaleValue,
+			h: jimpImage.height * scaleValue,
+			mode: ResizeStrategy.NEAREST_NEIGHBOR,
+		})
+		const scaledImage = await jimpImage.getBuffer('image/png')
+		const headers = buildImageHeaders(smolId, image, scaledImage.byteLength)
+		const baseEtag = normalizeEtag(headers.get('ETag'))
+		if (baseEtag) {
+			headers.set('ETag', `"${baseEtag.replace(/^W\//i, '').replace(/^"|"$/g, '')}-s${scaleValue}"`)
 		}
 
-		return new Response(scaled_image ?? image.body, {
-			headers: {
-				'Content-Type': 'image/png',
-				// Media URLs are intentionally link-shareable by opaque ID.
-				'Cache-Control': MEDIA_CACHE_CONTROL,
-				'Cache-Tag': `smol:${smolId}:media`,
-			},
-		})
+		if (edgeCache) {
+			runInBackground(
+				c,
+				edgeCache.put(
+					cacheKey,
+					new Response(new Uint8Array(scaledImage), {
+						status: 200,
+						headers: stripOriginSpecificHeaders(headers),
+					})
+				)
+			)
+		}
+
+		if (matchesIfNoneMatch(ifNoneMatch, normalizeEtag(headers.get('ETag')))) {
+			return notModifiedResponse(headers)
+		}
+		return new Response(isHead ? null : scaledImage, { status: 200, headers })
 	}
-)
+
+	const headers = buildImageHeaders(smolId, image, image.size)
+	if (matchesIfNoneMatch(ifNoneMatch, normalizeEtag(headers.get('ETag')))) {
+		await image.body?.cancel().catch(() => {})
+		return notModifiedResponse(headers)
+	}
+
+	let responseBody: ReadableStream | null = image.body
+	if (edgeCache && image.body) {
+		const [clientStream, cacheStream] = image.body.tee()
+		responseBody = clientStream
+		runInBackground(
+			c,
+			edgeCache.put(
+				cacheKey,
+				new Response(cacheStream, {
+					status: 200,
+					headers: stripOriginSpecificHeaders(headers),
+				})
+			)
+		)
+	}
+
+	return new Response(responseBody, { status: 200, headers })
+})
 
 export default media

@@ -1,6 +1,5 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
-import { etag } from 'hono/etag'
 import { SmolDurableObject, SmolState } from './do'
 import { Workflow } from './workflow'
 import { TxWorkflow } from './tx-workflow'
@@ -52,6 +51,7 @@ app.use(
 	cors({
 		origin: (origin) => allowedCorsOrigin(origin),
 		credentials: true,
+		exposeHeaders: ['Content-Range', 'Accept-Ranges', 'Content-Length', 'ETag'],
 	})
 )
 
