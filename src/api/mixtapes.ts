@@ -651,11 +651,19 @@ function writeReceipt(row: MixtapeRow, decision: MixtapeDecision) {
 	}
 }
 
+/**
+ * The subject's row and decision from a post-commit cohort snapshot, or null when an owner
+ * concurrently deleted it after our write committed (an expected race, never a 500).
+ */
 function cohortView(cohort: CohortResult, id: string) {
 	const row = cohort.rows.find((r) => r.Id === id)
-	if (!row) throw new HTTPException(500, { message: 'Mixtape vanished during re-evaluation' })
-	const decision = cohort.decisions.get(id)!
+	const decision = cohort.decisions.get(id)
+	if (!row || !decision) return null
 	return { row, decision, view: ownerView(row, decision, cohort.publicSmols) }
+}
+
+function concurrentDelete(c: Context<HonoEnv>, id: string, error = 'Mixtape was deleted concurrently after update') {
+	return privateJson(c, { error, code: 'concurrent_delete', id }, 409)
 }
 
 /** Load a live mixtape for an owner mutation: 404 when missing/deleted, 403 when not the owner. */
@@ -879,7 +887,7 @@ async function markClaim(env: Env, key: string, mixtapeId: string, token: string
 
 interface ClaimedClassification {
 	cohort: CohortResult
-	outcome: 'finalized' | 'not_committed' | 'superseded'
+	outcome: 'finalized' | 'not_committed' | 'superseded' | 'conflict'
 }
 
 /**
@@ -900,8 +908,8 @@ async function currentClaimResponse(c: Context<HonoEnv>, sub: string, key: strin
 	return privateJson(c, { ...writeReceipt(row, decision), deduplicated: status === 200 }, status)
 }
 
-function createConflict(c: Context<HonoEnv>) {
-	return privateJson(c, { error: 'This mixtape was changed or removed while it was being created; review it and try again', code: 'create_conflict' }, 409)
+function createConflict(c: Context<HonoEnv>, id?: string) {
+	return privateJson(c, { error: 'This mixtape was changed or removed while it was being created; review it and try again', code: 'create_conflict', ...(id ? { id } : {}) }, 409)
 }
 
 /**
@@ -914,6 +922,13 @@ async function classifyClaimedCreate(env: Env, sub: string, key: string, mixtape
 	try {
 		const cohort = await reevaluateOwnerCohort(env, sub, { subjectId: mixtapeId, allowAi: true, claim: { key, mixtapeId, token } })
 		if (cohort.superseded) return { cohort, outcome: 'superseded' }
+		// The owner may have deleted or edited the row while this classification ran: only a row
+		// that still has exactly the requested content (same snapshot) may be finalized/reported.
+		const row = cohort.rows.find((candidate) => candidate.Id === mixtapeId)
+		if (!row || await rowRetryKey(row) !== key) {
+			await markClaim(env, key, mixtapeId, token, CLAIM_FAILED)
+			return { cohort, outcome: 'conflict' }
+		}
 		const owned = await markClaim(env, key, mixtapeId, token, cohort.committed ? CLAIM_FINALIZED : CLAIM_FAILED)
 		// A recovery took this claim over meanwhile: our classification is no longer authoritative.
 		return { cohort, outcome: !owned ? 'superseded' : cohort.committed ? 'finalized' : 'not_committed' }
@@ -997,9 +1012,11 @@ mixtapes.post('/', parseAuth, async (c) => {
 				cohort.changedIds.forEach((changed) => purgeIds.add(changed))
 				// Never report a classification that never committed; the row stays recoverable.
 				if (outcome === 'not_committed') return createPending(c)
-				if (outcome === 'superseded') return await currentClaimResponse(c, sub, key, id, 201) ?? createConflict(c)
-				const { row, decision } = cohortView(cohort, id)
-				return privateJson(c, { ...writeReceipt(row, decision), deduplicated: false }, 201)
+				if (outcome === 'conflict') return createConflict(c, id)
+				if (outcome === 'superseded') return await currentClaimResponse(c, sub, key, id, 201) ?? createConflict(c, id)
+				const view = cohortView(cohort, id)
+				if (!view) return createConflict(c, id)
+				return privateJson(c, { ...writeReceipt(view.row, view.decision), deduplicated: false }, 201)
 			})
 		}
 
@@ -1022,7 +1039,7 @@ mixtapes.post('/', parseAuth, async (c) => {
 					return result
 				})
 				if (recovery.outcome === 'not_committed') return createPending(c)
-				if (recovery.outcome === 'superseded') {
+				if (recovery.outcome === 'superseded' || recovery.outcome === 'conflict') {
 					const current = await currentClaimResponse(c, sub, key, recoveredId, 200)
 					if (current) return current
 					cohort = null
@@ -1188,6 +1205,7 @@ async function updateMixtape(c: Context<HonoEnv>, mode: 'put' | 'patch') {
 		const cohort = await reevaluateOwnerCohort(env, sub, { subjectId: id, allowAi: true })
 		cohort.changedIds.forEach((changed) => purgeIds.add(changed))
 		const result = cohortView(cohort, id)
+		if (!result) return concurrentDelete(c, id)
 		return privateJson(c, { ...writeReceipt(result.row, result.decision), mixtape: result.view })
 	})
 }
@@ -1265,6 +1283,7 @@ mixtapes.post('/:id/restore', parseAuth, async (c) => {
 		const cohort = await reevaluateOwnerCohort(env, sub, { allowAi: false })
 		cohort.changedIds.forEach((changed) => purgeIds.add(changed))
 		const result = cohortView(cohort, id)
+		if (!result) return concurrentDelete(c, id, 'Mixtape was deleted concurrently after restore')
 		return privateJson(c, { ...writeReceipt(result.row, result.decision), restored: true, mixtape: result.view })
 	})
 })
@@ -1350,13 +1369,16 @@ mixtapes.post('/:id/merge', parseAuth, async (c) => {
 	return await afterCommit(c, [sourceId, targetId], async (purgeIds) => {
 		const cohort = await reevaluateOwnerCohort(env, sub, { allowAi: false })
 		cohort.changedIds.forEach((changed) => purgeIds.add(changed))
+		// The merge itself committed (source tombstoned); a target deleted right afterwards is an
+		// expected owner race, reported explicitly rather than as a server error.
 		const result = cohortView(cohort, targetId)
 		return privateJson(c, {
 			targetId,
 			mergedId: sourceId,
 			addedCount: added.length,
 			totalTracks: merged.length,
-			target: result.view,
+			target: result?.view ?? null,
+			...(result ? {} : { targetDeletedConcurrently: true }),
 		})
 	})
 })

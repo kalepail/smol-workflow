@@ -1520,3 +1520,77 @@ test('Pass 7 P2-1b: losing the claim during inference (no epoch change) aborts t
 	assert.deepEqual([h.row(id)!.Ai_Verdict, h.row(id)!.Hidden_Reason], [null, null], 'the stale attempt wrote no verdict')
 	assert.deepEqual([res.status, res.body.code], [503, 'create_pending'], 'the new owner has not finalized yet')
 })
+
+// ---------------------------------------------------------------------------
+// Pass-8 regressions (reports/25b-review-mixtape-be.md §Pass 8)
+// ---------------------------------------------------------------------------
+
+test('Pass 8 P2a/b: an owner DELETE or PATCH while the creator awaits Clef yields 409 create_conflict, never 500 or a mismatched 201', async () => {
+	for (const change of ['delete', 'patch'] as const) {
+		let resolveAi!: (value: unknown) => void
+		const h = buildHarness({ ai: () => new Promise((resolve) => { resolveAi = resolve }) })
+		await seedBiggerSibling(h)
+		const body = { title: 'Early set', smols: [1, 2, 3, 4, 5].map(SYN) }
+		const pending = h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+		while (h.aiCalls.length < 1) await tick()
+		const id = (await h.json<Array<{ Id: string; Title: string }>>('/mixtapes/mine', { as: NEW_OWNER })).body.find((m) => m.Title === 'Early set')!.Id
+		const ownerWrite = change === 'delete'
+			? await h.send(`/mixtapes/${id}`, { method: 'DELETE', as: NEW_OWNER })
+			: await h.send(`/mixtapes/${id}`, { method: 'PATCH', as: NEW_OWNER, body: { title: 'Renamed', smols: [SYN(1)] } })
+		assert.equal(ownerWrite.status, 200, `${change} succeeded during inference`)
+		resolveAi(clefAnswer(0.95))
+		const creator = await pending
+		assert.deepEqual([creator.status, creator.body.code, creator.body.id], [409, 'create_conflict', id], change)
+		assert.equal(creator.res.headers.get('Cache-Control'), 'private, no-store')
+		assert.notEqual(claimRow(h, id)?.Finalized, 1, `${change}: a mismatched row is never finalized`)
+		if (change === 'patch') assert.deepEqual([h.row(id)!.Title, h.row(id)!.Revision], ['Renamed', 2], 'the owner edit stands')
+		else assert.ok(h.row(id)!.Deleted_At, 'the owner delete stands')
+		const again = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+		assert.equal(again.status, 201, `${change}: the next identical POST simply creates it`)
+		assert.notEqual(again.body.id, id)
+	}
+})
+
+test('Pass 8 P2c: an owner DELETE right after commit on PATCH, restore and merge is reported, never a 500', async () => {
+	const h = buildHarness()
+	const create = async (title: string, smols: string[]) => (await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title, smols } })).body.id as string
+	const deleteRightAfterCommit = (id: string) => {
+		let fired = false
+		h.hooks.onStatement = (sql, args) => {
+			if (fired || !OWNER_ROWS_READ.test(sql) || args[0] !== NEW_OWNER) return
+			fired = true // the write has committed; its cohort read is next
+			h.write(`UPDATE Mixtapes SET Deleted_At = CURRENT_TIMESTAMP, Visibility = 'deleted', Hidden_Reason = 'deleted', Revision = Revision + 1 WHERE Id = ?`, id)
+		}
+		return () => {
+			h.hooks.onStatement = undefined
+			assert.equal(fired, true)
+		}
+	}
+
+	const edited = await create('Edit me', [SYN(1), SYN(2)])
+	let done = deleteRightAfterCommit(edited)
+	const patch = await h.json(`/mixtapes/${edited}`, { method: 'PATCH', as: NEW_OWNER, body: { title: 'Edited' } })
+	done()
+	assert.deepEqual([patch.status, patch.body.code, patch.body.id], [409, 'concurrent_delete', edited])
+	assert.equal(patch.res.headers.get('Cache-Control'), 'private, no-store')
+	assert.equal(h.row(edited)!.Title, 'Edited', 'the PATCH itself committed')
+
+	const restorable = await create('Restore me', [SYN(3), SYN(4)])
+	assert.equal((await h.send(`/mixtapes/${restorable}`, { method: 'DELETE', as: NEW_OWNER })).status, 200)
+	done = deleteRightAfterCommit(restorable)
+	const restore = await h.json(`/mixtapes/${restorable}/restore`, { method: 'POST', as: NEW_OWNER })
+	done()
+	assert.deepEqual([restore.status, restore.body.code, restore.body.id], [409, 'concurrent_delete', restorable])
+
+	const target = await create('Target', [SYN(5), SYN(6)])
+	const source = await create('Source', [SYN(7), SYN(8)])
+	done = deleteRightAfterCommit(target)
+	const merge = await h.json(`/mixtapes/${source}/merge`, { method: 'POST', as: NEW_OWNER, body: { targetId: target } })
+	done()
+	assert.equal(merge.status, 200)
+	assert.deepEqual(
+		[merge.body.targetId, merge.body.mergedId, merge.body.addedCount, merge.body.totalTracks, merge.body.target, merge.body.targetDeletedConcurrently],
+		[target, source, 2, 4, null, true],
+	)
+	assert.deepEqual([h.row(source)!.Hidden_Reason, h.row(source)!.Related_Mixtape_Id], ['merged', target], 'the merge committed')
+})
