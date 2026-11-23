@@ -100,6 +100,14 @@ export function purgeMixtapesCache(): Promise<boolean> {
 }
 
 /**
+ * Purge the mixtapes listing plus the detail entries of every mixtape whose
+ * content or derived visibility changed (edited row, promoted/hidden siblings, merge target).
+ */
+export function purgeMixtapeCache(mixtapeIds: string[]): Promise<boolean> {
+	return purgeCacheByTags(['mixtapes', ...mixtapeIds.map((id) => `mixtape:${id}`)])
+}
+
+/**
  * Helper to purge cache for public smols list
  */
 export function purgePublicSmolsCache(): Promise<boolean> {

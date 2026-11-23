@@ -30,6 +30,8 @@ declare namespace Cloudflare {
 		PLAY_COUNT_MODE?: string
 		PLAY_BEACON_COOLDOWN_SECONDS?: string
 		PLAY_BEACON_RATE_LIMIT_PER_MINUTE?: string
+		/** Tier 2 clef-flash mixtape tie-breaker. Enabled unless exactly 'false'. */
+		MIXTAPE_DEDUPE_AI_ENABLED?: string
 		USER_QUOTA: DurableObjectNamespace<import('../src/quota-do').UserQuotaDO>
 		SEARCH_BACKFILL_CRON_ENABLED: string
 		SEARCH_BACKFILL_CRON_PAGE_LIMIT: string

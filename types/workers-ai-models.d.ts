@@ -104,3 +104,42 @@ interface AiModels {
 	'@cf/moondream/moondream3.1-9B-A2B': Base_Ai_Cf_Moondream_Moondream3_1_9B_A2B
 	'@cf/google/gemma-4-26b-a4b-it': Base_Ai_Cf_Google_Gemma_4_26B_A4B_It
 }
+
+// Cloudflare Clef (Decision-1 / System One typed questions). Verified live on
+// 2026-11-23 (reports/25-mixtape-clef-jev-eval.md §1.2): the binding requires an
+// inner `model` selector and returns `{ model, answers, usage }` at the top level
+// (REST/gateway envelopes wrap it in `result`, so callers unwrap defensively).
+type ClefQuestion =
+	| { type: 'noul'; instructions: string; criteria?: { true: string; false: string } }
+	| { type: 'choice'; instructions: string; criteria: Record<string, string> }
+	| { type: 'score'; instructions: string; criteria: string[] }
+
+interface Ai_Cf_Cloudflare_Clef_Input {
+	model: 'clef' | 'clef-flash' | 'clef-omni'
+	state: string | Record<string, unknown> | unknown[]
+	questions: Record<string, ClefQuestion>
+}
+
+type ClefAnswer =
+	| { type: 'noul'; noul: number }
+	| { type: 'choice'; choice: string; probabilities: Record<string, number>; confidence: number }
+	| { type: 'score'; score: number; probabilities: Record<string, number>; confidence?: number }
+
+interface Ai_Cf_Cloudflare_Clef_Result {
+	model: string
+	answers: Record<string, ClefAnswer>
+	usage: { input_tokens: number; output_tokens: number }
+}
+
+type Ai_Cf_Cloudflare_Clef_Output = Ai_Cf_Cloudflare_Clef_Result & {
+	result?: Ai_Cf_Cloudflare_Clef_Result
+}
+
+interface Base_Ai_Cf_Cloudflare_Clef {
+	inputs: Ai_Cf_Cloudflare_Clef_Input
+	postProcessedOutputs: Ai_Cf_Cloudflare_Clef_Output
+}
+
+interface AiModels {
+	'@cf/cloudflare/clef-flash': Base_Ai_Cf_Cloudflare_Clef
+}

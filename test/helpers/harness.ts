@@ -730,3 +730,76 @@ export async function createAuthToken(sub: string, secret: string, usr = 'tester
 		'HS256'
 	)
 }
+
+/**
+ * Minimal Cloudflare D1 binding backed by a real `node:sqlite` database so route SQL
+ * (RETURNING, datetime('now'), ?NNN params, CHECK constraints, batches) executes for real.
+ * `batch()` is atomic (BEGIN/COMMIT, ROLLBACK on error) like D1.
+ */
+export function createSqliteD1(db: DatabaseSync) {
+	const stats = { statements: [] as string[] }
+	const normalize = (args: unknown[]) => args.map((value) => {
+		if (value === undefined) return null
+		if (typeof value === 'boolean') return value ? 1 : 0
+		return value
+	}) as never[]
+	const plain = <T>(row: unknown) => (row ? { ...(row as Record<string, unknown>) } as T : null)
+
+	class Statement {
+		constructor(readonly sql: string, readonly args: unknown[] = []) {}
+
+		bind(...args: unknown[]) {
+			return new Statement(this.sql, args)
+		}
+
+		runSync() {
+			stats.statements.push(this.sql)
+			const result = db.prepare(this.sql).run(...normalize(this.args))
+			return {
+				success: true,
+				results: [],
+				meta: { changes: Number(result.changes), last_row_id: Number(result.lastInsertRowid) },
+			}
+		}
+
+		async first<T>(column?: string): Promise<T | null> {
+			stats.statements.push(this.sql)
+			const row = plain<Record<string, unknown>>(db.prepare(this.sql).get(...normalize(this.args)))
+			if (!row) return null
+			return (column ? row[column] : row) as T
+		}
+
+		async all<T>() {
+			stats.statements.push(this.sql)
+			const rows = db.prepare(this.sql).all(...normalize(this.args)).map((row) => plain<T>(row) as T)
+			return { success: true, results: rows, meta: {} }
+		}
+
+		async run() {
+			return this.runSync()
+		}
+	}
+
+	const d1 = {
+		prepare(sql: string) {
+			return new Statement(sql)
+		},
+		async batch(statements: Statement[]) {
+			db.exec('BEGIN')
+			try {
+				const out = statements.map((statement) => statement.runSync())
+				db.exec('COMMIT')
+				return out
+			} catch (error) {
+				db.exec('ROLLBACK')
+				throw error
+			}
+		},
+		async exec(sql: string) {
+			db.exec(sql)
+			return { count: 1, duration: 0 }
+		},
+	}
+
+	return { d1: d1 as unknown as D1Database, stats }
+}
