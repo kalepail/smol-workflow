@@ -399,6 +399,8 @@ interface CohortResult {
 	decisions: Map<string, MixtapeDecision>
 	publicSmols: Map<string, MixtapeSmolRow>
 	changedIds: string[]
+	/** True when the derived state was written, or verified already current, at a stable epoch. */
+	committed: boolean
 }
 
 /**
@@ -558,7 +560,7 @@ async function reevaluateOwnerCohort(
 			}
 		})
 
-		const result: CohortResult = { rows: nextRows, decisions, publicSmols, changedIds }
+		const result: CohortResult = { rows: nextRows, decisions, publicSmols, changedIds, committed: true }
 		if (!changedIds.length) {
 			if (await readEpoch(env) === epoch) return result // still exactly the committed state
 			continue
@@ -572,10 +574,11 @@ async function reevaluateOwnerCohort(
 		}
 	}
 
-	// Still contended: nothing from this request was written. Return what is actually committed.
+	// Still contended: nothing from this request was written. Return what is actually committed,
+	// flagged as NOT committed so callers never treat it as a finished classification.
 	const { rows, publicSmols } = await loadCohortSnapshot(env, address)
 	const { decisions } = await deriveDecisions(rows, publicSmols)
-	return { rows, decisions, publicSmols, changedIds: [] }
+	return { rows, decisions, publicSmols, changedIds: [], committed: false }
 }
 
 function ownerView(row: MixtapeRow, decision: MixtapeDecision | undefined, publicSmols: ReadonlyMap<string, unknown>) {
@@ -798,7 +801,7 @@ mixtapes.post('/check-uniqueness', parseAuth, async (c) => {
 
 const REPLAY_POLL_MS = 40
 const REPLAY_WAIT_MS = 2000
-const MAX_CREATE_ATTEMPTS = 2
+const MAX_CREATE_ATTEMPTS = 3
 const CLAIM_IN_PROGRESS = 0
 const CLAIM_FINALIZED = 1
 const CLAIM_FAILED = 2
@@ -829,22 +832,30 @@ async function awaitClaim(env: Env, key: string): Promise<ClaimWait> {
 	}
 }
 
-async function markClaim(env: Env, key: string, mixtapeId: string, state: typeof CLAIM_FINALIZED | typeof CLAIM_FAILED) {
-	await env.SMOL_D1.prepare('UPDATE MixtapeRetryClaim SET Finalized = ?3 WHERE Retry_Key = ?1 AND Mixtape_Id = ?2')
-		.bind(key, mixtapeId, state).run()
+/**
+ * Record the outcome of THIS ownership attempt. Only the attempt holding the current token, while
+ * the claim is still in progress, can flip it: an expired holder can never overwrite a recovery.
+ */
+async function markClaim(env: Env, key: string, mixtapeId: string, token: string, state: typeof CLAIM_FINALIZED | typeof CLAIM_FAILED) {
+	await env.SMOL_D1.prepare(`
+		UPDATE MixtapeRetryClaim SET Finalized = ?4
+		WHERE Retry_Key = ?1 AND Mixtape_Id = ?2 AND Attempt_Token = ?3 AND Finalized = ${CLAIM_IN_PROGRESS}
+	`).bind(key, mixtapeId, token, state).run()
 }
 
 /**
  * Classify a claimed create (Tier 1 + borderline Tier 2) and flip its claim to FINALIZED only once
- * that commits; on failure flip it to FAILED (never finalized) so a replay can recover the row.
+ * that classification has actually committed (or was verified current). If every guarded write
+ * attempt rolled back, or classification throws, the claim becomes FAILED so a replay can recover
+ * the same row; `committed: false` tells the caller to answer with a retryable 503.
  */
-async function classifyClaimedCreate(env: Env, sub: string, key: string, mixtapeId: string): Promise<CohortResult> {
+async function classifyClaimedCreate(env: Env, sub: string, key: string, mixtapeId: string, token: string): Promise<CohortResult> {
 	try {
 		const cohort = await reevaluateOwnerCohort(env, sub, { subjectId: mixtapeId, allowAi: true })
-		await markClaim(env, key, mixtapeId, CLAIM_FINALIZED)
+		await markClaim(env, key, mixtapeId, token, cohort.committed ? CLAIM_FINALIZED : CLAIM_FAILED)
 		return cohort
 	} catch (error) {
-		await markClaim(env, key, mixtapeId, CLAIM_FAILED).catch((markError) => console.warn('mixtape_retry_mark_failed', markError))
+		await markClaim(env, key, mixtapeId, token, CLAIM_FAILED).catch((markError) => console.warn('mixtape_retry_mark_failed', markError))
 		throw error
 	}
 }
@@ -894,6 +905,7 @@ mixtapes.post('/', parseAuth, async (c) => {
 			&& await retryKey(prior.Address!, prior.Smols!, prior.Title, prior.Desc ?? '') !== key)
 
 		const id = newMixtapeId()
+		const token = newMixtapeId()
 		const results = await env.SMOL_D1.batch([
 			env.SMOL_D1.prepare(`DELETE FROM MixtapeRetryClaim WHERE Created_At < datetime('now', '${IDEMPOTENT_RETRY_WINDOW}')`),
 			env.SMOL_D1.prepare(`
@@ -907,7 +919,7 @@ mixtapes.post('/', parseAuth, async (c) => {
 					OR (Mixtape_Id = ?2 AND EXISTS (SELECT 1 FROM Mixtapes m WHERE m.Id = ?2 AND m.Revision = ?3))
 				)
 			`).bind(key, priorDiverged ? prior!.Mixtape_Id : null, priorDiverged ? prior!.Revision : null),
-			env.SMOL_D1.prepare('INSERT OR IGNORE INTO MixtapeRetryClaim (Retry_Key, Mixtape_Id) VALUES (?1, ?2)').bind(key, id),
+			env.SMOL_D1.prepare('INSERT OR IGNORE INTO MixtapeRetryClaim (Retry_Key, Mixtape_Id, Attempt_Token) VALUES (?1, ?2, ?3)').bind(key, id, token),
 			env.SMOL_D1.prepare(`
 				INSERT INTO Mixtapes (Id, Title, Desc, Smols, "Address", Updated_At, Visibility, Revision)
 				SELECT ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP, 'public', 1
@@ -918,8 +930,10 @@ mixtapes.post('/', parseAuth, async (c) => {
 
 		if (results[3]?.meta?.changes === 1) {
 			return await afterCommit(c, [id], async (purgeIds) => {
-				const cohort = await classifyClaimedCreate(env, sub, key, id)
+				const cohort = await classifyClaimedCreate(env, sub, key, id, token)
 				cohort.changedIds.forEach((changed) => purgeIds.add(changed))
+				// Never report a classification that never committed; the row stays recoverable.
+				if (!cohort.committed) return createPending(c)
 				const { row, decision } = cohortView(cohort, id)
 				return privateJson(c, { ...writeReceipt(row, decision), deduplicated: false }, 201)
 			})
@@ -929,19 +943,21 @@ mixtapes.post('/', parseAuth, async (c) => {
 		let wait = await awaitClaim(env, key)
 		let cohort: CohortResult | null = null
 		while (wait.state === 'recoverable') {
+			const recoveryToken = newMixtapeId()
 			const takeover = await env.SMOL_D1.prepare(`
-				UPDATE MixtapeRetryClaim SET Finalized = ${CLAIM_IN_PROGRESS}, Created_At = CURRENT_TIMESTAMP
+				UPDATE MixtapeRetryClaim SET Finalized = ${CLAIM_IN_PROGRESS}, Created_At = CURRENT_TIMESTAMP, Attempt_Token = ?3
 				WHERE Retry_Key = ?1 AND Mixtape_Id = ?2
 					AND (Finalized = ${CLAIM_FAILED} OR (Finalized = ${CLAIM_IN_PROGRESS} AND Created_At <= datetime('now', '${CLAIM_STALE_AFTER}')))
-			`).bind(key, wait.mixtapeId).run()
+			`).bind(key, wait.mixtapeId, recoveryToken).run()
 			if (takeover.meta?.changes === 1) {
 				// This request now owns recovery of the EXISTING row: classify it (no second insert).
 				const recoveredId = wait.mixtapeId
 				cohort = await afterCommit(c, [recoveredId], async (purgeIds) => {
-					const result = await classifyClaimedCreate(env, sub, key, recoveredId)
+					const result = await classifyClaimedCreate(env, sub, key, recoveredId, recoveryToken)
 					result.changedIds.forEach((changed) => purgeIds.add(changed))
 					return result
 				})
+				if (!cohort.committed) return createPending(c)
 				wait = { state: 'finalized', mixtapeId: recoveredId }
 				break
 			}
@@ -955,9 +971,20 @@ mixtapes.post('/', parseAuth, async (c) => {
 		const snapshot = cohort ?? { ...(await loadCohortSnapshot(env, sub)), decisions: null }
 		const row = snapshot.rows.find((candidate) => candidate.Id === wait.mixtapeId)
 		if (!row || await rowRetryKey(row) !== key) {
-			// Deleted or edited away since the claim: release it and create afresh (bounded).
-			await env.SMOL_D1.prepare('DELETE FROM MixtapeRetryClaim WHERE Retry_Key = ?1 AND Mixtape_Id = ?2').bind(key, wait.mixtapeId).run()
-			continue
+			// Deleted or edited away since the claim. Release it ONLY if that is still true right now
+			// (still absent, or still at the divergent revision we saw); if an Undo/restore brought
+			// the matching row back, the release is a no-op and the guarded claim check runs again.
+			const release = row
+				? env.SMOL_D1.prepare(`
+					DELETE FROM MixtapeRetryClaim WHERE Retry_Key = ?1 AND Mixtape_Id = ?2
+						AND EXISTS (SELECT 1 FROM Mixtapes WHERE Id = ?2 AND Deleted_At IS NULL AND Revision = ?3)
+				`).bind(key, wait.mixtapeId, row.Revision)
+				: env.SMOL_D1.prepare(`
+					DELETE FROM MixtapeRetryClaim WHERE Retry_Key = ?1 AND Mixtape_Id = ?2
+						AND NOT EXISTS (SELECT 1 FROM Mixtapes WHERE Id = ?2 AND Deleted_At IS NULL)
+				`).bind(key, wait.mixtapeId)
+			await release.run()
+			continue // re-enter the guarded claim check: it re-validates whatever is live now
 		}
 		const decisions = snapshot.decisions ?? (await deriveDecisions(snapshot.rows, snapshot.publicSmols)).decisions
 		const decision = decisions.get(row.Id)

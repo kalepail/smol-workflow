@@ -1242,3 +1242,96 @@ test('Pass 4 P2-2: a delete or edit between replay reads never yields a 500 or a
 		assert.equal((h.db.prepare('SELECT COUNT(*) AS n FROM Mixtapes WHERE Title = ? AND Deleted_At IS NULL').get(body.title) as { n: number }).n, 1)
 	}
 })
+
+// ---------------------------------------------------------------------------
+// Pass-5 regressions (reports/25b-review-mixtape-be.md §Pass 5)
+// ---------------------------------------------------------------------------
+
+const claimRow = (h: ReturnType<typeof buildHarness>, id: string) => h.db.prepare('SELECT Finalized, Attempt_Token FROM MixtapeRetryClaim WHERE Mixtape_Id = ?').get(id) as { Finalized: number; Attempt_Token: string } | undefined
+
+test('Pass 5 P2-1: when every guarded classification write rolls back, the create is 503 create_pending (never 201) and recovers on retry', async () => {
+	const h = buildHarness({ ai: async () => clefAnswer(0.95) })
+	await seedBiggerSibling(h)
+	let unrelatedWrites = 0
+	h.hooks.onStatement = (sql) => {
+		if (unrelatedWrites < 3 && sql.includes(CLASSIFY_BATCH)) {
+			unrelatedWrites += 1 // another owner commits right before each guarded write
+			h.write(`UPDATE Mixtapes SET Title = ? WHERE Id = ?`, `Cordova take ${unrelatedWrites}`, CORDOVA)
+		}
+	}
+	const body = { title: 'Early set', smols: [1, 2, 3, 4, 5].map(SYN) }
+	const first = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	h.hooks.onStatement = undefined
+	assert.equal(unrelatedWrites, 3, 'all three guarded attempts rolled back')
+	assert.deepEqual([first.status, first.body.code], [503, 'create_pending'])
+	assert.equal(first.res.headers.get('Retry-After'), '1')
+	assert.equal(first.res.headers.get('Cache-Control'), 'private, no-store')
+	const id = (h.db.prepare(`SELECT Id FROM Mixtapes WHERE Title = 'Early set'`).get() as { Id: string }).Id
+	assert.equal(claimRow(h, id)!.Finalized, 2, 'left recoverable, never finalized')
+	assert.deepEqual([h.row(id)!.Ai_Verdict, h.row(id)!.Uniqueness_Score], [null, null], 'nothing was persisted')
+
+	const retry = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	assert.deepEqual([retry.status, retry.body.id, retry.body.deduplicated, retry.body.visibility, retry.body.hiddenReason], [200, id, true, 'owner', 'semantic_duplicate'])
+	assert.equal(JSON.parse(h.row(id)!.Ai_Verdict).p, 0.95)
+	assert.equal(claimRow(h, id)!.Finalized, 1)
+	assert.equal(countTitled(h, 'Early set'), 1)
+})
+
+test('Pass 5 P2-2: delete-then-restore between the replay read and the claim release keeps one live row', async () => {
+	const h = buildHarness()
+	const body = { title: 'Undo me', smols: [SYN(1), SYN(2)] }
+	const original = (await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })).body.id as string
+	let deleted = false
+	let restored = false
+	h.hooks.onStatement = async (sql, args) => {
+		if (!deleted && OWNER_ROWS_READ.test(sql) && args[0] === NEW_OWNER) {
+			deleted = true // the owner deletes it just before the replay's cohort read…
+			assert.equal((await h.send(`/mixtapes/${original}`, { method: 'DELETE', as: NEW_OWNER })).status, 200)
+		} else if (deleted && !restored && sql.includes('DELETE FROM MixtapeRetryClaim WHERE Retry_Key = ?1 AND Mixtape_Id = ?2')) {
+			restored = true // …and hits Undo just before the replay releases the claim
+			assert.equal((await h.send(`/mixtapes/${original}/restore`, { method: 'POST', as: NEW_OWNER })).status, 200)
+		}
+	}
+	const replay = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	h.hooks.onStatement = undefined
+	assert.equal(deleted && restored, true)
+	assert.deepEqual([replay.status, replay.body.id, replay.body.deduplicated], [200, original, true])
+	assert.equal((h.db.prepare(`SELECT COUNT(*) AS n FROM Mixtapes WHERE Title = 'Undo me' AND Deleted_At IS NULL`).get() as { n: number }).n, 1, 'no second live copy')
+	assert.equal(countTitled(h, 'Undo me'), 1)
+})
+
+test('Pass 5 P2-3: an expired holder failing after a takeover cannot flip the recovered claim from finalized to failed', async () => {
+	const h = buildHarness()
+	let release!: () => void
+	const gate = new Promise<void>((resolve) => { release = resolve })
+	let held = false
+	h.hooks.onStatement = async (sql) => {
+		if (!held && sql.includes(CLASSIFY_BATCH)) {
+			held = true
+			await gate
+			throw new Error('D1_ERROR: late failure of the expired holder')
+		}
+	}
+	const body = { title: 'Slow start', smols: [SYN(1), SYN(2)] }
+	const pendingOriginal = h.send('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	while (!held) await tick()
+	const id = (h.db.prepare(`SELECT Id FROM Mixtapes WHERE Title = 'Slow start'`).get() as { Id: string }).Id
+	const originalToken = claimRow(h, id)!.Attempt_Token
+	assert.match(originalToken, /^[0-9a-f]{16}$/)
+	h.db.prepare(`UPDATE MixtapeRetryClaim SET Created_At = datetime('now', '-60 seconds') WHERE Mixtape_Id = ?`).run(id) // holder looks abandoned
+
+	const recovered = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	assert.deepEqual([recovered.status, recovered.body.id, recovered.body.visibility], [200, id, 'public'])
+	const afterRecovery = claimRow(h, id)!
+	assert.equal(afterRecovery.Finalized, 1)
+	assert.notEqual(afterRecovery.Attempt_Token, originalToken, 'takeover issued a fresh token')
+
+	release()
+	const original = await pendingOriginal
+	h.hooks.onStatement = undefined
+	assert.equal(original.status, 500)
+	assert.deepEqual(claimRow(h, id), afterRecovery, 'the expired holder could not overwrite the recovery')
+	const next = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	assert.deepEqual([next.status, next.body.id], [200, id])
+	assert.equal(countTitled(h, 'Slow start'), 1)
+})

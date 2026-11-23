@@ -56,7 +56,10 @@ CREATE TABLE IF NOT EXISTS MixtapeRetryClaim (
     Retry_Key TEXT PRIMARY KEY,
     Mixtape_Id TEXT NOT NULL,
     Created_At DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    Finalized INTEGER NOT NULL DEFAULT 0 CHECK (Finalized IN (0, 1, 2))
+    Finalized INTEGER NOT NULL DEFAULT 0 CHECK (Finalized IN (0, 1, 2)),
+    -- Fresh per ownership attempt (initial claim and every recovery takeover). Completion is only
+    -- recorded by the attempt holding the current token, so an expired holder can never overwrite it.
+    Attempt_Token TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_mixtape_retry_claim_created
