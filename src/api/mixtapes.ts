@@ -836,11 +836,33 @@ async function awaitClaim(env: Env, key: string): Promise<ClaimWait> {
  * Record the outcome of THIS ownership attempt. Only the attempt holding the current token, while
  * the claim is still in progress, can flip it: an expired holder can never overwrite a recovery.
  */
-async function markClaim(env: Env, key: string, mixtapeId: string, token: string, state: typeof CLAIM_FINALIZED | typeof CLAIM_FAILED) {
-	await env.SMOL_D1.prepare(`
+async function markClaim(env: Env, key: string, mixtapeId: string, token: string, state: typeof CLAIM_FINALIZED | typeof CLAIM_FAILED): Promise<boolean> {
+	const result = await env.SMOL_D1.prepare(`
 		UPDATE MixtapeRetryClaim SET Finalized = ?4
 		WHERE Retry_Key = ?1 AND Mixtape_Id = ?2 AND Attempt_Token = ?3 AND Finalized = ${CLAIM_IN_PROGRESS}
 	`).bind(key, mixtapeId, token, state).run()
+	return result.meta?.changes === 1
+}
+
+interface ClaimedClassification {
+	cohort: CohortResult
+	outcome: 'finalized' | 'not_committed' | 'superseded'
+}
+
+/**
+ * Answer for a claim this request no longer owns (a recovery took it over): the CURRENT committed
+ * decision once that claim is finalized, otherwise the retryable pending response. Never the
+ * superseded attempt's own, possibly stale, classification.
+ */
+async function currentClaimResponse(c: Context<HonoEnv>, sub: string, key: string, mixtapeId: string, status: 200 | 201) {
+	const claim = await c.env.SMOL_D1.prepare('SELECT Finalized FROM MixtapeRetryClaim WHERE Retry_Key = ?1 AND Mixtape_Id = ?2')
+		.bind(key, mixtapeId).first<{ Finalized: number }>()
+	if (claim?.Finalized !== CLAIM_FINALIZED) return createPending(c)
+	const { rows, publicSmols } = await loadCohortSnapshot(c.env, sub)
+	const row = rows.find((candidate) => candidate.Id === mixtapeId)
+	if (!row) return createPending(c)
+	const decision = (await deriveDecisions(rows, publicSmols)).decisions.get(mixtapeId)!
+	return privateJson(c, { ...writeReceipt(row, decision), deduplicated: status === 200 }, status)
 }
 
 /**
@@ -849,11 +871,12 @@ async function markClaim(env: Env, key: string, mixtapeId: string, token: string
  * attempt rolled back, or classification throws, the claim becomes FAILED so a replay can recover
  * the same row; `committed: false` tells the caller to answer with a retryable 503.
  */
-async function classifyClaimedCreate(env: Env, sub: string, key: string, mixtapeId: string, token: string): Promise<CohortResult> {
+async function classifyClaimedCreate(env: Env, sub: string, key: string, mixtapeId: string, token: string): Promise<ClaimedClassification> {
 	try {
 		const cohort = await reevaluateOwnerCohort(env, sub, { subjectId: mixtapeId, allowAi: true })
-		await markClaim(env, key, mixtapeId, token, cohort.committed ? CLAIM_FINALIZED : CLAIM_FAILED)
-		return cohort
+		const owned = await markClaim(env, key, mixtapeId, token, cohort.committed ? CLAIM_FINALIZED : CLAIM_FAILED)
+		// A recovery took this claim over meanwhile: our classification is no longer authoritative.
+		return { cohort, outcome: !owned ? 'superseded' : cohort.committed ? 'finalized' : 'not_committed' }
 	} catch (error) {
 		await markClaim(env, key, mixtapeId, token, CLAIM_FAILED).catch((markError) => console.warn('mixtape_retry_mark_failed', markError))
 		throw error
@@ -930,10 +953,11 @@ mixtapes.post('/', parseAuth, async (c) => {
 
 		if (results[3]?.meta?.changes === 1) {
 			return await afterCommit(c, [id], async (purgeIds) => {
-				const cohort = await classifyClaimedCreate(env, sub, key, id, token)
+				const { cohort, outcome } = await classifyClaimedCreate(env, sub, key, id, token)
 				cohort.changedIds.forEach((changed) => purgeIds.add(changed))
 				// Never report a classification that never committed; the row stays recoverable.
-				if (!cohort.committed) return createPending(c)
+				if (outcome === 'not_committed') return createPending(c)
+				if (outcome === 'superseded') return await currentClaimResponse(c, sub, key, id, 201)
 				const { row, decision } = cohortView(cohort, id)
 				return privateJson(c, { ...writeReceipt(row, decision), deduplicated: false }, 201)
 			})
@@ -952,12 +976,14 @@ mixtapes.post('/', parseAuth, async (c) => {
 			if (takeover.meta?.changes === 1) {
 				// This request now owns recovery of the EXISTING row: classify it (no second insert).
 				const recoveredId = wait.mixtapeId
-				cohort = await afterCommit(c, [recoveredId], async (purgeIds) => {
+				const recovery = await afterCommit(c, [recoveredId], async (purgeIds) => {
 					const result = await classifyClaimedCreate(env, sub, key, recoveredId, recoveryToken)
-					result.changedIds.forEach((changed) => purgeIds.add(changed))
+					result.cohort.changedIds.forEach((changed) => purgeIds.add(changed))
 					return result
 				})
-				if (!cohort.committed) return createPending(c)
+				if (recovery.outcome === 'not_committed') return createPending(c)
+				if (recovery.outcome === 'superseded') return await currentClaimResponse(c, sub, key, recoveredId, 200)
+				cohort = recovery.cohort
 				wait = { state: 'finalized', mixtapeId: recoveredId }
 				break
 			}
@@ -971,20 +997,11 @@ mixtapes.post('/', parseAuth, async (c) => {
 		const snapshot = cohort ?? { ...(await loadCohortSnapshot(env, sub)), decisions: null }
 		const row = snapshot.rows.find((candidate) => candidate.Id === wait.mixtapeId)
 		if (!row || await rowRetryKey(row) !== key) {
-			// Deleted or edited away since the claim. Release it ONLY if that is still true right now
-			// (still absent, or still at the divergent revision we saw); if an Undo/restore brought
-			// the matching row back, the release is a no-op and the guarded claim check runs again.
-			const release = row
-				? env.SMOL_D1.prepare(`
-					DELETE FROM MixtapeRetryClaim WHERE Retry_Key = ?1 AND Mixtape_Id = ?2
-						AND EXISTS (SELECT 1 FROM Mixtapes WHERE Id = ?2 AND Deleted_At IS NULL AND Revision = ?3)
-				`).bind(key, wait.mixtapeId, row.Revision)
-				: env.SMOL_D1.prepare(`
-					DELETE FROM MixtapeRetryClaim WHERE Retry_Key = ?1 AND Mixtape_Id = ?2
-						AND NOT EXISTS (SELECT 1 FROM Mixtapes WHERE Id = ?2 AND Deleted_At IS NULL)
-				`).bind(key, wait.mixtapeId)
-			await release.run()
-			continue // re-enter the guarded claim check: it re-validates whatever is live now
+			// Deleted or edited away since the claim. Never release it here: the next iteration's
+			// replacement batch re-validates the claim (still absent / still divergent) and replaces
+			// it together with the new row in ONE transaction, so an Undo/restore at any point in
+			// between keeps the original as the only live copy.
+			continue
 		}
 		const decisions = snapshot.decisions ?? (await deriveDecisions(snapshot.rows, snapshot.publicSmols)).decisions
 		const decision = decisions.get(row.Id)

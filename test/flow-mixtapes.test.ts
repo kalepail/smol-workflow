@@ -1277,7 +1277,7 @@ test('Pass 5 P2-1: when every guarded classification write rolls back, the creat
 	assert.equal(countTitled(h, 'Early set'), 1)
 })
 
-test('Pass 5 P2-2: delete-then-restore between the replay read and the claim release keeps one live row', async () => {
+test('Pass 5 P2-2: delete-then-restore between the replay read and the next claim check keeps one live row', async () => {
 	const h = buildHarness()
 	const body = { title: 'Undo me', smols: [SYN(1), SYN(2)] }
 	const original = (await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })).body.id as string
@@ -1287,8 +1287,8 @@ test('Pass 5 P2-2: delete-then-restore between the replay read and the claim rel
 		if (!deleted && OWNER_ROWS_READ.test(sql) && args[0] === NEW_OWNER) {
 			deleted = true // the owner deletes it just before the replay's cohort read…
 			assert.equal((await h.send(`/mixtapes/${original}`, { method: 'DELETE', as: NEW_OWNER })).status, 200)
-		} else if (deleted && !restored && sql.includes('DELETE FROM MixtapeRetryClaim WHERE Retry_Key = ?1 AND Mixtape_Id = ?2')) {
-			restored = true // …and hits Undo just before the replay releases the claim
+		} else if (deleted && !restored && sql.includes('FROM MixtapeRetryClaim c LEFT JOIN Mixtapes m')) {
+			restored = true // …and hits Undo just before the replay re-checks the claim
 			assert.equal((await h.send(`/mixtapes/${original}/restore`, { method: 'POST', as: NEW_OWNER })).status, 200)
 		}
 	}
@@ -1334,4 +1334,81 @@ test('Pass 5 P2-3: an expired holder failing after a takeover cannot flip the re
 	const next = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
 	assert.deepEqual([next.status, next.body.id], [200, id])
 	assert.equal(countTitled(h, 'Slow start'), 1)
+})
+
+// ---------------------------------------------------------------------------
+// Pass-6 regressions (reports/25b-review-mixtape-be.md §Pass 6)
+// ---------------------------------------------------------------------------
+
+test('Pass 6 P2-1: Undo right before the atomic replacement batch still yields the original as the only live row', async () => {
+	const h = buildHarness()
+	const body = { title: 'Undo late', smols: [SYN(1), SYN(2)] }
+	const original = (await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })).body.id as string
+	let deleted = false
+	let restored = false
+	let claimBatches = 0
+	h.hooks.onStatement = async (sql, args) => {
+		if (!deleted && OWNER_ROWS_READ.test(sql) && args[0] === NEW_OWNER) {
+			deleted = true // replay is about to observe the deletion
+			assert.equal((await h.send(`/mixtapes/${original}`, { method: 'DELETE', as: NEW_OWNER })).status, 200)
+		} else if (sql.includes(`DELETE FROM MixtapeRetryClaim WHERE Created_At`)) {
+			claimBatches += 1
+			if (deleted && !restored) {
+				restored = true // Undo lands at the latest possible point: right before replacement
+				assert.equal((await h.send(`/mixtapes/${original}/restore`, { method: 'POST', as: NEW_OWNER })).status, 200)
+				const mine = (await h.json<Array<{ Id: string; Title: string }>>('/mixtapes/mine', { as: NEW_OWNER })).body.filter((m) => m.Title === 'Undo late')
+				assert.deepEqual(mine.map((m) => m.Id), [original])
+			}
+		}
+	}
+	const replay = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	h.hooks.onStatement = undefined
+	assert.equal(deleted && restored, true)
+	assert.ok(claimBatches >= 2, 'the replay went back through the atomic claim batch')
+	assert.deepEqual([replay.status, replay.body.id, replay.body.deduplicated], [200, original, true])
+	assert.equal(countTitled(h, 'Undo late'), 1, 'no second mixtape row was ever inserted')
+	assert.equal(claimRow(h, original)?.Finalized, 1, 'the claim was never released')
+})
+
+test('Pass 6 P2-2: an expired creator whose finalize affects 0 rows returns the current committed verdict, never its stale one', async () => {
+	let calls = 0
+	const h = buildHarness({
+		ai: async () => {
+			calls += 1
+			if (calls === 1) throw new Error('5xx provider error') // the original commits the public fallback
+			return clefAnswer(0.95) // the recovery's adjudication
+		},
+	})
+	await seedBiggerSibling(h)
+	let release!: () => void
+	const gate = new Promise<void>((resolve) => { release = resolve })
+	let held = false
+	h.hooks.onStatement = async (sql) => {
+		if (!held && sql.includes('UPDATE MixtapeRetryClaim SET Finalized = ?4')) {
+			held = true
+			await gate // the original is paused at claim finalization, after committing "public"
+		}
+	}
+	const body = { title: 'Early set', smols: [1, 2, 3, 4, 5].map(SYN) }
+	const pendingOriginal = h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	while (!held) await tick()
+	const id = (h.db.prepare(`SELECT Id FROM Mixtapes WHERE Title = 'Early set'`).get() as { Id: string }).Id
+	assert.equal(h.row(id)!.Visibility, 'public', 'the original committed its fallback classification')
+	h.db.prepare(`UPDATE MixtapeRetryClaim SET Created_At = datetime('now', '-60 seconds') WHERE Mixtape_Id = ?`).run(id)
+
+	const recovered = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	assert.deepEqual([recovered.status, recovered.body.id, recovered.body.visibility, recovered.body.hiddenReason], [200, id, 'owner', 'semantic_duplicate'])
+
+	release()
+	const original = await pendingOriginal
+	h.hooks.onStatement = undefined
+	assert.equal(original.status, 201)
+	assert.deepEqual(
+		[original.body.id, original.body.visibility, original.body.hiddenReason, original.body.relatedMixtapeId],
+		[id, 'owner', 'semantic_duplicate', recovered.body.relatedMixtapeId],
+		'the superseded creator reports the current committed verdict',
+	)
+	const next = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	assert.deepEqual([next.status, next.body.visibility], [200, 'owner'])
+	assert.equal(countTitled(h, 'Early set'), 1)
 })
