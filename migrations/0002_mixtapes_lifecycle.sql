@@ -32,3 +32,36 @@ ON Mixtapes(Visibility, Created_At DESC, Id DESC);
 
 CREATE INDEX IF NOT EXISTS idx_mixtapes_address_created
 ON Mixtapes("Address", Created_At DESC, Id DESC);
+
+-- Monotonic cache epoch for public mixtape reads. Public GET cache keys embed this value,
+-- so a delayed in-flight GET can never refill the key that is current after a mutation.
+-- Every mixtape write batch bumps it; the triggers below bump it when a song's public
+-- state changes (songs are resolved live into every mixtape response).
+CREATE TABLE IF NOT EXISTS MixtapeState (
+    Id INTEGER PRIMARY KEY CHECK (Id = 1),
+    Epoch INTEGER NOT NULL DEFAULT 0
+);
+
+INSERT OR IGNORE INTO MixtapeState (Id, Epoch) VALUES (1, 0);
+
+CREATE TRIGGER IF NOT EXISTS trg_mixtape_epoch_smol_public
+AFTER UPDATE OF Public ON Smols
+WHEN OLD.Public IS NOT NEW.Public
+BEGIN
+    UPDATE MixtapeState SET Epoch = Epoch + 1 WHERE Id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_mixtape_epoch_smol_delete
+AFTER DELETE ON Smols
+BEGIN
+    UPDATE MixtapeState SET Epoch = Epoch + 1 WHERE Id = 1;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_mixtape_epoch_smol_insert
+AFTER INSERT ON Smols
+WHEN NEW.Public = 1 AND EXISTS (
+    SELECT 1 FROM Mixtapes WHERE instr(',' || replace(Smols, ' ', '') || ',', ',' || NEW.Id || ',') > 0
+)
+BEGIN
+    UPDATE MixtapeState SET Epoch = Epoch + 1 WHERE Id = 1;
+END;

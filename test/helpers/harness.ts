@@ -735,9 +735,12 @@ export async function createAuthToken(sub: string, secret: string, usr = 'tester
  * Minimal Cloudflare D1 binding backed by a real `node:sqlite` database so route SQL
  * (RETURNING, datetime('now'), ?NNN params, CHECK constraints, batches) executes for real.
  * `batch()` is atomic (BEGIN/COMMIT, ROLLBACK on error) like D1.
+ * `hooks.onStatement` runs (and is awaited) before every statement — before the whole batch
+ * for `batch()` — so tests can inject concurrent writes, barriers, delays or failures.
  */
 export function createSqliteD1(db: DatabaseSync) {
 	const stats = { statements: [] as string[] }
+	const hooks: { onStatement?: (sql: string, args: unknown[]) => void | Promise<void> } = {}
 	const normalize = (args: unknown[]) => args.map((value) => {
 		if (value === undefined) return null
 		if (typeof value === 'boolean') return value ? 1 : 0
@@ -763,6 +766,7 @@ export function createSqliteD1(db: DatabaseSync) {
 		}
 
 		async first<T>(column?: string): Promise<T | null> {
+			await hooks.onStatement?.(this.sql, this.args)
 			stats.statements.push(this.sql)
 			const row = plain<Record<string, unknown>>(db.prepare(this.sql).get(...normalize(this.args)))
 			if (!row) return null
@@ -770,12 +774,14 @@ export function createSqliteD1(db: DatabaseSync) {
 		}
 
 		async all<T>() {
+			await hooks.onStatement?.(this.sql, this.args)
 			stats.statements.push(this.sql)
 			const rows = db.prepare(this.sql).all(...normalize(this.args)).map((row) => plain<T>(row) as T)
 			return { success: true, results: rows, meta: {} }
 		}
 
 		async run() {
+			await hooks.onStatement?.(this.sql, this.args)
 			return this.runSync()
 		}
 	}
@@ -785,6 +791,7 @@ export function createSqliteD1(db: DatabaseSync) {
 			return new Statement(sql)
 		},
 		async batch(statements: Statement[]) {
+			for (const statement of statements) await hooks.onStatement?.(statement.sql, statement.args)
 			db.exec('BEGIN')
 			try {
 				const out = statements.map((statement) => statement.runSync())
@@ -801,5 +808,5 @@ export function createSqliteD1(db: DatabaseSync) {
 		},
 	}
 
-	return { d1: d1 as unknown as D1Database, stats }
+	return { d1: d1 as unknown as D1Database, stats, hooks }
 }

@@ -1,15 +1,16 @@
-import { Hono, type Context } from 'hono'
+import { Hono, type Context, type Next } from 'hono'
 import { HTTPException } from 'hono/http-exception'
 import { cache } from 'hono/cache'
 import type { HonoEnv, SmolKVData } from '../types'
 import { parseAuth } from '../middleware/auth'
 import { purgeMixtapeCache } from '../utils/cache'
 import {
-	applySemanticDuplicates,
+	borderlineTrigger,
 	classifyOwnerMixtapes,
 	dedupeOrdered,
 	findBorderlinePair,
 	normalizeMixtapeText,
+	pairFingerprint,
 	strongerOf,
 	type MixtapeCandidate,
 	type MixtapeDecision,
@@ -24,10 +25,15 @@ const MAX_MIXTAPE_SMOLS = 100
 const MAX_PUBLIC_LIST = 100
 const D1_IN_CHUNK_SIZE = 90
 const IDEMPOTENT_RETRY_WINDOW = '-15 minutes'
-const MAX_MERGE_HOPS = 10
+const MAX_COHORT_ATTEMPTS = 3
 const DRAFT_ID = '__draft__'
 
-const PUBLIC_CACHE_CONTROL = 'public, max-age=60, stale-while-revalidate=120'
+// v2 namespace: entries written by the pre-lifecycle worker (unfiltered, URL-keyed) are never read.
+const PUBLIC_CACHE_NAME = 'smol-workflow-mixtapes-v2'
+// Browsers always revalidate; only the edge keeps a copy (purged by tag, keyed by epoch).
+const PUBLIC_CACHE_CONTROL = 'public, max-age=0, s-maxage=60, stale-while-revalidate=120'
+const EPOCH_PARAM = '__mx_epoch'
+const BUMP_EPOCH_SQL = 'UPDATE MixtapeState SET Epoch = Epoch + 1 WHERE Id = 1'
 const PRIVATE_HEADERS = {
 	'Cache-Control': 'private, no-store',
 	'CDN-Cache-Control': 'no-store',
@@ -61,15 +67,21 @@ interface MixtapeSmolRow {
 	Public: number
 }
 
-/** Compact persisted clef-flash receipt (`Mixtapes.Ai_Verdict`). `pair`/`revs` are aligned and sorted by Id. */
+/**
+ * Compact persisted clef-flash receipt (`Mixtapes.Ai_Verdict`). `pair`/`revs` are aligned and
+ * sorted by Id; `fp` is the SHA-256 input fingerprint (resolved public tracks + normalized text).
+ * Duplicate receipts live on the hidden row, and only when the disposition was actually applied.
+ */
 interface AiVerdictReceipt {
 	v: 1
 	pv: number
 	model: string
 	pair: [string, string]
 	revs: [number, number]
+	fp: string
 	p?: number
 	dup?: boolean
+	applied?: boolean
 	rel?: string | null
 	keep?: string | null
 	hidden?: string | null
@@ -213,8 +225,57 @@ async function loadOwnerRows(env: Env, address: string): Promise<MixtapeRow[]> {
 	return results
 }
 
+function newMixtapeId(): string {
+	const bytes = new Uint8Array(8)
+	crypto.getRandomValues(bytes)
+	return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+/** Same-owner identical live mixtapes created within the retry window, oldest INSERT first. */
+async function findIdenticalRecent(env: Env, address: string, smols: string, title: string, desc: string): Promise<MixtapeRow | undefined> {
+	const { results } = await env.SMOL_D1.prepare(`
+		${MIXTAPE_SELECT}
+		WHERE "Address" = ?1 AND Smols = ?2 AND Deleted_At IS NULL
+			AND Created_At >= datetime('now', '${IDEMPOTENT_RETRY_WINDOW}')
+		ORDER BY rowid ASC
+	`).bind(address, smols).all<MixtapeRow>()
+	return results.find((row) => normalizeMixtapeText(row.Title) === normalizeMixtapeText(title)
+		&& normalizeMixtapeText(row.Desc) === normalizeMixtapeText(desc))
+}
+
 // ---------------------------------------------------------------------------
-// Derivation (Tier 1 + persisted Tier 2 overlay). Pure given rows + public songs.
+// Public cache: epoch-versioned keys
+// ---------------------------------------------------------------------------
+
+/**
+ * Edge cache key = canonical URL + the committed `MixtapeState.Epoch`. The epoch is read
+ * BEFORE the handler queries D1, so a slow in-flight GET can only ever fill the key of the
+ * epoch it started under; any later mutation (or song privacy flip, via trigger) moves every
+ * reader to a fresh key. Client-supplied epoch params are stripped.
+ */
+async function publicCacheKey(c: Context<HonoEnv>): Promise<string> {
+	const url = new URL(c.req.url)
+	url.searchParams.delete(EPOCH_PARAM)
+	url.searchParams.sort()
+	const state = await c.env.SMOL_D1.prepare('SELECT Epoch FROM MixtapeState WHERE Id = 1').first<{ Epoch: number }>()
+	url.searchParams.set(EPOCH_PARAM, String(state?.Epoch ?? 0))
+	return url.toString()
+}
+
+const publicCache = () => cache({
+	cacheName: PUBLIC_CACHE_NAME,
+	cacheControl: PUBLIC_CACHE_CONTROL,
+	keyGenerator: publicCacheKey,
+})
+
+/** Private, never-shared cache policy on EVERY response (incl. 400/401/403 thrown before handlers). */
+async function privateNoStore(c: Context<HonoEnv>, next: Next) {
+	await next()
+	for (const [name, value] of Object.entries(PRIVATE_HEADERS)) c.res.headers.set(name, value)
+}
+
+// ---------------------------------------------------------------------------
+// Derivation (Tier 1 + validated persisted Tier 2 verdicts). Zero inference.
 // ---------------------------------------------------------------------------
 
 function toCandidate(row: MixtapeRow, publicSmols: ReadonlyMap<string, unknown>): MixtapeCandidate {
@@ -244,29 +305,54 @@ function pairKey(a: string, b: string): [string, string] {
 	return a < b ? [a, b] : [b, a]
 }
 
-/** A receipt is only trusted while both mixtapes are still at the revisions it judged. */
-function receiptIsCurrent(receipt: AiVerdictReceipt, revisions: ReadonlyMap<string, number>): boolean {
-	return !receipt.fallback
-		&& typeof receipt.p === 'number'
-		&& receipt.pv === MIXTAPE_DEDUPE_PROMPT_VERSION
-		&& revisions.get(receipt.pair[0]) === receipt.revs[0]
-		&& revisions.get(receipt.pair[1]) === receipt.revs[1]
+function receiptRevisionsCurrent(receipt: AiVerdictReceipt, revisions: ReadonlyMap<string, number>): boolean {
+	return revisions.get(receipt.pair[0]) === receipt.revs[0] && revisions.get(receipt.pair[1]) === receipt.revs[1]
 }
 
-function deriveDecisions(rows: MixtapeRow[], publicSmols: ReadonlyMap<string, unknown>) {
-	const candidates = rows.map((row) => toCandidate(row, publicSmols))
-	const decisions = classifyOwnerMixtapes(candidates)
+/**
+ * Duplicate verdicts that are still trustworthy: same prompt version, both mixtapes at the
+ * judged revisions, the pair STILL in the borderline band, and the SHA-256 fingerprint of the
+ * resolved public inputs unchanged (a song flipping private invalidates it immediately).
+ */
+async function collectVerdicts(
+	rows: MixtapeRow[],
+	candidates: MixtapeCandidate[],
+	receiptOf: (row: MixtapeRow) => AiVerdictReceipt | null,
+): Promise<SemanticDuplicateVerdict[]> {
+	const byId = new Map(candidates.map((candidate) => [candidate.id, candidate]))
 	const revisions = new Map(rows.map((row) => [row.Id, row.Revision]))
 	const verdicts: SemanticDuplicateVerdict[] = []
 	for (const row of rows) {
-		const receipt = parseReceipt(row.Ai_Verdict)
-		if (receipt?.dup && receipt.hidden === row.Id && receipt.keep && receiptIsCurrent(receipt, revisions)) {
-			verdicts.push({ hiddenId: row.Id, keeperId: receipt.keep, pDuplicate: receipt.p! })
-		}
+		const receipt = receiptOf(row)
+		if (!receipt?.dup || receipt.hidden !== row.Id || !receipt.keep || receipt.fallback || typeof receipt.p !== 'number') continue
+		if (receipt.pv !== MIXTAPE_DEDUPE_PROMPT_VERSION || !receiptRevisionsCurrent(receipt, revisions)) continue
+		const hidden = byId.get(receipt.hidden)
+		const keeper = byId.get(receipt.keep)
+		if (!hidden || !keeper || !borderlineTrigger(hidden, keeper)) continue
+		if (receipt.fp !== await pairFingerprint(hidden, keeper)) continue
+		verdicts.push({ hiddenId: hidden.id, keeperId: keeper.id, pDuplicate: receipt.p })
 	}
-	applySemanticDuplicates(candidates, decisions, verdicts)
-	return { candidates, decisions, revisions }
+	return verdicts
 }
+
+async function deriveDecisions(rows: MixtapeRow[], publicSmols: ReadonlyMap<string, unknown>) {
+	const candidates = rows.map((row) => toCandidate(row, publicSmols))
+	const verdicts = await collectVerdicts(rows, candidates, (row) => parseReceipt(row.Ai_Verdict))
+	return { candidates, decisions: classifyOwnerMixtapes(candidates, verdicts) }
+}
+
+/** `id:revision` of every live cohort row, sorted by Id (binary order, same as SQLite's). */
+function cohortVersion(rows: MixtapeRow[]): string {
+	return rows.map((row) => `${row.Id}:${row.Revision}`).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).join(',')
+}
+
+const COHORT_VERSION_SQL = `(
+	SELECT group_concat(v, ',') FROM (
+		SELECT Id || ':' || Revision AS v FROM Mixtapes
+		WHERE "Address" = ?7 AND Deleted_At IS NULL AND Visibility != 'deleted'
+		ORDER BY Id
+	)
+)`
 
 // ---------------------------------------------------------------------------
 // Write-time cohort re-evaluation (Tier 1 + optional top-1 borderline Tier 2)
@@ -279,86 +365,117 @@ interface CohortResult {
 	changedIds: string[]
 }
 
+/**
+ * Re-derive and persist the owner's whole cohort. Every derived UPDATE is guarded by the
+ * exact cohort version (all live `Id:Revision` pairs) it was computed from, inside one D1
+ * batch, so a slow AI call can never overwrite a newer edit's decision: if anything changed
+ * meanwhile, nothing is written and the cohort is re-read and re-derived (no new inference;
+ * the fresh receipt is reused only while its revisions and fingerprint still hold).
+ */
 async function reevaluateOwnerCohort(
 	env: Env,
 	address: string,
 	options: { subjectId?: string; allowAi: boolean },
 ): Promise<CohortResult> {
-	const rows = await loadOwnerRows(env, address)
-	const publicSmols = await loadPublicSmolRows(env, rows.flatMap((row) => parseStoredSmolIds(row.Smols)))
-	const { candidates, decisions, revisions } = deriveDecisions(rows, publicSmols)
-	const newReceipts = new Map<string, AiVerdictReceipt>()
+	let fresh: { hostId: string; receipt: AiVerdictReceipt } | null = null
+	let result: CohortResult | null = null
 
-	const subjectId = options.subjectId
-	if (options.allowAi && subjectId && decisions.get(subjectId)?.visibility === 'public') {
-		const pair = findBorderlinePair(candidates, decisions, subjectId)
-		if (pair) {
-			const ids = pairKey(pair.a.id, pair.b.id)
-			// Every AI-eligible write bumps the subject's Revision, so prior receipts for this
-			// pair are never current here: always adjudicate fresh (one call, fail-open).
-			const revs: [number, number] = [revisions.get(ids[0]) ?? 1, revisions.get(ids[1]) ?? 1]
-			const titles = new Map([...publicSmols.values()].map((smol) => [smol.Id, smol.Title]))
-			const result = await adjudicateMixtapePair(env, pair.a, pair.b, titles)
-			const base = { v: 1 as const, pv: MIXTAPE_DEDUPE_PROMPT_VERSION, pair: ids, revs, at: new Date().toISOString() }
-			if (result.ok) {
-				const keeper = strongerOf(pair.a, pair.b)
-				const hidden = keeper.id === pair.a.id ? pair.b : pair.a
-				const receipt: AiVerdictReceipt = {
-					...base,
-					model: result.verdict.model,
-					p: Math.round(result.verdict.pDuplicate * 10_000) / 10_000,
-					dup: result.verdict.isDuplicate,
-					rel: result.verdict.relation,
-					keep: result.verdict.isDuplicate ? keeper.id : null,
-					hidden: result.verdict.isDuplicate ? hidden.id : null,
-					ms: result.verdict.latencyMs,
+	for (let attempt = 0; attempt < MAX_COHORT_ATTEMPTS; attempt += 1) {
+		const rows = await loadOwnerRows(env, address)
+		const publicSmols = await loadPublicSmolRows(env, rows.flatMap((row) => parseStoredSmolIds(row.Smols)))
+		const candidates = rows.map((row) => toCandidate(row, publicSmols))
+		const revisions = new Map(rows.map((row) => [row.Id, row.Revision]))
+		const freshCurrent = fresh !== null && receiptRevisionsCurrent(fresh.receipt, revisions)
+		const receiptOf = (row: MixtapeRow) => (freshCurrent && fresh?.hostId === row.Id ? fresh.receipt : parseReceipt(row.Ai_Verdict))
+		const verdicts = await collectVerdicts(rows, candidates, receiptOf)
+		let decisions = classifyOwnerMixtapes(candidates, verdicts)
+
+		const subjectId = options.subjectId
+		if (attempt === 0 && options.allowAi && subjectId && decisions.get(subjectId)?.visibility === 'public') {
+			const pair = findBorderlinePair(candidates, decisions, subjectId)
+			if (pair) {
+				const ids = pairKey(pair.a.id, pair.b.id)
+				const base = {
+					v: 1 as const,
+					pv: MIXTAPE_DEDUPE_PROMPT_VERSION,
+					pair: ids,
+					revs: [revisions.get(ids[0])!, revisions.get(ids[1])!] as [number, number],
+					fp: await pairFingerprint(pair.a, pair.b),
+					at: new Date().toISOString(),
 				}
-				if (result.verdict.isDuplicate) {
-					applySemanticDuplicates(candidates, decisions, [{ hiddenId: hidden.id, keeperId: keeper.id, pDuplicate: result.verdict.pDuplicate }])
-					newReceipts.set(hidden.id, receipt)
-				} else {
-					newReceipts.set(subjectId, receipt)
+				const titles = new Map([...publicSmols.values()].map((smol) => [smol.Id, smol.Title]))
+				const verdict = await adjudicateMixtapePair(env, pair.a, pair.b, titles)
+				if (verdict.ok) {
+					const keeper = strongerOf(pair.a, pair.b)
+					const hidden = keeper.id === pair.a.id ? pair.b : pair.a
+					const receipt: AiVerdictReceipt = {
+						...base,
+						model: verdict.verdict.model,
+						p: Math.round(verdict.verdict.pDuplicate * 10_000) / 10_000,
+						dup: verdict.verdict.isDuplicate,
+						rel: verdict.verdict.relation,
+						keep: null,
+						hidden: null,
+						ms: verdict.verdict.latencyMs,
+					}
+					fresh = { hostId: subjectId, receipt }
+					if (verdict.verdict.isDuplicate) {
+						const trial = classifyOwnerMixtapes(candidates, [...verdicts, { hiddenId: hidden.id, keeperId: keeper.id, pDuplicate: receipt.p! }])
+						const applied = trial.get(hidden.id)?.hiddenReason === 'semantic_duplicate' && trial.get(hidden.id)?.relatedId === keeper.id
+						receipt.applied = applied
+						if (applied) {
+							receipt.keep = keeper.id
+							receipt.hidden = hidden.id
+							fresh = { hostId: hidden.id, receipt }
+							decisions = trial
+						}
+					}
+				} else if (verdict.reason !== 'disabled') {
+					fresh = { hostId: subjectId, receipt: { ...base, model: MIXTAPE_DEDUPE_MODEL_SELECTOR, fallback: verdict.reason, ms: verdict.latencyMs } }
 				}
-			} else if (result.reason !== 'disabled') {
-				newReceipts.set(subjectId, { ...base, model: MIXTAPE_DEDUPE_MODEL_SELECTOR, fallback: result.reason, ms: result.latencyMs })
 			}
 		}
-	}
 
-	const statements: D1PreparedStatement[] = []
-	const changedIds: string[] = []
-	for (const row of rows) {
-		const decision = decisions.get(row.Id)!
-		const receipt = newReceipts.get(row.Id)
-		const aiVerdict = receipt ? JSON.stringify(receipt) : row.Ai_Verdict
-		const changed = row.Visibility !== decision.visibility
-			|| row.Hidden_Reason !== decision.hiddenReason
-			|| row.Related_Mixtape_Id !== decision.relatedId
-			|| row.Uniqueness_Score !== decision.uniquenessScore
-			|| row.Ai_Verdict !== aiVerdict
-		if (!changed) continue
-		changedIds.push(row.Id)
-		statements.push(env.SMOL_D1.prepare(`
-			UPDATE Mixtapes
-			SET Visibility = ?1, Hidden_Reason = ?2, Related_Mixtape_Id = ?3, Uniqueness_Score = ?4, Ai_Verdict = ?5
-			WHERE Id = ?6 AND Deleted_At IS NULL
-		`).bind(decision.visibility, decision.hiddenReason, decision.relatedId, decision.uniquenessScore, aiVerdict, row.Id))
-		Object.assign(row, {
-			Visibility: decision.visibility,
-			Hidden_Reason: decision.hiddenReason,
-			Related_Mixtape_Id: decision.relatedId,
-			Uniqueness_Score: decision.uniquenessScore,
-			Ai_Verdict: aiVerdict,
+		const persistFresh = fresh !== null && receiptRevisionsCurrent(fresh.receipt, revisions)
+		const version = cohortVersion(rows)
+		const statements: D1PreparedStatement[] = []
+		const changedIds: string[] = []
+		const nextRows = rows.map((row) => {
+			const decision = decisions.get(row.Id)!
+			const aiVerdict = persistFresh && fresh?.hostId === row.Id ? JSON.stringify(fresh.receipt) : row.Ai_Verdict
+			const changed = row.Visibility !== decision.visibility
+				|| row.Hidden_Reason !== decision.hiddenReason
+				|| row.Related_Mixtape_Id !== decision.relatedId
+				|| row.Uniqueness_Score !== decision.uniquenessScore
+				|| row.Ai_Verdict !== aiVerdict
+			if (!changed) return row
+			changedIds.push(row.Id)
+			statements.push(env.SMOL_D1.prepare(`
+				UPDATE Mixtapes
+				SET Visibility = ?1, Hidden_Reason = ?2, Related_Mixtape_Id = ?3, Uniqueness_Score = ?4, Ai_Verdict = ?5
+				WHERE Id = ?6 AND "Address" = ?7 AND Revision = ?8 AND Deleted_At IS NULL
+					AND ${COHORT_VERSION_SQL} = ?9
+			`).bind(decision.visibility, decision.hiddenReason, decision.relatedId, decision.uniquenessScore, aiVerdict, row.Id, address, row.Revision, version))
+			return {
+				...row,
+				Visibility: decision.visibility,
+				Hidden_Reason: decision.hiddenReason,
+				Related_Mixtape_Id: decision.relatedId,
+				Uniqueness_Score: decision.uniquenessScore,
+				Ai_Verdict: aiVerdict,
+			}
 		})
+
+		result = { rows: nextRows, decisions, publicSmols, changedIds }
+		if (!statements.length) return result
+		const outcomes = await env.SMOL_D1.batch([...statements, env.SMOL_D1.prepare(BUMP_EPOCH_SQL)])
+		if (outcomes.slice(0, statements.length).every((outcome) => outcome.meta?.changes === 1)) return result
+		console.warn('mixtape_cohort_stale_retry', { address, attempt })
 	}
-	if (statements.length) await env.SMOL_D1.batch(statements)
 
-	return { rows, decisions, publicSmols, changedIds }
+	// Still contended: nothing stale was written; reads re-derive dynamically anyway.
+	return result!
 }
-
-// ---------------------------------------------------------------------------
-// Response shapes
-// ---------------------------------------------------------------------------
 
 function ownerView(row: MixtapeRow, decision: MixtapeDecision | undefined, publicSmols: ReadonlyMap<string, unknown>) {
 	const stored = parseStoredSmolIds(row.Smols)
@@ -404,14 +521,6 @@ function cohortView(cohort: CohortResult, id: string) {
 	return { row, decision, view: ownerView(row, decision, cohort.publicSmols) }
 }
 
-function privateJson(c: Context<HonoEnv>, body: unknown, status: 200 | 201 | 404 | 409 = 200) {
-	return c.json(body, status, { ...PRIVATE_HEADERS })
-}
-
-function purge(c: Context<HonoEnv>, ids: Iterable<string>) {
-	c.executionCtx.waitUntil(purgeMixtapeCache([...new Set(ids)]))
-}
-
 /** Load a live mixtape for an owner mutation: 404 when missing/deleted, 403 when not the owner. */
 async function loadOwnedLiveRow(env: Env, id: string, sub: string): Promise<MixtapeRow> {
 	const row = await loadMixtapeRow(env, id)
@@ -424,10 +533,31 @@ async function loadOwnedLiveRow(env: Env, id: string, sub: string): Promise<Mixt
 	return row
 }
 
+function privateJson(c: Context<HonoEnv>, body: unknown, status: 200 | 201 | 404 | 409 = 200) {
+	return c.json(body, status, { ...PRIVATE_HEADERS })
+}
+
+function purge(c: Context<HonoEnv>, ids: Iterable<string>) {
+	c.executionCtx.waitUntil(purgeMixtapeCache([...new Set(ids)]))
+}
+
+/**
+ * Run the post-commit cohort re-evaluation and ALWAYS purge afterwards — even when the
+ * re-evaluation throws — because the mutation itself is already committed.
+ */
+async function afterCommit<T>(c: Context<HonoEnv>, ids: string[], work: (purgeIds: Set<string>) => Promise<T>): Promise<T> {
+	const purgeIds = new Set(ids)
+	try {
+		return await work(purgeIds)
+	} finally {
+		purge(c, purgeIds)
+	}
+}
+
 async function revisionConflict(c: Context<HonoEnv>, id: string, address: string) {
 	const rows = await loadOwnerRows(c.env, address)
 	const publicSmols = await loadPublicSmolRows(c.env, rows.flatMap((row) => parseStoredSmolIds(row.Smols)))
-	const { decisions } = deriveDecisions(rows, publicSmols)
+	const { decisions } = await deriveDecisions(rows, publicSmols)
 	const current = rows.find((row) => row.Id === id)
 	return privateJson(c, {
 		error: 'This mixtape was changed somewhere else. Review the latest version and try again.',
@@ -440,51 +570,48 @@ async function revisionConflict(c: Context<HonoEnv>, id: string, address: string
 // Routes — literal paths are registered BEFORE /:id
 // ---------------------------------------------------------------------------
 
+// Owner surfaces never enter a shared cache, whatever the status (auth/validation errors included).
+mixtapes.use('/mine', privateNoStore)
+mixtapes.use('*', async (c, next) => (c.req.method === 'GET' || c.req.method === 'HEAD' ? next() : privateNoStore(c, next)))
+
 // Public listing: only non-deleted, Tier-1-public mixtapes, re-derived from live Smols.Public on
 // every (cache-miss) request so legacy/unclassified rows or songs made private never leak.
-mixtapes.get(
-	'/',
-	cache({
-		cacheName: 'smol-workflow',
-		cacheControl: PUBLIC_CACHE_CONTROL,
-	}),
-	async (c) => {
-		const { env } = c
+mixtapes.get('/', publicCache(), async (c) => {
+	const { env } = c
 
-		const { results } = await env.SMOL_D1.prepare(`
-			${MIXTAPE_SELECT}
-			WHERE Deleted_At IS NULL AND Visibility != 'deleted'
-			ORDER BY Created_At DESC, Id DESC
-		`).all<MixtapeRow>()
+	const { results } = await env.SMOL_D1.prepare(`
+		${MIXTAPE_SELECT}
+		WHERE Deleted_At IS NULL AND Visibility != 'deleted'
+		ORDER BY Created_At DESC, Id DESC
+	`).all<MixtapeRow>()
 
-		const publicSmols = await loadPublicSmolRows(env, results.flatMap((row) => parseStoredSmolIds(row.Smols)))
-		const { decisions } = deriveDecisions(results, publicSmols)
+	const publicSmols = await loadPublicSmolRows(env, results.flatMap((row) => parseStoredSmolIds(row.Smols)))
+	const { decisions } = await deriveDecisions(results, publicSmols)
 
-		const list = results
-			.filter((row) => decisions.get(row.Id)?.visibility === 'public')
-			.slice(0, MAX_PUBLIC_LIST)
-			.map((row) => ({
-				Id: row.Id,
-				Title: row.Title,
-				Desc: row.Desc ?? '',
-				Smols: parseStoredSmolIds(row.Smols).filter((id) => publicSmols.has(id)),
-				Address: row.Address,
-				Created_At: row.Created_At,
-				Updated_At: row.Updated_At ?? row.Created_At,
-			}))
+	const list = results
+		.filter((row) => decisions.get(row.Id)?.visibility === 'public')
+		.slice(0, MAX_PUBLIC_LIST)
+		.map((row) => ({
+			Id: row.Id,
+			Title: row.Title,
+			Desc: row.Desc ?? '',
+			Smols: parseStoredSmolIds(row.Smols).filter((id) => publicSmols.has(id)),
+			Address: row.Address,
+			Created_At: row.Created_At,
+			Updated_At: row.Updated_At ?? row.Created_At,
+		}))
 
-		const response = c.json(list)
-		response.headers.append('Cache-Tag', 'mixtapes')
-		return response
-	}
-)
+	const response = c.json(list)
+	response.headers.append('Cache-Tag', 'mixtapes')
+	return response
+})
 
 // Owner listing: every non-deleted mixtape of the caller, including hidden ones, with coaching.
 mixtapes.get('/mine', parseAuth, async (c) => {
 	const sub = requireOwnerSub(c)
 	const rows = await loadOwnerRows(c.env, sub)
 	const publicSmols = await loadPublicSmolRows(c.env, rows.flatMap((row) => parseStoredSmolIds(row.Smols)))
-	const { decisions } = deriveDecisions(rows, publicSmols)
+	const { decisions } = await deriveDecisions(rows, publicSmols)
 	return privateJson(c, rows.map((row) => ownerView(row, decisions.get(row.Id), publicSmols)))
 })
 
@@ -498,9 +625,8 @@ mixtapes.post('/check-uniqueness', parseAuth, async (c) => {
 	const existing = editId ? rows.find((row) => row.Id === editId) : undefined
 	if (editId && !existing) {
 		const row = await loadMixtapeRow(c.env, editId)
-		throw new HTTPException(row && !row.Deleted_At && row.Address !== sub ? 403 : 404, {
-			message: row && !row.Deleted_At && row.Address !== sub ? 'Only the mixtape owner can check it' : 'Mixtape not found',
-		})
+		const foreign = Boolean(row && !row.Deleted_At && row.Address !== sub)
+		throw new HTTPException(foreign ? 403 : 404, { message: foreign ? 'Only the mixtape owner can check it' : 'Mixtape not found' })
 	}
 
 	// Live coaching preview: the draft may not have a title yet.
@@ -535,8 +661,8 @@ mixtapes.post('/check-uniqueness', parseAuth, async (c) => {
 	const hypothetical = [...rows.filter((row) => row.Id !== draftId), draft]
 
 	const publicSmols = await loadPublicSmolRows(c.env, hypothetical.flatMap((row) => parseStoredSmolIds(row.Smols)))
-	const before = deriveDecisions(rows, publicSmols).decisions
-	const { candidates, decisions } = deriveDecisions(hypothetical, publicSmols)
+	const before = (await deriveDecisions(rows, publicSmols)).decisions
+	const { candidates, decisions } = await deriveDecisions(hypothetical, publicSmols)
 	const decision = decisions.get(draftId)!
 	const titleOf = (id: string | null) => (id ? hypothetical.find((row) => row.Id === id)?.Title ?? null : null)
 	const borderline = decision.visibility === 'public' ? findBorderlinePair(candidates, decisions, draftId) : null
@@ -566,6 +692,26 @@ mixtapes.post('/check-uniqueness', parseAuth, async (c) => {
 	})
 })
 
+async function dedupedResponse(c: Context<HonoEnv>, sub: string, winner: MixtapeRow) {
+	const rows = await loadOwnerRows(c.env, sub)
+	const publicSmols = await loadPublicSmolRows(c.env, rows.flatMap((row) => parseStoredSmolIds(row.Smols)))
+	const { decisions } = await deriveDecisions(rows, publicSmols)
+	const current = rows.find((row) => row.Id === winner.Id) ?? winner
+	return privateJson(c, { ...writeReceipt(current, decisions.get(winner.Id) ?? fallbackDecision(current)), deduplicated: true })
+}
+
+function fallbackDecision(row: MixtapeRow): MixtapeDecision {
+	return {
+		id: row.Id,
+		visibility: row.Visibility === 'owner' ? 'owner' : 'public',
+		hiddenReason: null,
+		relatedId: null,
+		relatedTitle: null,
+		uniquenessScore: row.Uniqueness_Score,
+		advice: null,
+	}
+}
+
 // Create new mixtape
 mixtapes.post('/', parseAuth, async (c) => {
 	const { env } = c
@@ -582,120 +728,122 @@ mixtapes.post('/', parseAuth, async (c) => {
 	const smolsString = smolIds.join(',')
 
 	// Idempotent exact retry (double-tap / flaky network) within 15 minutes → return the original.
-	const { results: recent } = await env.SMOL_D1.prepare(`
-		${MIXTAPE_SELECT}
-		WHERE "Address" = ?1 AND Smols = ?2 AND Deleted_At IS NULL
-			AND Created_At >= datetime('now', '${IDEMPOTENT_RETRY_WINDOW}')
-		ORDER BY Created_At ASC, Id ASC
-	`).bind(sub, smolsString).all<MixtapeRow>()
-	const retryOf = recent.find((row) => normalizeMixtapeText(row.Title) === normalizeMixtapeText(title)
-		&& normalizeMixtapeText(row.Desc) === normalizeMixtapeText(desc))
-	if (retryOf) {
-		const rows = await loadOwnerRows(env, sub)
-		const publicSmols = await loadPublicSmolRows(env, rows.flatMap((row) => parseStoredSmolIds(row.Smols)))
-		const { decisions } = deriveDecisions(rows, publicSmols)
-		return privateJson(c, { ...writeReceipt(retryOf, decisions.get(retryOf.Id)!), deduplicated: true })
+	const earlier = await findIdenticalRecent(env, sub, smolsString, title, desc)
+	if (earlier) return await dedupedResponse(c, sub, earlier)
+
+	const id = newMixtapeId()
+	await env.SMOL_D1.batch([
+		env.SMOL_D1.prepare(`
+			INSERT INTO Mixtapes (Id, Title, Desc, Smols, "Address", Updated_At, Visibility, Revision)
+			VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP, 'public', 1)
+		`).bind(id, title, desc, smolsString, sub),
+		env.SMOL_D1.prepare(BUMP_EPOCH_SQL),
+	])
+
+	// Simultaneous identical POSTs both pass the check above. After inserting, the identical row
+	// with the lowest rowid (first INSERT) wins deterministically; later inserts remove themselves.
+	const winner = await findIdenticalRecent(env, sub, smolsString, title, desc)
+	if (winner && winner.Id !== id) {
+		await env.SMOL_D1.batch([
+			env.SMOL_D1.prepare('DELETE FROM Mixtapes WHERE Id = ?1 AND "Address" = ?2 AND Revision = 1').bind(id, sub),
+			env.SMOL_D1.prepare(BUMP_EPOCH_SQL),
+		])
+		return await afterCommit(c, [id], () => dedupedResponse(c, sub, winner))
 	}
 
-	const inserted = await env.SMOL_D1.prepare(`
-		INSERT INTO Mixtapes (Title, Desc, Smols, "Address", Updated_At, Visibility, Revision)
-		VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP, 'public', 1)
-		RETURNING Id
-	`)
-		.bind(title, desc, smolsString, sub)
-		.first<{ Id: string }>()
-	const id = inserted!.Id
-
-	const cohort = await reevaluateOwnerCohort(env, sub, { subjectId: id, allowAi: true })
-	const { row, decision } = cohortView(cohort, id)
-	purge(c, [id, ...cohort.changedIds])
-
-	return privateJson(c, { ...writeReceipt(row, decision), deduplicated: false }, 201)
+	return await afterCommit(c, [id], async (purgeIds) => {
+		const cohort = await reevaluateOwnerCohort(env, sub, { subjectId: id, allowAi: true })
+		cohort.changedIds.forEach((changed) => purgeIds.add(changed))
+		const { row, decision } = cohortView(cohort, id)
+		return privateJson(c, { ...writeReceipt(row, decision), deduplicated: false }, 201)
+	})
 })
 
-// Get single mixtape by ID. Public or owner-hidden rows are playable unlisted links (200).
-mixtapes.get(
-	'/:id',
-	cache({
-		cacheName: 'smol-workflow',
-		cacheControl: PUBLIC_CACHE_CONTROL,
-	}),
-	async (c) => {
-		const { env } = c
-		const id = c.req.param('id')
-
-		const mixtapeRow = await loadMixtapeRow(env, id)
-		if (!mixtapeRow) {
-			return c.json({ error: 'Mixtape not found' }, 404)
-		}
-
-		if (mixtapeRow.Deleted_At || mixtapeRow.Visibility === 'deleted') {
-			if (mixtapeRow.Hidden_Reason === 'merged' && mixtapeRow.Related_Mixtape_Id) {
-				let target = await loadMixtapeRow(env, mixtapeRow.Related_Mixtape_Id)
-				for (let hop = 0; target?.Deleted_At && target.Hidden_Reason === 'merged' && target.Related_Mixtape_Id && hop < MAX_MERGE_HOPS; hop += 1) {
-					target = await loadMixtapeRow(env, target.Related_Mixtape_Id)
-				}
-				if (target && !target.Deleted_At) {
-					return c.json({ error: 'This mixtape was merged into another mixtape', code: 'mixtape_merged', mergedInto: target.Id }, 404)
-				}
-			}
-			return c.json({ error: 'Mixtape not found' }, 404)
-		}
-
-		const cohortRows = await loadOwnerRows(env, mixtapeRow.Address)
-		const publicSmolRows = await loadPublicSmolRows(env, cohortRows.flatMap((row) => parseStoredSmolIds(row.Smols)))
-		const { decisions } = deriveDecisions(cohortRows, publicSmolRows)
-		const decision = decisions.get(id)
-		const smolRows = parseStoredSmolIds(mixtapeRow.Smols)
-			.map((smolId) => publicSmolRows.get(smolId))
-			.filter((row): row is MixtapeSmolRow => Boolean(row))
-
-		// Fetch KV data in bulk (up to 100 keys at once)
-		const publicSmolIds = smolRows.map((row) => row.Id)
-		const kvData = publicSmolIds.length > 0
-			? await env.SMOL_KV.get<SmolKVData>(publicSmolIds, 'json')
-			: new Map<string, SmolKVData | null>()
-
-		const smolsWithKV = smolRows.map((row) => ({
-			Id: row.Id,
-			Title: row.Title,
-			Address: row.Address,
-			Mint_Token: row.Mint_Token,
-			Mint_Amm: row.Mint_Amm,
-			Song_1: row.Song_1,
-			Public: row.Public,
-			Tags: kvData.get(row.Id)?.lyrics?.style || [],
-		}))
-
-		const view = ownerView(mixtapeRow, decision, publicSmolRows)
-		const response = c.json({
-			Id: view.Id,
-			Title: view.Title,
-			Desc: view.Desc,
-			Address: view.Address,
-			Created_At: view.Created_At,
-			Updated_At: view.Updated_At,
-			Smols: smolsWithKV,
-			Visibility: view.Visibility,
-			Hidden_Reason: view.Hidden_Reason,
-			Related_Mixtape_Id: view.Related_Mixtape_Id,
-			Related_Mixtape_Title: view.Related_Mixtape_Title,
-			Uniqueness_Score: view.Uniqueness_Score,
-			Advice: view.Advice,
-			Revision: view.Revision,
-			Stored_Track_Count: view.Stored_Track_Count,
-			Public_Track_Count: view.Public_Track_Count,
-		})
-
-		response.headers.append('Cache-Tag', 'mixtapes')
-		response.headers.append('Cache-Tag', `mixtape:${id}`)
-		if (view.Visibility !== 'public') {
-			response.headers.set('X-Robots-Tag', 'noindex')
-		}
-
-		return response
+/** Terminal live target of a merged mixtape. Cycle-safe, no hop limit (writes flatten aliases). */
+async function resolveMergeTarget(env: Env, row: MixtapeRow): Promise<MixtapeRow | null> {
+	const seen = new Set<string>([row.Id])
+	let current: MixtapeRow | null = row
+	while (current && current.Deleted_At && current.Hidden_Reason === 'merged' && current.Related_Mixtape_Id) {
+		if (seen.has(current.Related_Mixtape_Id)) return null
+		seen.add(current.Related_Mixtape_Id)
+		current = await loadMixtapeRow(env, current.Related_Mixtape_Id)
 	}
-)
+	return current && !current.Deleted_At ? current : null
+}
+
+// Get single mixtape by ID. Public or owner-hidden rows are playable unlisted links (200).
+mixtapes.get('/:id', publicCache(), async (c) => {
+	const { env } = c
+	const id = c.req.param('id')
+
+	const mixtapeRow = await loadMixtapeRow(env, id)
+	if (!mixtapeRow) {
+		return c.json({ error: 'Mixtape not found' }, 404)
+	}
+
+	if (mixtapeRow.Deleted_At || mixtapeRow.Visibility === 'deleted') {
+		if (mixtapeRow.Hidden_Reason === 'merged') {
+			const target = await resolveMergeTarget(env, mixtapeRow)
+			if (target) {
+				return c.json({ error: 'This mixtape was merged into another mixtape', code: 'mixtape_merged', mergedInto: target.Id }, 404)
+			}
+		}
+		return c.json({ error: 'Mixtape not found' }, 404)
+	}
+
+	const cohortRows = await loadOwnerRows(env, mixtapeRow.Address)
+	const publicSmolRows = await loadPublicSmolRows(env, cohortRows.flatMap((row) => parseStoredSmolIds(row.Smols)))
+	const { decisions } = await deriveDecisions(cohortRows, publicSmolRows)
+	const decision = decisions.get(id)
+	const smolRows = parseStoredSmolIds(mixtapeRow.Smols)
+		.map((smolId) => publicSmolRows.get(smolId))
+		.filter((row): row is MixtapeSmolRow => Boolean(row))
+
+	// Fetch KV data in bulk (up to 100 keys at once)
+	const publicSmolIds = smolRows.map((row) => row.Id)
+	const kvData = publicSmolIds.length > 0
+		? await env.SMOL_KV.get<SmolKVData>(publicSmolIds, 'json')
+		: new Map<string, SmolKVData | null>()
+
+	const smolsWithKV = smolRows.map((row) => ({
+		Id: row.Id,
+		Title: row.Title,
+		Address: row.Address,
+		Mint_Token: row.Mint_Token,
+		Mint_Amm: row.Mint_Amm,
+		Song_1: row.Song_1,
+		Public: row.Public,
+		Tags: kvData.get(row.Id)?.lyrics?.style || [],
+	}))
+
+	const view = ownerView(mixtapeRow, decision, publicSmolRows)
+	const response = c.json({
+		Id: view.Id,
+		Title: view.Title,
+		Desc: view.Desc,
+		Address: view.Address,
+		Created_At: view.Created_At,
+		Updated_At: view.Updated_At,
+		Smols: smolsWithKV,
+		Visibility: view.Visibility,
+		Hidden_Reason: view.Hidden_Reason,
+		Related_Mixtape_Id: view.Related_Mixtape_Id,
+		Related_Mixtape_Title: view.Related_Mixtape_Title,
+		Uniqueness_Score: view.Uniqueness_Score,
+		Advice: view.Advice,
+		Revision: view.Revision,
+		Stored_Track_Count: view.Stored_Track_Count,
+		Public_Track_Count: view.Public_Track_Count,
+	})
+
+	response.headers.append('Cache-Tag', 'mixtapes')
+	response.headers.append('Cache-Tag', `mixtape:${id}`)
+	if (view.Visibility !== 'public') {
+		response.headers.set('X-Robots-Tag', 'noindex')
+	}
+
+	return response
+})
 
 // Edit (PUT = full replace of title/desc/smols; PATCH = any subset). Owner-only.
 async function updateMixtape(c: Context<HonoEnv>, mode: 'put' | 'patch') {
@@ -726,21 +874,24 @@ async function updateMixtape(c: Context<HonoEnv>, mode: 'put' | 'patch') {
 		smols = smolIds.join(',')
 	}
 
-	const updated = await env.SMOL_D1.prepare(`
-		UPDATE Mixtapes
-		SET Title = ?1, Desc = ?2, Smols = ?3, Revision = Revision + 1, Updated_At = CURRENT_TIMESTAMP
-		WHERE Id = ?4 AND "Address" = ?5 AND Deleted_At IS NULL AND Revision = ?6
-		RETURNING Id
-	`).bind(title, desc, smols, id, sub, row.Revision).first<{ Id: string }>()
-	if (!updated) {
+	const [updated] = await env.SMOL_D1.batch([
+		env.SMOL_D1.prepare(`
+			UPDATE Mixtapes
+			SET Title = ?1, Desc = ?2, Smols = ?3, Revision = Revision + 1, Updated_At = CURRENT_TIMESTAMP
+			WHERE Id = ?4 AND "Address" = ?5 AND Deleted_At IS NULL AND Revision = ?6
+		`).bind(title, desc, smols, id, sub, row.Revision),
+		env.SMOL_D1.prepare(BUMP_EPOCH_SQL),
+	])
+	if (updated?.meta?.changes !== 1) {
 		return await revisionConflict(c, id, sub)
 	}
 
-	const cohort = await reevaluateOwnerCohort(env, sub, { subjectId: id, allowAi: true })
-	const result = cohortView(cohort, id)
-	purge(c, [id, ...cohort.changedIds])
-
-	return privateJson(c, { ...writeReceipt(result.row, result.decision), mixtape: result.view })
+	return await afterCommit(c, [id], async (purgeIds) => {
+		const cohort = await reevaluateOwnerCohort(env, sub, { subjectId: id, allowAi: true })
+		cohort.changedIds.forEach((changed) => purgeIds.add(changed))
+		const result = cohortView(cohort, id)
+		return privateJson(c, { ...writeReceipt(result.row, result.decision), mixtape: result.view })
+	})
 }
 
 mixtapes.put('/:id', parseAuth, (c) => updateMixtape(c, 'put'))
@@ -766,17 +917,21 @@ mixtapes.delete('/:id', parseAuth, async (c) => {
 		return privateJson(c, { id, deleted: true, undoable: true })
 	}
 
-	await env.SMOL_D1.prepare(`
-		UPDATE Mixtapes
-		SET Deleted_At = CURRENT_TIMESTAMP, Updated_At = CURRENT_TIMESTAMP, Visibility = 'deleted',
-			Hidden_Reason = 'deleted', Related_Mixtape_Id = NULL, Uniqueness_Score = NULL, Revision = Revision + 1
-		WHERE Id = ?1 AND "Address" = ?2 AND Deleted_At IS NULL
-	`).bind(id, sub).run()
+	await env.SMOL_D1.batch([
+		env.SMOL_D1.prepare(`
+			UPDATE Mixtapes
+			SET Deleted_At = CURRENT_TIMESTAMP, Updated_At = CURRENT_TIMESTAMP, Visibility = 'deleted',
+				Hidden_Reason = 'deleted', Related_Mixtape_Id = NULL, Uniqueness_Score = NULL, Revision = Revision + 1
+			WHERE Id = ?1 AND "Address" = ?2 AND Deleted_At IS NULL
+		`).bind(id, sub),
+		env.SMOL_D1.prepare(BUMP_EPOCH_SQL),
+	])
 
-	const cohort = await reevaluateOwnerCohort(env, sub, { allowAi: false })
-	purge(c, [id, ...cohort.changedIds])
-
-	return privateJson(c, { id, deleted: true, undoable: true })
+	return await afterCommit(c, [id], async (purgeIds) => {
+		const cohort = await reevaluateOwnerCohort(env, sub, { allowAi: false })
+		cohort.changedIds.forEach((changed) => purgeIds.add(changed))
+		return privateJson(c, { id, deleted: true, undoable: true })
+	})
 })
 
 // Undo a soft delete (merged sources cannot be restored; their songs already live in the target).
@@ -797,23 +952,27 @@ mixtapes.post('/:id/restore', parseAuth, async (c) => {
 	}
 
 	if (existing.Deleted_At) {
-		await env.SMOL_D1.prepare(`
-			UPDATE Mixtapes
-			SET Deleted_At = NULL, Updated_At = CURRENT_TIMESTAMP, Visibility = 'public',
-				Hidden_Reason = NULL, Related_Mixtape_Id = NULL, Revision = Revision + 1
-			WHERE Id = ?1 AND "Address" = ?2 AND Deleted_At IS NOT NULL AND Hidden_Reason = 'deleted'
-		`).bind(id, sub).run()
+		await env.SMOL_D1.batch([
+			env.SMOL_D1.prepare(`
+				UPDATE Mixtapes
+				SET Deleted_At = NULL, Updated_At = CURRENT_TIMESTAMP, Visibility = 'public',
+					Hidden_Reason = NULL, Related_Mixtape_Id = NULL, Revision = Revision + 1
+				WHERE Id = ?1 AND "Address" = ?2 AND Deleted_At IS NOT NULL AND Hidden_Reason = 'deleted'
+			`).bind(id, sub),
+			env.SMOL_D1.prepare(BUMP_EPOCH_SQL),
+		])
 	}
 
-	const cohort = await reevaluateOwnerCohort(env, sub, { allowAi: false })
-	const result = cohortView(cohort, id)
-	purge(c, [id, ...cohort.changedIds])
-
-	return privateJson(c, { ...writeReceipt(result.row, result.decision), restored: true, mixtape: result.view })
+	return await afterCommit(c, [id], async (purgeIds) => {
+		const cohort = await reevaluateOwnerCohort(env, sub, { allowAi: false })
+		cohort.changedIds.forEach((changed) => purgeIds.add(changed))
+		const result = cohortView(cohort, id)
+		return privateJson(c, { ...writeReceipt(result.row, result.decision), restored: true, mixtape: result.view })
+	})
 })
 
-// Merge source (:id) into targetId. Owner of BOTH. Appends the source's public songs that the
-// target doesn't have (source order), then soft-deletes the source as 'merged' → target.
+// Merge source (:id) into targetId. Owner of BOTH. Appends the source's songs that the target
+// doesn't have (source order), then soft-deletes the source as 'merged' → target.
 mixtapes.post('/:id/merge', parseAuth, async (c) => {
 	const { env } = c
 	const sub = requireOwnerSub(c)
@@ -837,44 +996,78 @@ mixtapes.post('/:id/merge', parseAuth, async (c) => {
 	const sourceIds = parseStoredSmolIds(source.Smols)
 	const sourcePublic = await loadPublicSmolRows(env, sourceIds)
 	const targetSet = new Set(targetIds)
-	const added = sourceIds.filter((id) => sourcePublic.has(id) && !targetSet.has(id))
+
+	// The source is tombstoned for good, so never silently drop songs it still references.
+	const unavailableCount = sourceIds.filter((id) => !sourcePublic.has(id) && !targetSet.has(id)).length
+	if (unavailableCount > 0) {
+		return privateJson(c, {
+			error: `${unavailableCount} song${unavailableCount === 1 ? ' in this mixtape is' : 's in this mixtape are'} not public right now, so merging would lose ${unavailableCount === 1 ? 'it' : 'them'}. Remove ${unavailableCount === 1 ? 'it' : 'them'} first, or wait until ${unavailableCount === 1 ? 'it is' : 'they are'} public again.`,
+			code: 'merge_unavailable_tracks',
+			unavailableCount,
+		}, 409)
+	}
+
+	const added = sourceIds.filter((id) => !targetSet.has(id))
 	const merged = [...targetIds, ...added]
 	if (merged.length > MAX_MIXTAPE_SMOLS) {
 		throw new HTTPException(400, { message: `Merged mixtape would have ${merged.length} songs (max ${MAX_MIXTAPE_SMOLS})` })
 	}
 	const mergedSmols = merged.join(',')
+	const sourceAfter = source.Revision + 1
+	const targetAfter = target.Revision + 1
 
-	// One D1 batch = one transaction; each statement re-asserts the other row's state so
-	// either both rows change or neither does (concurrent edits → 409).
-	const [targetResult] = await env.SMOL_D1.batch([
-		env.SMOL_D1.prepare(`
-			UPDATE Mixtapes
-			SET Smols = ?1, Title = ?2, Desc = ?3, Revision = Revision + 1, Updated_At = CURRENT_TIMESTAMP
-			WHERE Id = ?4 AND "Address" = ?5 AND Deleted_At IS NULL AND Revision = ?6
-				AND EXISTS (SELECT 1 FROM Mixtapes WHERE Id = ?7 AND "Address" = ?5 AND Deleted_At IS NULL AND Revision = ?8)
-		`).bind(mergedSmols, title, desc, targetId, sub, target.Revision, sourceId, source.Revision),
+	// One D1 batch = one transaction, nothing interleaves. Statement 1 is the gate: it tombstones
+	// the source only if BOTH rows are still exactly as read. Statements 2 and 3 fire only when the
+	// source carries statement 1's exact post-state while the target is still at the read revision,
+	// which (inside this transaction) only statement 1 can produce. Statement 4 is a hard invariant:
+	// a source merged by this request without the matching target update violates CHECK(Revision >= 1)
+	// and rolls the whole batch back.
+	const [gate] = await env.SMOL_D1.batch([
 		env.SMOL_D1.prepare(`
 			UPDATE Mixtapes
 			SET Deleted_At = CURRENT_TIMESTAMP, Updated_At = CURRENT_TIMESTAMP, Visibility = 'deleted',
 				Hidden_Reason = 'merged', Related_Mixtape_Id = ?1, Uniqueness_Score = NULL, Revision = Revision + 1
 			WHERE Id = ?2 AND "Address" = ?3 AND Deleted_At IS NULL AND Revision = ?4
-				AND EXISTS (SELECT 1 FROM Mixtapes WHERE Id = ?1 AND Revision = ?5 AND Smols = ?6 AND Deleted_At IS NULL)
-		`).bind(targetId, sourceId, sub, source.Revision, target.Revision + 1, mergedSmols),
+				AND EXISTS (SELECT 1 FROM Mixtapes WHERE Id = ?1 AND "Address" = ?3 AND Deleted_At IS NULL AND Revision = ?5)
+		`).bind(targetId, sourceId, sub, source.Revision, target.Revision),
+		env.SMOL_D1.prepare(`
+			UPDATE Mixtapes
+			SET Smols = ?1, Title = ?2, Desc = ?3, Revision = Revision + 1, Updated_At = CURRENT_TIMESTAMP
+			WHERE Id = ?4 AND "Address" = ?5 AND Deleted_At IS NULL AND Revision = ?6
+				AND EXISTS (
+					SELECT 1 FROM Mixtapes WHERE Id = ?7 AND Deleted_At IS NOT NULL AND Hidden_Reason = 'merged'
+						AND Related_Mixtape_Id = ?4 AND Revision = ?8
+				)
+		`).bind(mergedSmols, title, desc, targetId, sub, target.Revision, sourceId, sourceAfter),
+		// Flatten older aliases (X merged into source) straight to the target: chains stay 1 hop.
+		env.SMOL_D1.prepare(`
+			UPDATE Mixtapes SET Related_Mixtape_Id = ?1
+			WHERE "Address" = ?2 AND Deleted_At IS NOT NULL AND Hidden_Reason = 'merged' AND Related_Mixtape_Id = ?3
+				AND EXISTS (SELECT 1 FROM Mixtapes WHERE Id = ?1 AND Revision = ?4 AND Smols = ?5 AND Deleted_At IS NULL)
+				AND EXISTS (SELECT 1 FROM Mixtapes WHERE Id = ?3 AND Revision = ?6 AND Hidden_Reason = 'merged' AND Related_Mixtape_Id = ?1)
+		`).bind(targetId, sub, sourceId, targetAfter, mergedSmols, sourceAfter),
+		env.SMOL_D1.prepare(`
+			UPDATE Mixtapes SET Revision = 0
+			WHERE Id = ?1 AND Hidden_Reason = 'merged' AND Related_Mixtape_Id = ?2 AND Revision = ?3
+				AND NOT EXISTS (SELECT 1 FROM Mixtapes WHERE Id = ?2 AND Revision = ?4 AND Smols = ?5 AND Deleted_At IS NULL)
+		`).bind(sourceId, targetId, sourceAfter, targetAfter, mergedSmols),
+		env.SMOL_D1.prepare(BUMP_EPOCH_SQL),
 	])
-	if (!targetResult?.meta?.changes) {
+	if (gate?.meta?.changes !== 1) {
 		return await revisionConflict(c, targetId, sub)
 	}
 
-	const cohort = await reevaluateOwnerCohort(env, sub, { allowAi: false })
-	const result = cohortView(cohort, targetId)
-	purge(c, [sourceId, targetId, ...cohort.changedIds])
-
-	return privateJson(c, {
-		targetId,
-		mergedId: sourceId,
-		addedCount: added.length,
-		totalTracks: merged.length,
-		target: result.view,
+	return await afterCommit(c, [sourceId, targetId], async (purgeIds) => {
+		const cohort = await reevaluateOwnerCohort(env, sub, { allowAi: false })
+		cohort.changedIds.forEach((changed) => purgeIds.add(changed))
+		const result = cohortView(cohort, targetId)
+		return privateJson(c, {
+			targetId,
+			mergedId: sourceId,
+			addedCount: added.length,
+			totalTracks: merged.length,
+			target: result.view,
+		})
 	})
 })
 

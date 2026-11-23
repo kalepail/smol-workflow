@@ -128,11 +128,29 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
 }
 
-/** Strict validation of a clef-flash payload (direct binding shape or `{ result }` envelope). */
+function isTokenCount(value: unknown): value is number {
+	return typeof value === 'number' && Number.isInteger(value) && value >= 0
+}
+
+/**
+ * Strict validation of a clef-flash payload. Accepts the direct binding shape
+ * `{ model, answers, usage }` or up to three Cloudflare envelopes (`{ success, errors, result }`
+ * / `{ state, result }`). Any reported error, non-completed state, missing model, malformed
+ * answers or usage rejects the WHOLE response before a probability is used (fail open).
+ */
 export function parseMixtapeDedupeResponse(raw: unknown): Omit<SemanticVerdict, 'latencyMs'> | null {
-	if (!isRecord(raw)) return null
-	const payload = isRecord(raw.result) && isRecord(raw.result.answers) ? raw.result : raw
-	if (!isRecord(payload.answers)) return null
+	let payload: unknown = raw
+	for (let depth = 0; depth < 4; depth += 1) {
+		if (!isRecord(payload)) return null
+		if (payload.success === false) return null
+		if (payload.errors !== undefined && (!Array.isArray(payload.errors) || payload.errors.length > 0)) return null
+		if (payload.state !== undefined && payload.state !== 'Completed') return null
+		if (payload.answers !== undefined || !('result' in payload)) break
+		payload = payload.result
+	}
+	if (!isRecord(payload) || !isRecord(payload.answers)) return null
+	if (typeof payload.model !== 'string' || !payload.model.trim()) return null
+	if (!isRecord(payload.usage) || !isTokenCount(payload.usage.input_tokens) || !isTokenCount(payload.usage.output_tokens)) return null
 
 	const isDuplicate = payload.answers.is_duplicate
 	if (!isRecord(isDuplicate) || isDuplicate.type !== 'noul') return null
@@ -141,21 +159,17 @@ export function parseMixtapeDedupeResponse(raw: unknown): Omit<SemanticVerdict, 
 
 	let relation: MixtapeRelation | null = null
 	const rel = payload.answers.relation
-	if (isRecord(rel) && rel.type === 'choice' && typeof rel.choice === 'string' && (RELATIONS as readonly string[]).includes(rel.choice)) {
+	if (rel !== undefined) {
+		if (!isRecord(rel) || rel.type !== 'choice' || typeof rel.choice !== 'string' || !(RELATIONS as readonly string[]).includes(rel.choice)) return null
 		relation = rel.choice as MixtapeRelation
 	}
-
-	const usage = isRecord(payload.usage) ? payload.usage : null
-	const inputTokens = typeof usage?.input_tokens === 'number' && Number.isInteger(usage.input_tokens) && usage.input_tokens >= 0
-		? usage.input_tokens
-		: null
 
 	return {
 		pDuplicate: p,
 		isDuplicate: p >= MIXTAPE_DEDUPE_THRESHOLD,
 		relation,
-		model: typeof payload.model === 'string' && payload.model ? payload.model : MIXTAPE_DEDUPE_MODEL_SELECTOR,
-		inputTokens,
+		model: payload.model,
+		inputTokens: payload.usage.input_tokens,
 	}
 }
 

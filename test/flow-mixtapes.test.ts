@@ -4,6 +4,7 @@ import { DatabaseSync } from 'node:sqlite'
 import test, { after, before } from 'node:test'
 import {
 	createAuthToken,
+	createMockEdgeCache,
 	createMockExecutionContext,
 	createSqliteD1,
 	installCloudflareStubs,
@@ -13,7 +14,9 @@ import {
 	classifyOwnerMixtapes,
 	findBorderlinePair,
 	type MixtapeCandidate,
+	type MixtapeDecision,
 } from '../src/utils/mixtape-visibility'
+import { parseMixtapeDedupeResponse } from '../src/ai/mixtape-dedupe'
 
 const TEST_SECRET = 'test-jwt-secret-32-chars-minimum!'
 
@@ -61,17 +64,17 @@ let stubs: CloudflareStubHandle
 let appModule: typeof import('../src/index')
 const originalFetch = globalThis.fetch
 const purgedTagBatches: string[][] = []
-const cachePuts: string[] = []
+// Each harness installs its own in-memory edge cache; this indirection lets it swap per test.
+let activeCache: Cache | null = null
+const openedCacheNames = new Set<string>()
 
 before(async () => {
 	// Must exist before routes are defined: hono/cache checks globalThis.caches at import time.
 	Reflect.set(globalThis, 'caches', {
-		open: async () => ({
-			match: async () => undefined,
-			put: async (key: string) => {
-				cachePuts.push(new URL(key).pathname)
-			},
-		}),
+		open: async (name: string) => {
+			openedCacheNames.add(name)
+			return activeCache
+		},
 	})
 	globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
 		const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
@@ -115,7 +118,17 @@ function buildHarness(options: { ai?: AiHandler; aiEnabled?: string; seed?: numb
 	for (const m of seededShuffle(FIXTURE.mixtapes, options.seed ?? 7)) insertMixtape.run(m.Id, m.Title, m.Desc, m.Smols, m.Address, m.Created_At)
 	db.exec(MIGRATION_0002)
 
-	const { d1 } = createSqliteD1(db)
+	const { d1, hooks } = createSqliteD1(db)
+	const edge = createMockEdgeCache()
+	const heldPuts: Array<() => void> = []
+	let holdPuts = false
+	const realPut = edge.cache.put.bind(edge.cache)
+	edge.cache.put = (async (key: RequestInfo | URL, response: Response) => {
+		if (holdPuts) await new Promise<void>((resolve) => heldPuts.push(resolve))
+		return realPut(key, response)
+	}) as Cache['put']
+	activeCache = edge.cache
+
 	const aiCalls: Array<{ model: string; input: Ai_Cf_Cloudflare_Clef_Input }> = []
 	const env = {
 		SECRET: TEST_SECRET,
@@ -132,9 +145,10 @@ function buildHarness(options: { ai?: AiHandler; aiEnabled?: string; seed?: numb
 		},
 		MIXTAPE_DEDUPE_AI_ENABLED: options.aiEnabled ?? 'true',
 	} as unknown as Env
-	const ctx = createMockExecutionContext()
 
-	async function send(path: string, init: { method?: string; body?: unknown; as?: string } = {}) {
+	/** Each request gets its own ExecutionContext; `noFlush` leaves its waitUntil work pending. */
+	async function send(path: string, init: { method?: string; body?: unknown; as?: string; noFlush?: boolean } = {}) {
+		const ctx = createMockExecutionContext()
 		const headers = new Headers()
 		if (init.as) headers.set('Authorization', `Bearer ${init.as === 'admin' ? TEST_SECRET : await createAuthToken(init.as, TEST_SECRET)}`)
 		if (init.body !== undefined) headers.set('Content-Type', 'application/json')
@@ -147,8 +161,8 @@ function buildHarness(options: { ai?: AiHandler; aiEnabled?: string; seed?: numb
 			env,
 			ctx.ctx,
 		)
-		await ctx.flush()
-		return res
+		if (!init.noFlush) await ctx.flush()
+		return Object.assign(res, { flush: ctx.flush })
 	}
 	async function json<T = any>(path: string, init: Parameters<typeof send>[1] = {}) {
 		const res = await send(path, init)
@@ -162,9 +176,24 @@ function buildHarness(options: { ai?: AiHandler; aiEnabled?: string; seed?: numb
 		return { res, status: res.status, body }
 	}
 	const row = (id: string) => db.prepare('SELECT * FROM Mixtapes WHERE Id = ?').get(id) as Record<string, any> | undefined
-	const backdate = (id: string, minutes: number) => db.prepare(`UPDATE Mixtapes SET Created_At = datetime('now', ?) WHERE Id = ?`).run(`-${minutes} minutes`, id)
+	/** Direct test-only writes must bump the epoch like every route write does. */
+	const write = (sql: string, ...args: Array<string | number | null>) => {
+		db.prepare(sql).run(...args)
+		db.exec('UPDATE MixtapeState SET Epoch = Epoch + 1 WHERE Id = 1')
+	}
+	const backdate = (id: string, minutes: number) => write(`UPDATE Mixtapes SET Created_At = datetime('now', ?) WHERE Id = ?`, `-${minutes} minutes`, id)
+	const epoch = () => (db.prepare('SELECT Epoch FROM MixtapeState WHERE Id = 1').get() as { Epoch: number }).Epoch
+	const cache = {
+		stats: edge.stats,
+		keys: () => [...edge.entries.keys()],
+		hold: () => { holdPuts = true },
+		release: () => {
+			holdPuts = false
+			heldPuts.splice(0).forEach((resolve) => resolve())
+		},
+	}
 
-	return { db, env, send, json, row, backdate, aiCalls }
+	return { db, env, send, json, row, write, backdate, epoch, aiCalls, hooks, cache }
 }
 
 function toCandidates(mixtapes: FixtureMixtape[], publicIds: Set<string>): MixtapeCandidate[] {
@@ -206,6 +235,14 @@ test('migration 0002 is additive on the legacy table, backfills Updated_At, and 
 	const indexes = (target: DatabaseSync) => (target.prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'Mixtapes' AND name LIKE 'idx_%' ORDER BY name`).all() as Array<{ name: string }>).map((r) => r.name)
 	assert.deepEqual(indexes(db), ['idx_mixtapes_address_created', 'idx_mixtapes_created', 'idx_mixtapes_visibility_created'])
 	assert.deepEqual(indexes(fresh), indexes(db))
+	const epochObjects = (target: DatabaseSync) => (target.prepare(`SELECT type, name FROM sqlite_master WHERE name = 'MixtapeState' OR name LIKE 'trg_mixtape_epoch_%' ORDER BY name`).all() as Array<Record<string, string>>).map((r) => `${r.type}:${r.name}`)
+	assert.deepEqual(epochObjects(db), ['table:MixtapeState', 'trigger:trg_mixtape_epoch_smol_delete', 'trigger:trg_mixtape_epoch_smol_insert', 'trigger:trg_mixtape_epoch_smol_public'])
+	assert.deepEqual(epochObjects(fresh), epochObjects(db))
+	const epochOf = (target: DatabaseSync) => (target.prepare('SELECT Epoch FROM MixtapeState WHERE Id = 1').get() as { Epoch: number }).Epoch
+	const before = epochOf(db)
+	db.exec(`UPDATE Smols SET Public = 0 WHERE Id = '${FIXTURE.smols[0].Id}'`)
+	db.exec(`UPDATE Smols SET Title = 'renamed' WHERE Id = '${FIXTURE.smols[0].Id}'`)
+	assert.equal(epochOf(db), before + 1, 'privacy flips bump the epoch; unrelated column updates do not')
 
 	for (const target of [db, fresh]) {
 		for (const bad of [`Visibility = 'hidden'`, `Hidden_Reason = 'spam'`, 'Uniqueness_Score = 101', 'Revision = 0']) {
@@ -265,7 +302,6 @@ test('Tier 1 on the 18-row production fixture: 15 public / 3 owner-only in any o
 
 test('GET / vs GET /mine vs GET /:id: visibility, caching headers, and live Smols.Public re-derivation', async () => {
 	const h = buildHarness({ seed: 11 })
-	cachePuts.length = 0
 
 	const list = await h.json<Array<Record<string, any>>>('/mixtapes')
 	assert.equal(list.status, 200)
@@ -275,9 +311,13 @@ test('GET / vs GET /mine vs GET /:id: visibility, caching headers, and live Smol
 	assert.deepEqual(list.body.map((m) => m.Created_At), [...list.body.map((m) => m.Created_At)].sort().reverse(), 'newest first')
 	assert.equal(list.body.find((m) => m.Id === '807e0a11b827b1e3')!.Smols.length, 11, 'private song slots never exposed')
 	assert.deepEqual(Object.keys(list.body[0]).sort(), ['Address', 'Created_At', 'Desc', 'Id', 'Smols', 'Title', 'Updated_At'])
-	assert.match(list.res.headers.get('Cache-Control')!, /public, max-age=60/)
+	assert.equal(list.res.headers.get('Cache-Control'), 'public, max-age=0, s-maxage=60, stale-while-revalidate=120', 'browsers revalidate; only the edge caches')
 	assert.equal(list.res.headers.get('Cache-Tag'), 'mixtapes')
-	assert.ok(cachePuts.includes('/mixtapes'))
+	assert.ok(openedCacheNames.has('smol-workflow-mixtapes-v2') && !openedCacheNames.has('smol-workflow'), 'fresh v2 namespace')
+	assert.deepEqual(h.cache.keys(), [`https://api.smol.xyz/mixtapes?__mx_epoch=${h.epoch()}`], 'edge key carries the committed epoch')
+	const hit = await h.send('/mixtapes?__mx_epoch=999')
+	assert.equal(h.cache.stats.hits, 1, 'unchanged epoch is a hit; client-supplied epoch params are ignored')
+	assert.equal(((await hit.json()) as unknown[]).length, 15)
 
 	assert.equal((await h.send('/mixtapes/mine')).status, 401)
 	assert.equal((await h.send('/mixtapes/mine', { as: 'admin' })).status, 401, 'admin token has no owner subject')
@@ -293,7 +333,7 @@ test('GET / vs GET /mine vs GET /:id: visibility, caching headers, and live Smol
 	assert.match(v1.Advice, /“Creasy Drops”/)
 	assert.equal(mine.body[0].Visibility, 'public')
 	assert.equal(mine.body[0].Advice, null)
-	assert.ok(!cachePuts.includes('/mixtapes/mine'), '/mine never enters the shared cache')
+	assert.ok(!h.cache.keys().some((key) => key.includes('/mine')), '/mine never enters the shared cache')
 
 	const december = (await h.json<Array<Record<string, any>>>('/mixtapes/mine', { as: PRE_PARTY_OWNER })).body.find((m) => m.Id === OUR_DECEMBER)!
 	assert.deepEqual([december.Hidden_Reason, december.Stored_Track_Count, december.Public_Track_Count, december.Uniqueness_Score], ['empty', 1, 0, null])
@@ -445,18 +485,27 @@ test('merge: owner of both, appends unique public songs, 404 mergedInto redirect
 	assert.equal((await h.json(`/mixtapes/${CREASY_V1}/restore`, { method: 'POST', as: CREASY_OWNER })).status, 409, 'merged sources are not restorable')
 	assert.deepEqual((await h.json<Array<{ Id: string }>>('/mixtapes/mine', { as: CREASY_OWNER })).body.map((m) => m.Id), [CREASY_V2])
 
-	// Appends only songs the target lacks, in source order, skipping private ones; title updated.
+	// P1-5: a source song that is not public (and not already on the target) would be lost
+	// forever once the source is tombstoned → 409 with a count, nothing written.
 	const create = async (title: string, smols: string[]) => (await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title, smols } })).body.id as string
 	const a = await create('Alpha', [SYN(1), SYN(2), SYN(3)])
 	const b = await create('Beta', [SYN(3), SYN(4), SYN(5)])
-	h.db.prepare('UPDATE Mixtapes SET Smols = ? WHERE Id = ?').run([SYN(3), PRIVATE_SYN, SYN(4), SYN(5)].join(','), b)
+	h.write('UPDATE Mixtapes SET Smols = ? WHERE Id = ?', [SYN(3), PRIVATE_SYN, SYN(4), SYN(5)].join(','), b)
+	const stranded = await merge(b, { targetId: a, title: 'Alpha + Beta' }, NEW_OWNER)
+	assert.deepEqual([stranded.status, stranded.body.code, stranded.body.unavailableCount], [409, 'merge_unavailable_tracks', 1])
+	assert.equal(stranded.res.headers.get('Cache-Control'), 'private, no-store')
+	assert.deepEqual([h.row(b)!.Deleted_At, h.row(b)!.Revision, h.row(a)!.Revision], [null, 1, 1], 'nothing written')
+
+	// Once the owner removes it, the merge appends only songs the target lacks, in source order.
+	assert.equal((await h.send(`/mixtapes/${b}`, { method: 'PATCH', as: NEW_OWNER, body: { smols: [SYN(3), SYN(4), SYN(5)] } })).status, 200)
 	const ab = await merge(b, { targetId: a, title: 'Alpha + Beta' }, NEW_OWNER)
 	assert.deepEqual([ab.status, ab.body.addedCount, ab.body.totalTracks, ab.body.target.Title], [200, 2, 5, 'Alpha + Beta'])
 	assert.equal(h.row(a)!.Smols, [SYN(1), SYN(2), SYN(3), SYN(4), SYN(5)].join(','))
 
-	// Merge chains resolve to the live terminal target.
+	// Merging the target onward flattens the older alias (b → c directly, one hop).
 	const c = await create('Gamma', [SYN(40), SYN(41)])
 	assert.equal((await merge(a, { targetId: c }, NEW_OWNER)).status, 200)
+	assert.equal(h.row(b)!.Related_Mixtape_Id, c, 'alias flattened transactionally')
 	assert.equal((await h.json(`/mixtapes/${b}`)).body.mergedInto, c)
 
 	const big = await create('Big', Array.from({ length: 60 }, (_, i) => SYN(i + 50)))
@@ -586,4 +635,275 @@ test('Tier 2 clef-flash on write: duplicate hides the weaker sibling, unique kee
 		assert.equal(verdict ? JSON.parse(verdict).fallback : null, fallback)
 		if (label === 'timeout') assert.ok(Date.now() - startedAt < 4000, 'bounded by the 1.5 s timeout')
 	}
+})
+
+// ---------------------------------------------------------------------------
+// Regressions from reports/25b-review-mixtape-be.md
+// ---------------------------------------------------------------------------
+
+function assertNoHiddenKeepers(decisions: Map<string, MixtapeDecision>, label: string) {
+	for (const decision of decisions.values()) {
+		if (decision.relatedId) assert.equal(decisions.get(decision.relatedId)?.visibility, 'public', `${label}: ${decision.id} → ${decision.relatedId} must point at a listed keeper`)
+	}
+}
+
+const tick = () => new Promise((resolve) => setImmediate(resolve))
+
+test('P1-1 / P2-6: a concurrent target edit makes merge 409 without tombstoning the source; long merge chains stay one hop', async () => {
+	const h = buildHarness()
+	let injected = false
+	h.hooks.onStatement = (sql) => {
+		if (!injected && sql.includes(`Hidden_Reason = 'merged', Related_Mixtape_Id = ?1`)) {
+			injected = true
+			// Another tab renames the target between this request's read and its batch.
+			h.db.prepare(`UPDATE Mixtapes SET Title = 'Renamed elsewhere', Revision = Revision + 1 WHERE Id = ?`).run(CREASY_V2)
+		}
+	}
+	const raced = await h.json(`/mixtapes/${CREASY_V1}/merge`, { method: 'POST', as: CREASY_OWNER, body: { targetId: CREASY_V2, title: 'Requested title' } })
+	h.hooks.onStatement = undefined
+	assert.equal(injected, true)
+	assert.deepEqual([raced.status, raced.body.code, raced.body.current?.Title], [409, 'revision_conflict', 'Renamed elsewhere'])
+	assert.deepEqual([h.row(CREASY_V1)!.Deleted_At, h.row(CREASY_V1)!.Visibility, h.row(CREASY_V1)!.Related_Mixtape_Id, h.row(CREASY_V1)!.Revision], [null, 'public', null, 1], 'source untouched (not tombstoned, still editable)')
+	assert.equal(h.row(CREASY_V2)!.Title, 'Renamed elsewhere', 'requested title never applied')
+	const retried = await h.json(`/mixtapes/${CREASY_V1}/merge`, { method: 'POST', as: CREASY_OWNER, body: { targetId: CREASY_V2 } })
+	assert.equal(retried.status, 200, 'a fresh retry succeeds')
+
+	// Twelve sequential merges: every older alias is flattened to the live terminal target.
+	const ids: string[] = []
+	for (let i = 0; i < 13; i += 1) {
+		ids.push((await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title: `Chain ${i}`, smols: [SYN(2 * i + 1), SYN(2 * i + 2)] } })).body.id)
+	}
+	for (let i = 0; i < 12; i += 1) {
+		assert.equal((await h.send(`/mixtapes/${ids[i]}/merge`, { method: 'POST', as: NEW_OWNER, body: { targetId: ids[i + 1] } })).status, 200)
+	}
+	const terminal = ids[12]
+	for (const id of ids.slice(0, 12)) assert.equal(h.row(id)!.Related_Mixtape_Id, terminal, `${id} points straight at the terminal target`)
+	assert.equal(h.row(terminal)!.Smols.split(',').length, 26)
+	const first = await h.json(`/mixtapes/${ids[0]}`)
+	assert.deepEqual([first.status, first.body.code, first.body.mergedInto], [404, 'mixtape_merged', terminal])
+
+	// Corrupt legacy cycles resolve safely (plain 404, no hang).
+	h.write(`UPDATE Mixtapes SET Deleted_At = CURRENT_TIMESTAMP, Visibility = 'deleted', Hidden_Reason = 'merged', Related_Mixtape_Id = ? WHERE Id = ?`, CORDOVA_RETRY, CORDOVA)
+	h.write(`UPDATE Mixtapes SET Deleted_At = CURRENT_TIMESTAMP, Visibility = 'deleted', Hidden_Reason = 'merged', Related_Mixtape_Id = ? WHERE Id = ?`, CORDOVA, CORDOVA_RETRY)
+	const cycle = await h.json(`/mixtapes/${CORDOVA}`)
+	assert.deepEqual([cycle.status, cycle.body.code], [404, undefined])
+})
+
+test('P1-2: a delayed AI verdict can never overwrite a newer edit\'s decision', async () => {
+	let releaseFirst!: () => void
+	const first = new Promise<void>((resolve) => { releaseFirst = resolve })
+	let calls = 0
+	const h = buildHarness({
+		ai: async () => {
+			calls += 1
+			if (calls === 1) {
+				await first
+				return clefAnswer(0.08) // stale "unique" verdict from the slow request
+			}
+			return clefAnswer(0.9)
+		},
+	})
+	const A = [1, 2, 3, 4, 5].map(SYN)
+	const B = [1, 2, 3, 4, 6, 7, 8].map(SYN)
+	const a = (await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title: 'Drafts', desc: 'v1', smols: A } })).body.id as string
+	h.backdate(a, 60)
+
+	const slowCreate = h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title: 'Drafts final', desc: 'v2', smols: B } })
+	while (h.aiCalls.length < 1) await tick()
+	const b = (h.db.prepare(`SELECT Id FROM Mixtapes WHERE Title = 'Drafts final'`).get() as { Id: string }).Id
+
+	// Meanwhile the owner edits A; that request adjudicates the pair as a duplicate and commits.
+	const edit = await h.json(`/mixtapes/${a}`, { method: 'PATCH', as: NEW_OWNER, body: { desc: 'v1 reworked' } })
+	assert.deepEqual([edit.status, edit.body.hiddenReason, edit.body.relatedMixtapeId], [200, 'semantic_duplicate', b])
+
+	releaseFirst()
+	const created = await slowCreate
+	assert.equal(created.status, 201, 'the slow write still succeeds')
+	assert.equal(h.aiCalls.length, 2, 'stale work is re-derived, never re-inferred')
+	const hidden = h.row(a)!
+	assert.deepEqual([hidden.Visibility, hidden.Hidden_Reason, hidden.Related_Mixtape_Id], ['owner', 'semantic_duplicate', b], 'newer verdict survives')
+	assert.equal(JSON.parse(hidden.Ai_Verdict).p, 0.9)
+	assert.equal(h.row(b)!.Ai_Verdict, null, 'the stale receipt (old revisions) is never persisted')
+	assert.ok(!(await h.json<Array<{ Id: string }>>('/mixtapes')).body.some((m) => m.Id === a))
+})
+
+test('P1-3: a song turning private invalidates a stored AI verdict immediately, with zero inference', async () => {
+	const h = buildHarness({ ai: async () => clefAnswer(0.9) })
+	const A = [1, 2, 3, 4, 5, 6].map(SYN)
+	const B = [1, 2, 3, 4, 7, 8].map(SYN) // J = 4/8 → borderline; equal size keeps the newer B
+	const a = (await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title: 'Season', smols: A } })).body.id as string
+	h.backdate(a, 60)
+	const b = (await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title: 'Season II', smols: B } })).body.id as string
+	const receipt = JSON.parse(h.row(a)!.Ai_Verdict)
+	assert.deepEqual([receipt.hidden, receipt.keep, receipt.applied], [a, b, true])
+	assert.match(receipt.fp, /^[0-9a-f]{64}$/, 'SHA-256 input fingerprint persisted')
+
+	const flip = (value: number) => h.db.prepare(`UPDATE Smols SET Public = ? WHERE Id IN (?, ?, ?, ?)`).run(value, ...[1, 2, 3, 4].map(SYN))
+	flip(0) // the four shared songs go private: the mixtapes are now disjoint
+	const mine = (await h.json<Array<Record<string, any>>>('/mixtapes/mine', { as: NEW_OWNER })).body.find((m) => m.Id === a)!
+	assert.deepEqual([mine.Visibility, mine.Hidden_Reason, mine.Public_Track_Count], ['public', null, 2])
+	const list = (await h.json<Array<{ Id: string }>>('/mixtapes')).body
+	assert.ok(list.some((m) => m.Id === a) && list.some((m) => m.Id === b))
+
+	flip(1) // identical inputs again → the fingerprint matches and the verdict applies again
+	assert.equal((await h.json(`/mixtapes/${a}`)).body.Hidden_Reason, 'semantic_duplicate')
+	assert.equal(h.aiCalls.length, 1, 'reads never infer')
+})
+
+test('P1-4: a delayed in-flight GET cannot refill the current cache key; purge runs even when recompute fails', async () => {
+	const h = buildHarness()
+	for (const path of ['/mixtapes', `/mixtapes/${CORDOVA}`]) {
+		h.cache.hold()
+		const inFlight = await h.send(path, { noFlush: true }) // computed before the edit, fill still pending
+		const renamed = `Renamed via ${path}`
+		assert.equal((await h.send(`/mixtapes/${CORDOVA}`, { method: 'PATCH', as: CORDOVA_OWNER, body: { title: renamed } })).status, 200)
+		h.cache.release()
+		await inFlight.flush() // the stale fill lands now — under the OLD epoch key
+		const fresh = await h.json<any>(path)
+		const title = Array.isArray(fresh.body) ? fresh.body.find((m: { Id: string }) => m.Id === CORDOVA)?.Title : fresh.body.Title
+		assert.equal(title, renamed, `${path}: never served from the stale fill`)
+		const hitsBefore = h.cache.stats.hits
+		await h.send(path)
+		assert.equal(h.cache.stats.hits, hitsBefore + 1, `${path}: the current epoch is cached normally`)
+	}
+
+	// A song privacy flip bumps the epoch through the trigger: no stale public song data.
+	const cordovaSong = byId(CORDOVA).Smols.split(',')[0]
+	h.db.prepare('UPDATE Smols SET Public = 0 WHERE Id = ?').run(cordovaSong)
+	assert.ok(!(await h.json<any>(`/mixtapes/${CORDOVA}`)).body.Smols.some((s: { Id: string }) => s.Id === cordovaSong))
+
+	// The mutation commits, then the cohort recompute throws: the purge still goes out.
+	purgedTagBatches.length = 0
+	let armed = true
+	h.hooks.onStatement = (sql) => {
+		if (armed && /"Address" = \?1 AND Deleted_At IS NULL/.test(sql)) {
+			armed = false
+			throw new Error('D1_ERROR: transient')
+		}
+	}
+	const failed = await h.send(`/mixtapes/${CORDOVA_RETRY}`, { method: 'PATCH', as: CORDOVA_OWNER, body: { title: 'Committed anyway' } })
+	h.hooks.onStatement = undefined
+	assert.equal(failed.status, 500)
+	assert.equal(h.row(CORDOVA_RETRY)!.Title, 'Committed anyway')
+	assert.ok(['mixtapes', `mixtape:${CORDOVA_RETRY}`].every((tag) => purgedTagBatches.flat().includes(tag)), 'purge is guaranteed after commit')
+})
+
+test('P2-1: simultaneous identical POSTs converge on one canonical id', async () => {
+	const h = buildHarness()
+	let arrivals = 0
+	let openBarrier!: () => void
+	const barrier = new Promise<void>((resolve) => { openBarrier = resolve })
+	h.hooks.onStatement = async (sql) => {
+		if (sql.includes('ORDER BY rowid ASC') && arrivals < 2) {
+			arrivals += 1
+			if (arrivals === 2) openBarrier()
+			await barrier // both requests pass the pre-insert retry check before either inserts
+		}
+	}
+	const body = { title: 'Double Tap', smols: [SYN(1), SYN(2)] }
+	const results = await Promise.all([1, 2].map(() => h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })))
+	h.hooks.onStatement = undefined
+	assert.deepEqual(results.map((r) => r.status).sort(), [200, 201])
+	assert.equal(results[0].body.id, results[1].body.id, 'both callers get the same id')
+	assert.equal(results.find((r) => r.status === 200)!.body.deduplicated, true)
+	const live = h.db.prepare(`SELECT Id FROM Mixtapes WHERE Title = 'Double Tap'`).all() as Array<{ Id: string }>
+	assert.deepEqual(live.map((r) => r.Id), [results[0].body.id], 'the losing insert removed itself')
+})
+
+test('P2-2 / P2-3: pointers only target listed keepers; 3+ track reorders reach Tier 2', async () => {
+	const mk = (id: string, tracks: number[], createdAt: string, title = 'Mix', desc = ''): MixtapeCandidate => ({
+		id, address: NEW_OWNER, title, desc, createdAt, publicTracks: tracks.map(SYN),
+	})
+	// A ⊂ B, B overlaps newer C at J = 0.80. A must not point at hidden B; it is promoted.
+	const abc = classifyOwnerMixtapes([
+		mk('A', [1, 9], '2026-01-01 00:00:00', 'A'),
+		mk('B', [1, 2, 3, 4, 5, 6, 7, 8, 9], '2026-01-02 00:00:00', 'B'),
+		mk('C', [1, 2, 3, 4, 5, 6, 7, 8, 10], '2026-01-03 00:00:00', 'C'),
+	])
+	assert.deepEqual([abc.get('A')!.visibility, abc.get('B')!.hiddenReason, abc.get('B')!.relatedId], ['public', 'overlap', 'C'])
+	assertNoHiddenKeepers(abc, 'A→B→C')
+
+	// A semantic verdict that hides a keeper re-tests its dependents against the survivors.
+	const rows = [
+		mk('K', [1, 2, 3, 6, 7, 8, 9], '2026-01-03 00:00:00', 'K'),
+		mk('H', [1, 2, 3, 4, 5], '2026-01-02 00:00:00', 'H'),
+		mk('D', [1, 2, 4], '2026-01-01 00:00:00', 'D'),
+		mk('E', [1, 2, 3], '2026-01-01 00:00:00', 'E'),
+	]
+	const plain = classifyOwnerMixtapes(rows)
+	assert.deepEqual([plain.get('D')!.relatedId, plain.get('H')!.visibility], ['H', 'public'])
+	const withVerdict = classifyOwnerMixtapes(rows, [{ hiddenId: 'H', keeperId: 'K', pDuplicate: 0.9 }])
+	assert.deepEqual([withVerdict.get('H')!.hiddenReason, withVerdict.get('H')!.relatedId], ['semantic_duplicate', 'K'])
+	assert.deepEqual([withVerdict.get('D')!.visibility, withVerdict.get('E')!.relatedId], ['public', 'K'], 'D promoted; E re-pointed to the surviving keeper')
+	assertNoHiddenKeepers(withVerdict, 'semantic')
+	assertNoHiddenKeepers(classifyOwnerMixtapes(rows, [{ hiddenId: 'K', keeperId: 'H', pDuplicate: 0.9 }]), 'verdict against rank')
+
+	// Three-track editions with a changed order or title are borderline, not deterministic overlap.
+	for (const [label, second] of [['reorder', mk('r2', [3, 2, 1], '2026-01-02 00:00:00', 'Trilogy')], ['retitle', mk('r2', [1, 2, 3], '2026-01-02 00:00:00', 'Trilogy (Live)')]] as const) {
+		const pair = [mk('r1', [1, 2, 3], '2026-01-01 00:00:00', 'Trilogy'), second]
+		const decisions = classifyOwnerMixtapes(pair)
+		assert.equal(decisions.get('r1')!.visibility, 'public', `${label}: not hidden as overlap`)
+		assert.equal(findBorderlinePair(pair, decisions)?.trigger, 'same_set_changed', label)
+	}
+
+	const h = buildHarness({ ai: async () => clefAnswer(0.9) })
+	const original = (await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title: 'Trilogy', smols: [1, 2, 3].map(SYN) } })).body.id as string
+	h.backdate(original, 60)
+	const reordered = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title: 'Trilogy', smols: [3, 2, 1].map(SYN) } })
+	assert.equal(h.aiCalls.length, 1, 'the reorder is adjudicated by clef-flash')
+	assert.equal((h.aiCalls[0].input.state as any).relationship_metrics.exact_same_order, false)
+	assert.equal(reordered.body.visibility, 'public')
+	assert.deepEqual([h.row(original)!.Hidden_Reason, h.row(original)!.Related_Mixtape_Id], ['semantic_duplicate', reordered.body.id])
+})
+
+test('P2-4: the clef-flash parser rejects error envelopes and malformed payloads before using a probability', async () => {
+	const valid = clefAnswer(0.99)
+	assert.equal(parseMixtapeDedupeResponse(valid)?.pDuplicate, 0.99)
+	assert.equal(parseMixtapeDedupeResponse({ success: true, errors: [], result: valid })?.pDuplicate, 0.99)
+	assert.equal(parseMixtapeDedupeResponse({ state: 'Completed', result: { success: true, errors: [], result: valid } })?.pDuplicate, 0.99)
+	const { model: _model, usage: _usage, ...bare } = valid
+	const malformed: Array<[string, unknown]> = [
+		['success:false', { success: false, errors: [], result: valid }],
+		['errors', { success: true, errors: [{ code: 3040, message: 'capacity' }], result: valid }],
+		['pending', { state: 'Running', result: valid }],
+		['bare answers', bare],
+		['missing usage', { ...valid, usage: undefined }],
+		['negative tokens', { ...valid, usage: { input_tokens: -1, output_tokens: 0 } }],
+		['empty model', { ...valid, model: ' ' }],
+		['bad relation', { ...valid, answers: { ...valid.answers, relation: { type: 'choice', choice: 'banana' } } }],
+		['wrong type', { ...valid, answers: { is_duplicate: { type: 'score', noul: 0.9 } } }],
+		['out of range', clefAnswer(1.2)],
+	]
+	for (const [label, payload] of malformed) assert.equal(parseMixtapeDedupeResponse(payload), null, label)
+
+	// End to end: a success:false envelope with a duplicate probability fails open.
+	const h = buildHarness({ ai: async () => ({ success: false, errors: [{ code: 1 }], result: valid }) })
+	const a = (await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title: 'One', smols: [1, 2, 3, 4, 5].map(SYN) } })).body.id as string
+	h.backdate(a, 60)
+	const b = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title: 'Two', smols: [1, 2, 3, 4, 6, 7, 8].map(SYN) } })
+	assert.deepEqual([b.status, b.body.visibility, h.row(a)!.Visibility], [201, 'public', 'public'])
+	assert.equal(JSON.parse(h.row(b.body.id)!.Ai_Verdict).fallback, 'invalid_response')
+})
+
+test('P2-5: owner-route errors (401/400/403/404/409) carry private no-store headers', async () => {
+	const h = buildHarness()
+	const cases: Array<[string, Parameters<typeof h.send>[1], number]> = [
+		['/mixtapes/mine', {}, 401],
+		['/mixtapes/check-uniqueness', { method: 'POST', body: {} }, 401],
+		['/mixtapes/check-uniqueness', { method: 'POST', as: NEW_OWNER, body: { smols: 'nope' } }, 400],
+		['/mixtapes', { method: 'POST', body: { title: 'x', smols: [SYN(1)] } }, 401],
+		['/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title: '', smols: [SYN(1)] } }, 400],
+		[`/mixtapes/${CORDOVA}`, { method: 'PATCH', as: NEW_OWNER, body: { title: 'x' } }, 403],
+		['/mixtapes/doesnotexist', { method: 'DELETE', as: NEW_OWNER }, 404],
+		[`/mixtapes/${CORDOVA}/merge`, { method: 'POST', as: CORDOVA_OWNER, body: { targetId: CORDOVA } }, 400],
+	]
+	for (const [path, init, status] of cases) {
+		const res = await h.send(path, init)
+		assert.equal(res.status, status, `${init?.method ?? 'GET'} ${path}`)
+		assert.equal(res.headers.get('Cache-Control'), 'private, no-store', `${path} ${status}`)
+		assert.equal(res.headers.get('CDN-Cache-Control'), 'no-store', `${path} ${status}`)
+	}
+	const mine = await h.send('/mixtapes/mine', { as: NEW_OWNER })
+	assert.deepEqual([mine.status, mine.headers.get('Cache-Control')], [200, 'private, no-store'])
+	assert.match((await h.send('/mixtapes')).headers.get('Cache-Control')!, /^public/, 'public GETs stay cacheable')
 })

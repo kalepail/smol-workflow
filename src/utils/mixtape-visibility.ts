@@ -210,7 +210,19 @@ function hide(
 	})
 }
 
-function classifyCohort(cohort: MixtapeCandidate[], decisions: Map<string, MixtapeDecision>) {
+function sameSetChanged(a: MixtapeCandidate, b: MixtapeCandidate, metrics: PairMetrics): boolean {
+	return metrics.sameSet && (
+		!metrics.sameOrder
+		|| normalizeMixtapeText(a.title) !== normalizeMixtapeText(b.title)
+		|| normalizeMixtapeText(a.desc) !== normalizeMixtapeText(b.desc)
+	)
+}
+
+function classifyCohort(
+	cohort: MixtapeCandidate[],
+	decisions: Map<string, MixtapeDecision>,
+	verdicts: ReadonlyMap<string, SemanticDuplicateVerdict>,
+) {
 	const tracks = new Map<string, string[]>()
 	const sets = new Map<string, Set<string>>()
 	const sizes = new Map<string, number>()
@@ -242,7 +254,7 @@ function classifyCohort(cohort: MixtapeCandidate[], decisions: Map<string, Mixta
 		if (group) group.push(row)
 		else groups.set(key, [row])
 	}
-	let survivors: MixtapeCandidate[] = []
+	const survivors: MixtapeCandidate[] = []
 	const retryCopies: Array<[MixtapeCandidate, MixtapeCandidate]> = []
 	for (const group of groups.values()) {
 		group.sort(byCreatedAsc)
@@ -253,37 +265,60 @@ function classifyCohort(cohort: MixtapeCandidate[], decisions: Map<string, Mixta
 		}
 	}
 
-	// Rule 3 — superseded: strict subset of a bigger same-owner mixtape. Processing in
-	// keeper-rank order means a row is only ever pointed at a row already kept.
-	const rank = byKeeperRank(sizes)
-	survivors.sort(rank)
-	let keepers: MixtapeCandidate[] = []
+	// Rules 3–5 + Tier 2 in ONE pass over the keeper rank (|S| DESC, newest, Id DESC).
+	// A row is only ever compared with rows already KEPT, and a kept row is never hidden
+	// later, so every pointer targets a surviving public keeper (no A → B → C chains).
+	// A row whose would-be keeper got hidden is re-tested against the survivors and is
+	// promoted when none of them match.
+	survivors.sort(byKeeperRank(sizes))
+	const keepers: MixtapeCandidate[] = []
+	const keeperIds = new Set<string>()
+	const pendingScore: Array<[MixtapeCandidate, 'too_few' | 'semantic_duplicate', MixtapeCandidate | null, number]> = []
 	for (const row of survivors) {
-		const keeper = keepers.find((k) => isStrictSubset(sets.get(row.id)!, sets.get(k.id)!))
-		if (keeper) hide(decisions, row, 'superseded', keeper, 0)
-		else keepers.push(row)
-	}
+		// Rule 3 — superseded: strict subset of a kept same-owner mixtape.
+		const superset = keepers.find((k) => isStrictSubset(sets.get(row.id)!, sets.get(k.id)!))
+		if (superset) {
+			hide(decisions, row, 'superseded', superset, 0)
+			continue
+		}
 
-	// Rule 4 — overlap: both >= 3 tracks and Jaccard >= 0.80. Keep the larger/newer.
-	survivors = keepers
-	keepers = []
-	for (const row of survivors) {
-		let keeper: MixtapeCandidate | undefined
-		let keeperJ = 0
+		// Rule 4 — overlap: both >= 3 tracks and Jaccard >= 0.80. Same track set with a changed
+		// order/title/description takes precedence: it is a borderline edition for Tier 2.
+		let overlap: MixtapeCandidate | undefined
+		let overlapJ = 0
 		for (const k of keepers) {
 			if (Math.min(sizes.get(row.id)!, sizes.get(k.id)!) < OVERLAP_MIN_TRACKS) continue
-			const j = pairMetrics(tracks.get(row.id)!, tracks.get(k.id)!).jaccard
-			if (j >= OVERLAP_JACCARD) {
-				keeper = k
-				keeperJ = j
+			const metrics = pairMetrics(tracks.get(row.id)!, tracks.get(k.id)!)
+			if (sameSetChanged(row, k, metrics)) continue
+			if (metrics.jaccard >= OVERLAP_JACCARD) {
+				overlap = k
+				overlapJ = metrics.jaccard
 				break
 			}
 		}
-		if (keeper) hide(decisions, row, 'overlap', keeper, scoreFromSimilarity(keeperJ))
-		else keepers.push(row)
+		if (overlap) {
+			hide(decisions, row, 'overlap', overlap, scoreFromSimilarity(overlapJ))
+			continue
+		}
+
+		// Tier 2 — persisted semantic verdict, only while its keeper survived.
+		const verdict = verdicts.get(row.id)
+		if (verdict && keeperIds.has(verdict.keeperId)) {
+			pendingScore.push([row, 'semantic_duplicate', keepers.find((k) => k.id === verdict.keeperId)!, verdict.pDuplicate])
+			continue
+		}
+
+		// Rule 5 — too_few: a single public song is a link, not a listed mixtape.
+		if (sizes.get(row.id)! < MIN_LISTED_TRACKS) {
+			pendingScore.push([row, 'too_few', null, 0])
+			continue
+		}
+
+		keepers.push(row)
+		keeperIds.add(row.id)
 	}
 
-	// Uniqueness score for survivors: 100 × (1 − max Jaccard vs other same-owner survivors).
+	// Uniqueness score: 100 × (1 − max Jaccard vs the same owner's listed mixtapes).
 	const scoreOf = (row: MixtapeCandidate) => {
 		let maxJ = 0
 		for (const other of keepers) {
@@ -293,12 +328,7 @@ function classifyCohort(cohort: MixtapeCandidate[], decisions: Map<string, Mixta
 		return scoreFromSimilarity(maxJ)
 	}
 
-	// Rule 5 — too_few: a single public song is a link, not a listed mixtape.
 	for (const row of keepers) {
-		if (sizes.get(row.id)! < MIN_LISTED_TRACKS) {
-			hide(decisions, row, 'too_few', null, scoreOf(row))
-			continue
-		}
 		decisions.set(row.id, {
 			id: row.id,
 			visibility: 'public',
@@ -309,10 +339,13 @@ function classifyCohort(cohort: MixtapeCandidate[], decisions: Map<string, Mixta
 			advice: null,
 		})
 	}
+	for (const [row, reason, keeper, pDuplicate] of pendingScore) {
+		const score = reason === 'semantic_duplicate' ? Math.min(scoreOf(row), scoreFromSimilarity(pDuplicate)) : scoreOf(row)
+		hide(decisions, row, reason, keeper, score)
+	}
 
-	// No chained pointers: a retry copy whose original was itself hidden by a later rule
-	// (superseded / overlap / too_few) shares the original's content, so it inherits the
-	// original's decision and points straight at the same public keeper.
+	// A retry copy whose original was hidden by a later rule shares the original's content,
+	// so it inherits the original's decision and points straight at the same public keeper.
 	for (const [copy, original] of retryCopies) {
 		const originalDecision = decisions.get(original.id)!
 		if (originalDecision.visibility !== 'public') decisions.set(copy.id, { ...originalDecision, id: copy.id })
@@ -320,18 +353,30 @@ function classifyCohort(cohort: MixtapeCandidate[], decisions: Map<string, Mixta
 }
 
 /**
- * Classify every mixtape (any number of owners) with Tier 1. Rows are grouped by
- * exact `address`; no comparison ever crosses an owner boundary.
+ * Classify every mixtape (any number of owners). Rows are grouped by exact `address`;
+ * no comparison ever crosses an owner boundary. `semanticVerdicts` are still-valid
+ * persisted Tier 2 duplicate verdicts (callers validate fingerprints); each applies
+ * only when no deterministic rule hides the row first and its keeper is still listed.
  */
-export function classifyOwnerMixtapes(rows: readonly MixtapeCandidate[]): Map<string, MixtapeDecision> {
+export function classifyOwnerMixtapes(
+	rows: readonly MixtapeCandidate[],
+	semanticVerdicts: readonly SemanticDuplicateVerdict[] = [],
+): Map<string, MixtapeDecision> {
 	const cohorts = new Map<string, MixtapeCandidate[]>()
 	for (const row of rows) {
 		const cohort = cohorts.get(row.address)
 		if (cohort) cohort.push(row)
 		else cohorts.set(row.address, [row])
 	}
+	const addressOf = new Map(rows.map((row) => [row.id, row.address]))
+	const verdicts = new Map<string, SemanticDuplicateVerdict>()
+	for (const verdict of [...semanticVerdicts].sort((a, b) => (a.hiddenId < b.hiddenId ? -1 : a.hiddenId > b.hiddenId ? 1 : 0))) {
+		const address = addressOf.get(verdict.hiddenId)
+		if (!address || address !== addressOf.get(verdict.keeperId) || verdict.hiddenId === verdict.keeperId) continue
+		if (!verdicts.has(verdict.hiddenId)) verdicts.set(verdict.hiddenId, verdict)
+	}
 	const decisions = new Map<string, MixtapeDecision>()
-	for (const cohort of cohorts.values()) classifyCohort(cohort, decisions)
+	for (const cohort of cohorts.values()) classifyCohort(cohort, decisions, verdicts)
 	return decisions
 }
 
@@ -341,12 +386,7 @@ export function classifyOwnerMixtapes(rows: readonly MixtapeCandidate[]): Map<st
 
 export function borderlineTrigger(a: MixtapeCandidate, b: MixtapeCandidate, metrics = pairMetrics(dedupeOrdered(a.publicTracks), dedupeOrdered(b.publicTracks))): BorderlinePair['trigger'] | null {
 	if (metrics.intersection === 0) return null
-	if (metrics.sameSet) {
-		const changed = !metrics.sameOrder
-			|| normalizeMixtapeText(a.title) !== normalizeMixtapeText(b.title)
-			|| normalizeMixtapeText(a.desc) !== normalizeMixtapeText(b.desc)
-		return changed ? 'same_set_changed' : null
-	}
+	if (metrics.sameSet) return sameSetChanged(a, b, metrics) ? 'same_set_changed' : null
 	if (metrics.jaccard >= BORDERLINE_JACCARD_MIN && metrics.jaccard < OVERLAP_JACCARD) return 'jaccard'
 	if (metrics.maxContainment >= BORDERLINE_CONTAINMENT_MIN && metrics.maxContainment < 1) return 'containment'
 	return null
@@ -385,7 +425,7 @@ export function findBorderlinePair(
 }
 
 // ---------------------------------------------------------------------------
-// Tier 2 overlay (persisted clef-flash verdicts; applied on every read, zero inference)
+// Tier 2 verdict inputs (persisted clef-flash verdicts; applied on every read, zero inference)
 // ---------------------------------------------------------------------------
 
 export interface SemanticDuplicateVerdict {
@@ -395,29 +435,14 @@ export interface SemanticDuplicateVerdict {
 }
 
 /**
- * Overlay still-valid persisted Tier 2 `semantic_duplicate` verdicts on top of Tier 1.
- * A verdict only applies while both rows are Tier-1 public, and never when it would
- * create a chained pointer (hiding a row another row points at, or pointing at a row
- * that is itself semantically hidden). Callers decide validity (e.g. revisions match).
+ * Deterministic SHA-256 fingerprint of exactly what Tier 2 judged for a pair: both Ids,
+ * their resolved PUBLIC track order, and normalized title & description. A persisted
+ * verdict is only trusted while this still matches, so a song flipping private (which
+ * changes no mixtape revision) invalidates it immediately, with zero inference.
  */
-export function applySemanticDuplicates(
-	rows: readonly MixtapeCandidate[],
-	decisions: Map<string, MixtapeDecision>,
-	verdicts: readonly SemanticDuplicateVerdict[],
-): Map<string, MixtapeDecision> {
-	const byId = new Map(rows.map((row) => [row.id, row]))
-	const pointedAt = new Set<string>()
-	for (const decision of decisions.values()) if (decision.relatedId) pointedAt.add(decision.relatedId)
-	const ordered = [...verdicts].sort((a, b) => (a.hiddenId < b.hiddenId ? -1 : a.hiddenId > b.hiddenId ? 1 : 0))
-	for (const verdict of ordered) {
-		const hidden = byId.get(verdict.hiddenId)
-		const keeper = byId.get(verdict.keeperId)
-		if (!hidden || !keeper || hidden.address !== keeper.address || hidden.id === keeper.id) continue
-		const hiddenDecision = decisions.get(hidden.id)
-		if (hiddenDecision?.visibility !== 'public' || decisions.get(keeper.id)?.visibility !== 'public') continue
-		if (pointedAt.has(hidden.id)) continue
-		hide(decisions, hidden, 'semantic_duplicate', keeper, Math.min(hiddenDecision.uniquenessScore ?? 100, scoreFromSimilarity(verdict.pDuplicate)))
-		pointedAt.add(keeper.id)
-	}
-	return decisions
+export async function pairFingerprint(a: MixtapeCandidate, b: MixtapeCandidate): Promise<string> {
+	const [x, y] = a.id < b.id ? [a, b] : [b, a]
+	const payload = JSON.stringify([x, y].map((m) => [m.id, dedupeOrdered(m.publicTracks), normalizeMixtapeText(m.title), normalizeMixtapeText(m.desc)]))
+	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(payload))
+	return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('')
 }
