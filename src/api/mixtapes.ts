@@ -281,8 +281,9 @@ function withBrowserPolicy(response: Response): Response {
 
 /**
  * Public read cache. The Worker Cache API copy (v2 namespace, epoch-versioned key) carries the
- * edge TTL; every response that reaches a browser carries `max-age=0, must-revalidate`, so a
- * rename, delete or song privacy change is never served stale from a browser cache.
+ * edge TTL; every 200 that reaches a browser carries `max-age=0, must-revalidate`, so a
+ * rename, delete or song privacy change is never served stale from a browser cache. Non-200s
+ * are `no-store` everywhere (browser and CDN).
  */
 const publicCache = () => async (c: Context<HonoEnv>, next: Next) => {
 	const edge = typeof caches === 'undefined' ? null : await caches.open(PUBLIC_CACHE_NAME)
@@ -291,7 +292,14 @@ const publicCache = () => async (c: Context<HonoEnv>, next: Next) => {
 	if (hit) return withBrowserPolicy(hit)
 
 	await next()
-	if (edge && c.res.status === 200) {
+	if (c.res.status !== 200) {
+		// 404s (deleted / merged / unknown) and errors must never be shared: an Undo or restore
+		// has to be visible immediately, and these responses carry no purgeable cache tag.
+		c.res.headers.set('Cache-Control', 'no-store')
+		c.res.headers.set('CDN-Cache-Control', 'no-store')
+		return
+	}
+	if (edge) {
 		const copy = new Response(c.res.clone().body, c.res)
 		copy.headers.set('Cache-Control', EDGE_COPY_CACHE_CONTROL)
 		c.executionCtx.waitUntil(edge.put(key, copy))
@@ -335,6 +343,15 @@ function parseReceipt(raw: string | null): AiVerdictReceipt | null {
 
 function pairKey(a: string, b: string): [string, string] {
 	return a < b ? [a, b] : [b, a]
+}
+
+function samePair(receipt: AiVerdictReceipt | null, pair: readonly [string, string]): boolean {
+	return Boolean(receipt && receipt.pair[0] === pair[0] && receipt.pair[1] === pair[1])
+}
+
+/** A real (non-fallback) clef-flash adjudication of exactly this pair and input fingerprint. */
+function adjudicates(receipt: AiVerdictReceipt | null, pair: readonly [string, string], fp: string): boolean {
+	return samePair(receipt, pair) && receipt!.fp === fp && !receipt!.fallback && typeof receipt!.p === 'number'
 }
 
 function receiptRevisionsCurrent(receipt: AiVerdictReceipt, revisions: ReadonlyMap<string, number>): boolean {
@@ -411,7 +428,8 @@ async function reevaluateOwnerCohort(
 	address: string,
 	options: { subjectId?: string; allowAi: boolean },
 ): Promise<CohortResult> {
-	let fresh: { hostId: string; receipt: AiVerdictReceipt; baseVerdict: string | null } | null = null
+	// `captured` = both pair participants' Ai_Verdict as read before inference.
+	let fresh: { hostId: string; receipt: AiVerdictReceipt; captured: Map<string, string | null> } | null = null
 
 	for (let attempt = 0; attempt < MAX_COHORT_ATTEMPTS; attempt += 1) {
 		const { epoch, rows, publicSmols } = await loadCohortSnapshot(env, address)
@@ -421,12 +439,20 @@ async function reevaluateOwnerCohort(
 
 		let freshUsable = false
 		if (fresh) {
+			const { receipt, captured } = fresh
 			const host = rows.find((row) => row.Id === fresh!.hostId)
-			const [x, y] = fresh.receipt.pair.map((id) => byId.get(id))
+			const [x, y] = receipt.pair.map((id) => byId.get(id))
+			// Discard a late result if EITHER participant now holds a different adjudication of this
+			// exact (pair, fingerprint) than when we read it: an intervening request already decided.
+			const intervened = receipt.pair.some((id) => {
+				const current = rows.find((row) => row.Id === id)?.Ai_Verdict ?? null
+				return current !== captured.get(id) && adjudicates(parseReceipt(current), receipt.pair, receipt.fp)
+			})
 			freshUsable = Boolean(host && x && y)
-				&& host!.Ai_Verdict === fresh.baseVerdict
-				&& receiptRevisionsCurrent(fresh.receipt, revisions)
-				&& fresh.receipt.fp === await pairFingerprint(x!, y!)
+				&& !intervened
+				&& host!.Ai_Verdict === captured.get(host!.Id)
+				&& receiptRevisionsCurrent(receipt, revisions)
+				&& receipt.fp === await pairFingerprint(x!, y!)
 		}
 		const receiptOf = (row: MixtapeRow) => (freshUsable && fresh?.hostId === row.Id ? fresh.receipt : parseReceipt(row.Ai_Verdict))
 		const verdicts = await collectVerdicts(rows, candidates, receiptOf)
@@ -446,8 +472,15 @@ async function reevaluateOwnerCohort(
 					at: new Date().toISOString(),
 				}
 				const baseVerdictOf = (id: string) => rows.find((row) => row.Id === id)?.Ai_Verdict ?? null
+				const captured = new Map(ids.map((id) => [id, baseVerdictOf(id)]))
+				// Same inputs already adjudicated at these revisions (on either row)? Honor it, no inference.
+				const existing = ids
+					.map((id) => parseReceipt(baseVerdictOf(id)))
+					.find((receipt) => adjudicates(receipt, ids, base.fp) && receiptRevisionsCurrent(receipt!, revisions))
 				const titles = new Map([...publicSmols.values()].map((smol) => [smol.Id, smol.Title]))
-				const verdict = await adjudicateMixtapePair(env, pair.a, pair.b, titles)
+				const verdict = existing
+					? { ok: false as const, reason: 'disabled' as const, latencyMs: 0 }
+					: await adjudicateMixtapePair(env, pair.a, pair.b, titles)
 				if (verdict.ok) {
 					const keeper = strongerOf(pair.a, pair.b)
 					const hidden = keeper.id === pair.a.id ? pair.b : pair.a
@@ -461,7 +494,7 @@ async function reevaluateOwnerCohort(
 						hidden: null,
 						ms: verdict.verdict.latencyMs,
 					}
-					fresh = { hostId: subjectId, receipt, baseVerdict: baseVerdictOf(subjectId) }
+					fresh = { hostId: subjectId, receipt, captured }
 					if (verdict.verdict.isDuplicate) {
 						const trial = classifyOwnerMixtapes(candidates, [...verdicts, { hiddenId: hidden.id, keeperId: keeper.id, pDuplicate: receipt.p! }])
 						const applied = trial.get(hidden.id)?.hiddenReason === 'semantic_duplicate' && trial.get(hidden.id)?.relatedId === keeper.id
@@ -469,7 +502,7 @@ async function reevaluateOwnerCohort(
 						if (applied) {
 							receipt.keep = keeper.id
 							receipt.hidden = hidden.id
-							fresh = { hostId: hidden.id, receipt, baseVerdict: baseVerdictOf(hidden.id) }
+							fresh = { hostId: hidden.id, receipt, captured }
 							decisions = trial
 						}
 					}
@@ -477,7 +510,7 @@ async function reevaluateOwnerCohort(
 					fresh = {
 						hostId: subjectId,
 						receipt: { ...base, model: MIXTAPE_DEDUPE_MODEL_SELECTOR, fallback: verdict.reason, ms: verdict.latencyMs },
-						baseVerdict: baseVerdictOf(subjectId),
+						captured,
 					}
 				}
 				freshUsable = fresh !== null
@@ -488,7 +521,12 @@ async function reevaluateOwnerCohort(
 		const changedIds: string[] = []
 		const nextRows = rows.map((row) => {
 			const decision = decisions.get(row.Id)!
-			const aiVerdict = freshUsable && fresh?.hostId === row.Id ? JSON.stringify(fresh.receipt) : row.Ai_Verdict
+			let aiVerdict = row.Ai_Verdict
+			if (freshUsable && fresh) {
+				if (fresh.hostId === row.Id) aiVerdict = JSON.stringify(fresh.receipt)
+				// Never leave a second, possibly contradictory receipt for the same pair on the other row.
+				else if (fresh.receipt.pair.includes(row.Id) && samePair(parseReceipt(row.Ai_Verdict), fresh.receipt.pair)) aiVerdict = null
+			}
 			const changed = row.Visibility !== decision.visibility
 				|| row.Hidden_Reason !== decision.hiddenReason
 				|| row.Related_Mixtape_Id !== decision.relatedId
@@ -758,13 +796,31 @@ mixtapes.post('/check-uniqueness', parseAuth, async (c) => {
 	})
 })
 
+const REPLAY_POLL_MS = 40
+const REPLAY_WAIT_MS = 2000
+const MAX_CREATE_ATTEMPTS = 2
+
 /** The committed state of an existing winner, as a 200 idempotent-retry receipt. */
-async function dedupedResponse(c: Context<HonoEnv>, sub: string, winnerId: string) {
+async function dedupedResponse(c: Context<HonoEnv>, sub: string, winner: MixtapeRow) {
 	const { rows, publicSmols } = await loadCohortSnapshot(c.env, sub)
-	const winner = rows.find((row) => row.Id === winnerId)
-	if (!winner) throw new HTTPException(409, { message: 'An identical mixtape is being created; try again' })
+	const current = rows.find((row) => row.Id === winner.Id) ?? winner
 	const { decisions } = await deriveDecisions(rows, publicSmols)
-	return privateJson(c, { ...writeReceipt(winner, decisions.get(winnerId)!), deduplicated: true })
+	return privateJson(c, { ...writeReceipt(current, decisions.get(winner.Id)!), deduplicated: true })
+}
+
+/**
+ * Wait (briefly) until the winning create has committed its cohort classification, so a
+ * concurrent replay reports the same final visibility as the winner's 201.
+ */
+async function awaitFinalizedClaim(env: Env, key: string): Promise<string | null> {
+	const deadline = Date.now() + REPLAY_WAIT_MS
+	for (;;) {
+		const claim = await env.SMOL_D1.prepare('SELECT Mixtape_Id, Finalized FROM MixtapeRetryClaim WHERE Retry_Key = ?1')
+			.bind(key).first<{ Mixtape_Id: string; Finalized: number }>()
+		if (!claim) return null
+		if (claim.Finalized === 1 || Date.now() >= deadline) return claim.Mixtape_Id
+		await new Promise((resolve) => setTimeout(resolve, REPLAY_POLL_MS))
+	}
 }
 
 // Create new mixtape
@@ -786,39 +842,64 @@ mixtapes.post('/', parseAuth, async (c) => {
 	// Claim the normalized retry identity and insert the row in ONE batch: whoever holds the claim
 	// owns the only row, so no provisional duplicate row is ever created or visible.
 	const key = await retryKey(sub, smolsString, title, desc)
-	const id = newMixtapeId()
-	const results = await env.SMOL_D1.batch([
-		env.SMOL_D1.prepare(`DELETE FROM MixtapeRetryClaim WHERE Created_At < datetime('now', '${IDEMPOTENT_RETRY_WINDOW}')`),
-		// A claim only stands while its mixtape is live, unedited (Revision 1) and inside the window.
-		env.SMOL_D1.prepare(`
-			DELETE FROM MixtapeRetryClaim
-			WHERE Retry_Key = ?1 AND NOT EXISTS (
-				SELECT 1 FROM Mixtapes m
-				WHERE m.Id = MixtapeRetryClaim.Mixtape_Id AND m.Deleted_At IS NULL AND m.Revision = 1
-					AND m.Created_At >= datetime('now', '${IDEMPOTENT_RETRY_WINDOW}')
-			)
-		`).bind(key),
-		env.SMOL_D1.prepare('INSERT OR IGNORE INTO MixtapeRetryClaim (Retry_Key, Mixtape_Id) VALUES (?1, ?2)').bind(key, id),
-		env.SMOL_D1.prepare(`
-			INSERT INTO Mixtapes (Id, Title, Desc, Smols, "Address", Updated_At, Visibility, Revision)
-			SELECT ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP, 'public', 1
-			WHERE EXISTS (SELECT 1 FROM MixtapeRetryClaim WHERE Retry_Key = ?1 AND Mixtape_Id = ?2)
-		`).bind(key, id, title, desc, smolsString, sub),
-		env.SMOL_D1.prepare(BUMP_EPOCH_SQL),
-	])
+	for (let attempt = 0; attempt < MAX_CREATE_ATTEMPTS; attempt += 1) {
+		// A claim stands while its mixtape is live, inside the window and its CURRENT content still
+		// has this retry identity (a no-op PATCH keeps the protection; a real edit releases it).
+		const prior = await env.SMOL_D1.prepare(`
+			SELECT c.Mixtape_Id AS Mixtape_Id, m.Title AS Title, m.Desc AS Desc, m.Smols AS Smols,
+				m."Address" AS Address, m.Revision AS Revision
+			FROM MixtapeRetryClaim c LEFT JOIN Mixtapes m ON m.Id = c.Mixtape_Id
+			WHERE c.Retry_Key = ?1
+		`).bind(key).first<{ Mixtape_Id: string; Title: string | null; Desc: string | null; Smols: string | null; Address: string | null; Revision: number | null }>()
+		const priorDiverged = Boolean(prior?.Title !== null && prior?.Title !== undefined
+			&& await retryKey(prior.Address!, prior.Smols!, prior.Title, prior.Desc ?? '') !== key)
 
-	if (results[3]?.meta?.changes !== 1) {
-		const claim = await env.SMOL_D1.prepare('SELECT Mixtape_Id FROM MixtapeRetryClaim WHERE Retry_Key = ?1').bind(key).first<{ Mixtape_Id: string }>()
-		if (!claim) throw new HTTPException(409, { message: 'An identical mixtape is being created; try again' })
-		return await dedupedResponse(c, sub, claim.Mixtape_Id)
+		const id = newMixtapeId()
+		const results = await env.SMOL_D1.batch([
+			env.SMOL_D1.prepare(`DELETE FROM MixtapeRetryClaim WHERE Created_At < datetime('now', '${IDEMPOTENT_RETRY_WINDOW}')`),
+			env.SMOL_D1.prepare(`
+				DELETE FROM MixtapeRetryClaim
+				WHERE Retry_Key = ?1 AND (
+					NOT EXISTS (
+						SELECT 1 FROM Mixtapes m
+						WHERE m.Id = MixtapeRetryClaim.Mixtape_Id AND m.Deleted_At IS NULL
+							AND m.Created_At >= datetime('now', '${IDEMPOTENT_RETRY_WINDOW}')
+					)
+					OR (Mixtape_Id = ?2 AND EXISTS (SELECT 1 FROM Mixtapes m WHERE m.Id = ?2 AND m.Revision = ?3))
+				)
+			`).bind(key, priorDiverged ? prior!.Mixtape_Id : null, priorDiverged ? prior!.Revision : null),
+			env.SMOL_D1.prepare('INSERT OR IGNORE INTO MixtapeRetryClaim (Retry_Key, Mixtape_Id) VALUES (?1, ?2)').bind(key, id),
+			env.SMOL_D1.prepare(`
+				INSERT INTO Mixtapes (Id, Title, Desc, Smols, "Address", Updated_At, Visibility, Revision)
+				SELECT ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP, 'public', 1
+				WHERE EXISTS (SELECT 1 FROM MixtapeRetryClaim WHERE Retry_Key = ?1 AND Mixtape_Id = ?2)
+			`).bind(key, id, title, desc, smolsString, sub),
+			env.SMOL_D1.prepare(BUMP_EPOCH_SQL),
+		])
+
+		if (results[3]?.meta?.changes === 1) {
+			return await afterCommit(c, [id], async (purgeIds) => {
+				try {
+					const cohort = await reevaluateOwnerCohort(env, sub, { subjectId: id, allowAi: true })
+					cohort.changedIds.forEach((changed) => purgeIds.add(changed))
+					const { row, decision } = cohortView(cohort, id)
+					return privateJson(c, { ...writeReceipt(row, decision), deduplicated: false }, 201)
+				} finally {
+					// Classification committed (or failed): release any replay waiting on this claim.
+					await env.SMOL_D1.prepare('UPDATE MixtapeRetryClaim SET Finalized = 1 WHERE Retry_Key = ?1 AND Mixtape_Id = ?2')
+						.bind(key, id).run().catch((error) => console.warn('mixtape_retry_finalize_failed', error))
+				}
+			})
+		}
+
+		const winnerId = await awaitFinalizedClaim(env, key)
+		const winner = winnerId ? await loadMixtapeRow(env, winnerId) : null
+		if (winner && !winner.Deleted_At && await retryKey(winner.Address, winner.Smols, winner.Title, winner.Desc) === key) {
+			return await dedupedResponse(c, sub, winner)
+		}
+		// The claim holder vanished or was edited away meanwhile: claim again.
 	}
-
-	return await afterCommit(c, [id], async (purgeIds) => {
-		const cohort = await reevaluateOwnerCohort(env, sub, { subjectId: id, allowAi: true })
-		cohort.changedIds.forEach((changed) => purgeIds.add(changed))
-		const { row, decision } = cohortView(cohort, id)
-		return privateJson(c, { ...writeReceipt(row, decision), deduplicated: false }, 201)
-	})
+	throw new HTTPException(409, { message: 'An identical mixtape is being created; try again' })
 })
 
 /** Terminal live target of a merged mixtape. Cycle-safe, no hop limit (writes flatten aliases). */

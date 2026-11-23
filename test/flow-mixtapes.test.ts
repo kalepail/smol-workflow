@@ -1029,3 +1029,108 @@ test('Pass 2 P2-2: a song privacy flip during pending clef inference yields an a
 	assert.equal((await h.json(`/mixtapes/${a}`)).body.Visibility, 'public', 'receipt matches the next read')
 	assert.equal(h.aiCalls.length, 1)
 })
+
+// ---------------------------------------------------------------------------
+// Pass-3 regressions (reports/25b-review-mixtape-be.md §Pass 3)
+// ---------------------------------------------------------------------------
+
+test('Pass 3 P1: a late verdict cannot contradict a committed adjudication of the same pair stored on the other row', async () => {
+	let resolveFirst!: (value: unknown) => void
+	let markFirstCalled!: () => void
+	const firstCalled = new Promise<void>((resolve) => { markFirstCalled = resolve })
+	let calls = 0
+	const h = buildHarness({
+		ai: async () => {
+			calls += 1
+			if (calls === 1) {
+				markFirstCalled()
+				return await new Promise((resolve) => { resolveFirst = resolve })
+			}
+			return clefAnswer(0.03) // the newer request: clearly unique
+		},
+	})
+	// Both evaluations read the same (X rev 1, Y rev 1) cohort → same pair and input fingerprint.
+	let arrivals = 0
+	let markYRead!: () => void
+	const yRead = new Promise<void>((resolve) => { markYRead = resolve })
+	h.hooks.onStatement = async (sql, args) => {
+		if (!/"Address" = \?1 AND Deleted_At IS NULL AND Visibility != 'deleted'/.test(sql) || args[0] !== NEW_OWNER) return
+		arrivals += 1
+		if (arrivals === 1) await yRead
+		else if (arrivals === 2) {
+			markYRead()
+			await firstCalled
+		}
+	}
+	const pendingX = h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title: 'Drafts', smols: [1, 2, 3, 4, 5].map(SYN) } })
+	while (arrivals < 1) await tick()
+	const y = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title: 'Drafts final', smols: [1, 2, 3, 4, 6, 7, 8].map(SYN) } })
+	const xId = (h.db.prepare(`SELECT Id FROM Mixtapes WHERE Title = 'Drafts'`).get() as { Id: string }).Id
+	const committed = JSON.parse(h.row(y.body.id)!.Ai_Verdict)
+	assert.deepEqual([committed.p, committed.dup], [0.03, false], 'Y committed "unique" on the larger row')
+
+	resolveFirst(clefAnswer(0.95)) // late, contradictory duplicate verdict about the same inputs
+	const x = await pendingX
+	h.hooks.onStatement = undefined
+	assert.equal(h.aiCalls.length, 2)
+	assert.deepEqual([x.status, x.body.visibility, x.body.hiddenReason], [201, 'public', null], 'the committed decision wins')
+	assert.equal(h.row(xId)!.Ai_Verdict, null, 'the late 0.95 receipt was discarded')
+	const receipts = (h.db.prepare(`SELECT Id, Ai_Verdict FROM Mixtapes WHERE "Address" = ? AND Ai_Verdict IS NOT NULL`).all(NEW_OWNER) as Array<{ Id: string; Ai_Verdict: string }>)
+		.map((row) => ({ id: row.Id, ...JSON.parse(row.Ai_Verdict) }))
+		.filter((receipt) => receipt.pair.includes(xId) && receipt.pair.includes(y.body.id))
+	assert.equal(receipts.length, 1, 'exactly one receipt for the pair')
+	assert.equal(receipts[0].p, 0.03)
+	assert.equal((await h.json(`/mixtapes/${xId}`)).body.Visibility, 'public')
+
+	// A later edit moves the pair to new revisions, so it is adjudicated afresh exactly once.
+	assert.equal((await h.send(`/mixtapes/${y.body.id}`, { method: 'PATCH', as: NEW_OWNER, body: { title: 'Drafts final' } })).status, 200)
+	assert.equal(h.aiCalls.length, 3)
+})
+
+test('Pass 3 P2: an identical POST during the winner\'s Clef inference reports the same final visibility', async () => {
+	let resolveAi!: (value: unknown) => void
+	const h = buildHarness({ ai: () => new Promise((resolve) => { resolveAi = resolve }) })
+	const bigger = (await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title: 'Full set', smols: [1, 2, 3, 4, 6, 7, 8].map(SYN) } })).body.id as string
+	h.backdate(bigger, 60)
+	const body = { title: 'Early set', smols: [1, 2, 3, 4, 5].map(SYN) }
+	const pendingWinner = h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	while (h.aiCalls.length < 1) await tick()
+	const replayStarted = Date.now()
+	const pendingReplay = h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	await new Promise((resolve) => setTimeout(resolve, 150)) // the replay is polling the unfinalized claim
+	resolveAi(clefAnswer(0.9))
+	const [winner, replay] = await Promise.all([pendingWinner, pendingReplay])
+	assert.deepEqual([winner.status, winner.body.visibility, winner.body.hiddenReason], [201, 'owner', 'semantic_duplicate'])
+	assert.deepEqual([replay.status, replay.body.deduplicated, replay.body.id], [200, true, winner.body.id])
+	for (const field of ['visibility', 'hiddenReason', 'relatedMixtapeId', 'uniquenessScore', 'revision']) assert.deepEqual(replay.body[field], winner.body[field], `replay ${field}`)
+	assert.ok(Date.now() - replayStarted >= 150, 'the replay waited for finalization')
+	assert.equal(h.aiCalls.length, 1)
+	assert.equal((h.db.prepare('SELECT Finalized FROM MixtapeRetryClaim').all() as Array<{ Finalized: number }>).filter((r) => r.Finalized === 1).length, 2)
+})
+
+test('Pass 3 P2: a no-op PATCH keeps the 15-minute exact-retry protection', async () => {
+	const h = buildHarness()
+	const body = { title: 'Quiet Hours', smols: [SYN(1), SYN(2)] }
+	const created = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	const noop = await h.json(`/mixtapes/${created.body.id}`, { method: 'PATCH', as: NEW_OWNER, body: { desc: '' } })
+	assert.deepEqual([noop.status, noop.body.revision], [200, 2], 'revision bumps, identity unchanged')
+	const replay = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
+	assert.deepEqual([replay.status, replay.body.id, replay.body.deduplicated, replay.body.revision], [200, created.body.id, true, 2])
+	assert.equal((h.db.prepare(`SELECT COUNT(*) AS n FROM Mixtapes WHERE Title = 'Quiet Hours'`).get() as { n: number }).n, 1)
+})
+
+test('Pass 3 P2: non-200 public responses (deleted / merged / unknown 404) are never shareable', async () => {
+	const h = buildHarness()
+	assert.equal((await h.send(`/mixtapes/${CORDOVA}`, { method: 'DELETE', as: CORDOVA_OWNER })).status, 200)
+	assert.equal((await h.send(`/mixtapes/${CREASY_V1}/merge`, { method: 'POST', as: CREASY_OWNER, body: { targetId: CREASY_V2 } })).status, 200)
+	for (const path of [`/mixtapes/${CORDOVA}`, `/mixtapes/${CREASY_V1}`, '/mixtapes/doesnotexist']) {
+		const res = await h.send(path)
+		assert.equal(res.status, 404, path)
+		assert.equal(res.headers.get('Cache-Control'), 'no-store', `${path} Cache-Control`)
+		assert.equal(res.headers.get('CDN-Cache-Control'), 'no-store', `${path} CDN-Cache-Control`)
+	}
+	assert.ok(!h.cache.keys().some((key) => key.includes(CORDOVA) || key.includes('doesnotexist')), 'no 404 in the Worker cache')
+	assert.equal((await h.send(`/mixtapes/${CORDOVA}/restore`, { method: 'POST', as: CORDOVA_OWNER })).status, 200)
+	const restored = await h.send(`/mixtapes/${CORDOVA}`)
+	assert.deepEqual([restored.status, restored.headers.get('Cache-Control'), restored.headers.get('CDN-Cache-Control')], [200, 'public, max-age=0, must-revalidate', 'public, s-maxage=60, stale-while-revalidate=120'], 'undo is visible immediately')
+})
