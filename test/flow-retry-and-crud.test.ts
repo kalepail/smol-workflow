@@ -1796,3 +1796,149 @@ test('Pass-4 P1 regression: expired Workflow instance (instance.not_found) NEVER
 	assert.equal(seedCrashHarness.createdWorkflows.length, 1)
 	assert.equal(seedCrashHarness.createdWorkflows[0].id, reservedScB)
 })
+
+
+test('PUT /:id blocks hiding minted songs (Mint_Token, Mint_Amm, and concurrent mint race) while still allowing legacy private minted songs to publish', async () => {
+	const harness = createRetryCrudHarness()
+	const ctx = createMockExecutionContext()
+	const token = await createAuthToken(OWNER, TEST_SECRET)
+	const mintedTokenId = 'b1'.repeat(32)
+	const mintedAmmId = 'b2'.repeat(32)
+	const raceId = 'b3'.repeat(32)
+	const legacyPrivateMintedId = 'b4'.repeat(32)
+
+	const extraMintFields = new Map<string, { Mint_Token?: string | null; Mint_Amm?: string | null }>([
+		[mintedTokenId, { Mint_Token: 'CMINTTOKEN000000000000000000000000000000000000000000000001', Mint_Amm: null }],
+		[mintedAmmId, { Mint_Token: null, Mint_Amm: 'CMINTAMM00000000000000000000000000000000000000000000000001' }],
+		[raceId, { Mint_Token: null, Mint_Amm: null }],
+		[legacyPrivateMintedId, { Mint_Token: 'CMINTTOKEN000000000000000000000000000000000000000000000002', Mint_Amm: null }],
+	])
+
+	for (const [id, pub] of [
+		[mintedTokenId, 1],
+		[mintedAmmId, 1],
+		[raceId, 1],
+		[legacyPrivateMintedId, 0],
+	] as const) {
+		harness.smolsTable.set(id, {
+			Id: id,
+			Title: `Song ${id.slice(0, 4)}`,
+			Song_1: 's1',
+			Song_2: null,
+			Address: OWNER,
+			Public: pub,
+		})
+	}
+	harness.kv.set(legacyPrivateMintedId, JSON.stringify({
+		payload: { address: OWNER, prompt: 'legacy minted' },
+		nsfw: { safe: true, categories: [] },
+	}))
+
+	let simulateConcurrentMint = false
+	const origPrepare = harness.env.SMOL_D1.prepare.bind(harness.env.SMOL_D1)
+	;(harness.env.SMOL_D1 as any).prepare = (sql: string) => {
+		if (sql.includes('SELECT Public') && sql.includes('WHERE Id = ?1 AND "Address" = ?2')) {
+			return {
+				bind: (id: string, addr: string) => ({
+					first: async () => {
+						const row = harness.smolsTable.get(id)
+						if (!row || row.Address !== addr) return null
+						const mint = extraMintFields.get(id) ?? {}
+						return { Public: row.Public, Mint_Token: mint.Mint_Token ?? null, Mint_Amm: mint.Mint_Amm ?? null }
+					},
+				}),
+			}
+		}
+		if (sql.includes('SET Public = ?1') && sql.includes('AND Public = ?4')) {
+			return {
+				bind: (targetPublic: number, id: string, addr: string, expectedPublic: number) => ({
+					run: async () => {
+						if (simulateConcurrentMint && id === raceId) {
+							extraMintFields.set(raceId, {
+								Mint_Token: 'CMINTTOKENRACE00000000000000000000000000000000000000000001',
+								Mint_Amm: null,
+							})
+							simulateConcurrentMint = false
+						}
+						const row = harness.smolsTable.get(id)
+						const mint = extraMintFields.get(id) ?? {}
+						const minted = Boolean(mint.Mint_Token?.trim() || mint.Mint_Amm?.trim())
+						const requireUnminted = sql.includes('Mint_Token IS NULL')
+						if (
+							row &&
+							row.Address === addr &&
+							(row.Public === 1 ? 1 : 0) === expectedPublic &&
+							(!requireUnminted || !minted)
+						) {
+							row.Public = targetPublic
+							return { success: true, meta: { changes: 1 } }
+						}
+						return { success: true, meta: { changes: 0 } }
+					},
+				}),
+			}
+		}
+		return origPrepare(sql)
+	}
+
+	// 1. Mint_Token set -> 409 and stays Public = 1
+	const resToken = await appModule.app.fetch(
+		new Request(`https://api.smol.xyz/${mintedTokenId}`, {
+			method: 'PUT',
+			headers: { Authorization: `Bearer ${token}` },
+		}),
+		harness.env,
+		ctx.ctx
+	)
+	assert.equal(resToken.status, 409)
+	assert.equal(harness.smolsTable.get(mintedTokenId)?.Public, 1)
+
+	// 2. Mint_Amm set -> 409 and stays Public = 1
+	const resAmm = await appModule.app.fetch(
+		new Request(`https://api.smol.xyz/${mintedAmmId}`, {
+			method: 'PUT',
+			headers: { Authorization: `Bearer ${token}` },
+		}),
+		harness.env,
+		ctx.ctx
+	)
+	assert.equal(resAmm.status, 409)
+	assert.equal(harness.smolsTable.get(mintedAmmId)?.Public, 1)
+
+	// 3. Concurrent mint races between SELECT and UPDATE -> CAS blocks hide and returns 409
+	simulateConcurrentMint = true
+	const resRace = await appModule.app.fetch(
+		new Request(`https://api.smol.xyz/${raceId}`, {
+			method: 'PUT',
+			headers: { Authorization: `Bearer ${token}` },
+		}),
+		harness.env,
+		ctx.ctx
+	)
+	assert.equal(resRace.status, 409)
+	assert.equal(harness.smolsTable.get(raceId)?.Public, 1)
+
+	// 4. Legacy private minted song can still be published (0 -> 1), then cannot be hidden again (1 -> 0)
+	const resPublish = await appModule.app.fetch(
+		new Request(`https://api.smol.xyz/${legacyPrivateMintedId}`, {
+			method: 'PUT',
+			headers: { Authorization: `Bearer ${token}` },
+		}),
+		harness.env,
+		ctx.ctx
+	)
+	await ctx.flush()
+	assert.equal(resPublish.status, 204)
+	assert.equal(harness.smolsTable.get(legacyPrivateMintedId)?.Public, 1)
+
+	const resRehide = await appModule.app.fetch(
+		new Request(`https://api.smol.xyz/${legacyPrivateMintedId}`, {
+			method: 'PUT',
+			headers: { Authorization: `Bearer ${token}` },
+		}),
+		harness.env,
+		ctx.ctx
+	)
+	assert.equal(resRehide.status, 409)
+	assert.equal(harness.smolsTable.get(legacyPrivateMintedId)?.Public, 1)
+})
