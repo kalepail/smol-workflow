@@ -1523,6 +1523,10 @@ smols.post('/retry/:id', async (c) => {
 	return c.text(targetInstanceId)
 })
 
+function isMintedSmolRecord(record: { Mint_Token?: string | null; Mint_Amm?: string | null }): boolean {
+	return Boolean(record.Mint_Token?.trim() || record.Mint_Amm?.trim())
+}
+
 // Toggle public/private
 smols.put('/:id', parseAuth, async (c) => {
 	const { env, req } = c
@@ -1530,21 +1534,26 @@ smols.put('/:id', parseAuth, async (c) => {
 	const payload = c.get('jwtPayload')!
 
 	const smolRecord = await env.SMOL_D1.prepare(`
-		SELECT Public
+		SELECT Public, Mint_Token, Mint_Amm
 		FROM Smols
 		WHERE Id = ?1 AND "Address" = ?2
 	`)
 		.bind(id, payload.sub)
-		.first<{ Public: number }>()
+		.first<{ Public: number; Mint_Token?: string | null; Mint_Amm?: string | null }>()
 
 	if (!smolRecord) {
 		throw new HTTPException(404, { message: 'Smol not found or not owned by you' })
 	}
 
-	// Always allow hiding (Public 1 -> 0), even if KV/classifier data is missing or unsafe.
+	// Allow hiding unminted songs (Public 1 -> 0), even if KV/classifier data is missing or unsafe.
+	// Block hiding minted songs (on-chain collectibles must remain public).
 	// Require authoritative KV + unambiguous safe classification ONLY when publishing (0 -> 1).
 	const currentPublic = smolRecord.Public === 1 ? 1 : 0
 	const targetPublic = currentPublic === 1 ? 0 : 1
+
+	if (targetPublic === 0 && isMintedSmolRecord(smolRecord)) {
+		throw new HTTPException(409, { message: 'Minted songs must remain public' })
+	}
 
 	if (targetPublic === 1) {
 		const smol_kv: any = await env.SMOL_KV.get(id, 'json')
@@ -1554,24 +1563,38 @@ smols.put('/:id', parseAuth, async (c) => {
 	}
 
 	// Write the validated target visibility with compare-and-set against the value read so
-	// concurrent hide requests can NEVER double-toggle an unsafe smol back to Public = 1.
-	await env.SMOL_D1.prepare(`
+	// concurrent hide requests can NEVER double-toggle an unsafe smol back to Public = 1,
+	// and a concurrent mint racing with hide can NEVER hide a newly minted song.
+	const updateSql = targetPublic === 0
+		? `
 		UPDATE Smols
 		SET Public = ?1
 		WHERE Id = ?2 AND "Address" = ?3 AND Public = ?4
-	`)
+			AND (Mint_Token IS NULL OR TRIM(Mint_Token) = '')
+			AND (Mint_Amm IS NULL OR TRIM(Mint_Amm) = '')
+	`
+		: `
+		UPDATE Smols
+		SET Public = ?1
+		WHERE Id = ?2 AND "Address" = ?3 AND Public = ?4
+	`
+
+	await env.SMOL_D1.prepare(updateSql)
 		.bind(targetPublic, id, payload.sub, currentPublic)
 		.run()
 
 	const updated = await env.SMOL_D1.prepare(`
-		SELECT Public
+		SELECT Public, Mint_Token, Mint_Amm
 		FROM Smols
 		WHERE Id = ?1 AND "Address" = ?2
 	`)
 		.bind(id, payload.sub)
-		.first<{ Public: number }>()
+		.first<{ Public: number; Mint_Token?: string | null; Mint_Amm?: string | null }>()
 
 	const visibleUpdate = requireOwnedVisibilityToggle(updated)
+	if (targetPublic === 0 && visibleUpdate.Public === 1 && updated && isMintedSmolRecord(updated)) {
+		throw new HTTPException(409, { message: 'Minted songs must remain public' })
+	}
 	const playlistTitles = await getPlaylistTitlesForSmol(env, id)
 
 	runBackground(
