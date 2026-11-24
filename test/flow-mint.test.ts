@@ -514,3 +514,69 @@ test('Gate 3c: POST /mint/:id and POST /mint deduplicate identical submissions a
 	assert.deepEqual(await b2.json(), firstBatch)
 	assert.equal(harness.txWorkflowCreates.length, 2, 'Duplicate batch mint request must deduplicate')
 })
+
+test('A2: a relay error that still carries a valid 64-hex hash is checkpointed and confirmed, never dropped', async () => {
+	const harness = createMintEnv({
+		[SINGLE_ID]: { Address: OWNER_SUB, Mint_Token: null, Mint_Amm: null },
+	})
+	const relayHash = 'AB'.repeat(32)
+	harness.setRelayResponder(async () => ({ hash: relayHash, error: 'WAIT_TIMEOUT', errorCode: 'WAIT_TIMEOUT' }))
+	const resultMetaB64 = buildReturnValueMetaB64([SINGLE_PAIR.sac, SINGLE_PAIR.pool])
+	const { envelopeXdr, resultXdr } = buildMockEnvelopeAndResultXdr()
+	const polledHashes: string[] = []
+
+	const originalFetch = globalThis.fetch
+	globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+		const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+		if (url.includes('rpc.test.local')) {
+			const body = JSON.parse(String(init?.body ?? '{}'))
+			polledHashes.push(body.params?.hash)
+			return Response.json({
+				jsonrpc: '2.0',
+				id: body.id ?? 1,
+				result: {
+					status: 'SUCCESS',
+					latestLedger: 100,
+					latestLedgerCloseTime: '1700000000',
+					oldestLedger: 1,
+					oldestLedgerCloseTime: '1690000000',
+					envelopeXdr,
+					resultXdr,
+					resultMetaXdr: resultMetaB64,
+				},
+			})
+		}
+		if (url.includes('/purge_cache')) return Response.json({ success: true })
+		throw new Error(`Unexpected fetch: ${url}`)
+	}) as typeof fetch
+
+	try {
+		const wf = new txWorkflowModule.TxWorkflow({} as ExecutionContext, harness.env)
+		wf.signTransaction = async (x) => `signed:${x}`
+		const event = {
+			payload: { type: 'mint' as const, entropy: SINGLE_ID, xdr: 'unsigned-xdr', sub: MINTER_SUB, ownerSub: OWNER_SUB },
+			instanceId: 'mint-a2-hash',
+			timestamp: new Date(),
+		}
+
+		const cache = new Map<string, unknown>()
+		await wf.run(event as never, createWorkflowStep(cache).step as never)
+		assert.equal(harness.getRelaySubmitCalls(), 1)
+		assert.deepEqual(cache.get('submit transaction#1'), { hash: relayHash.toLowerCase() }, 'relay hash is checkpointed')
+		assert.ok(polledHashes.length > 0 && polledHashes.every((h) => h === relayHash.toLowerCase()), 'confirm polls the relay hash')
+		assert.equal(harness.rows.get(SINGLE_ID)?.Mint_Token, SINGLE_PAIR.sac, 'landed mint is persisted')
+
+		// An error with no usable hash is still a hard stop (no confirm, no duplicate submit).
+		for (const response of [{ error: 'WAIT_TIMEOUT' }, { hash: 'not-a-hash', error: 'ONCHAIN_FAILED' }]) {
+			harness.setRelayResponder(async () => response)
+			polledHashes.length = 0
+			await assert.rejects(
+				() => wf.run({ ...event, instanceId: `mint-a2-${response.error}` } as never, createWorkflowStep(new Map()).step as never),
+				/Relay could not confirm submission/
+			)
+			assert.equal(polledHashes.length, 0)
+		}
+	} finally {
+		globalThis.fetch = originalFetch
+	}
+})

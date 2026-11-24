@@ -276,8 +276,26 @@ async function publicCacheKey(c: Context<HonoEnv>): Promise<string> {
 	return url.toString()
 }
 
+function stripOriginSpecificHeaders(headers: Headers): Headers {
+	const clean = new Headers(headers)
+	for (const name of [...clean.keys()]) {
+		if (name.startsWith('access-control-')) clean.delete(name)
+	}
+	clean.delete('Vary')
+	return clean
+}
+
+/**
+ * Serve an edge-cache HIT. Origin-specific headers are stripped on the hit path too, so a warm entry
+ * written before the strip-on-write deploy (same v2 namespace, <= 60s TTL) can never replay its first
+ * requester's Access-Control-* / Vary headers; the global cors() middleware re-adds the right ones.
+ */
 function withBrowserPolicy(response: Response): Response {
-	const out = new Response(response.body, response)
+	const out = new Response(response.body, {
+		status: response.status,
+		statusText: response.statusText,
+		headers: stripOriginSpecificHeaders(response.headers),
+	})
 	out.headers.set('Cache-Control', BROWSER_CACHE_CONTROL)
 	out.headers.set('CDN-Cache-Control', CDN_CACHE_CONTROL)
 	return out
@@ -304,7 +322,9 @@ const publicCache = () => async (c: Context<HonoEnv>, next: Next) => {
 		return
 	}
 	if (edge) {
-		const copy = new Response(c.res.clone().body, c.res)
+		// The shared edge copy must not carry the first requester's CORS headers: the global cors()
+		// middleware re-adds the right ones per request on a hit (matches src/api/media.ts).
+		const copy = new Response(c.res.clone().body, { status: c.res.status, headers: stripOriginSpecificHeaders(c.res.headers) })
 		copy.headers.set('Cache-Control', EDGE_COPY_CACHE_CONTROL)
 		c.executionCtx.waitUntil(edge.put(key, copy))
 	}

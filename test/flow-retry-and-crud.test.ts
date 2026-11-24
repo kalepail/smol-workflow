@@ -293,7 +293,7 @@ test('Gate 2a: POST /retry/:id seeds DO immediately (no owner 404), preserves pr
 	const overrideRes = await appModule.app.fetch(
 		new Request(`https://api.smol.xyz/retry/${OLD_ID}`, {
 			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
+			headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
 			body: JSON.stringify({ override_provider: 'aisonggenerator' }),
 		}),
 		harness.env,
@@ -723,7 +723,7 @@ test('Post-review P0/P1 regressions: published smol protected even with override
 	const retryOverridePublished = await appModule.app.fetch(
 		new Request(`https://api.smol.xyz/retry/${pubId}`, {
 			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
+			headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
 			body: JSON.stringify({ override_provider: 'elevenlabs' }),
 		}),
 		harness.env,
@@ -1941,4 +1941,406 @@ test('PUT /:id blocks hiding minted songs (Mint_Token, Mint_Amm, and concurrent 
 	)
 	assert.equal(resRehide.status, 409)
 	assert.equal(harness.smolsTable.get(legacyPrivateMintedId)?.Public, 1)
+})
+
+test('A1: carried ambiguous AISG attempt reconciles by replaying POST /api/tasks with the stored Idempotency-Key (never GET /api/attempts)', async () => {
+	const harness = createRetryCrudHarness()
+	const makeAudio = (seed: number) => Uint8Array.from({ length: 40_000 }, (_, i) => (seed + i * 17) & 0xff)
+	const audio1 = makeAudio(11)
+	const audio2 = makeAudio(77)
+	const attemptId = `smol-${'a1'.repeat(32)}-aisg`
+	const replays: Array<{ key: string | null; body: Record<string, unknown> }> = []
+	const otherCalls: string[] = []
+	let replayResponder: () => Response = () => Response.json({ task_id: 'task-a1', workspace_id: 'ws-a1' })
+
+	;(harness.env as any).AISONGGENERATOR = {
+		fetch: async (url: string, init?: RequestInit) => {
+			if (url.endsWith('/api/tasks') && init?.method === 'POST') {
+				replays.push({
+					key: new Headers(init.headers).get('Idempotency-Key'),
+					body: JSON.parse(String(init.body)),
+				})
+				return replayResponder()
+			}
+			if (url.includes('/api/tasks/task-a1')) {
+				return Response.json({ task_id: 'task-a1', music_ids: ['a1-song-1', 'a1-song-2'] })
+			}
+			if (url.includes('/api/songs?ids=')) {
+				return Response.json([
+					{ music_id: 'a1-song-1', status: 4, audio: 'https://cdn.aisg.test/a1-1.mp3', service: 'aisonggenerator' },
+					{ music_id: 'a1-song-2', status: 4, audio: 'https://cdn.aisg.test/a1-2.mp3', service: 'aisonggenerator' },
+				])
+			}
+			otherCalls.push(url)
+			throw new Error(`Unexpected AISG call: ${url}`)
+		},
+	}
+
+	const originalFetch = globalThis.fetch
+	globalThis.fetch = (async (input: string | URL | Request) => {
+		const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+		if (url.includes('/a1-1.mp3')) return new Response(audio1, { status: 200 })
+		if (url.includes('/a1-2.mp3')) return new Response(audio2, { status: 200 })
+		if (url.includes('/purge_cache')) return Response.json({ success: true })
+		throw new Error(`Unexpected fetch: ${url}`)
+	}) as typeof fetch
+
+	const seedCarried = (oldId: string) => {
+		const storage = harness.doNs.getStorage(oldId)
+		storage.set('payload', { address: OWNER, prompt: 'replay me', public: false, provider: 'aisonggenerator' })
+		storage.set('image_base64', Buffer.from('img').toString('base64'))
+		storage.set('description', 'Replay desc')
+		storage.set('lyrics', { title: 'Replay', style: ['pop', 'synth'], lyrics: 'verse' })
+		storage.set('nsfw', { safe: true, categories: [] })
+		storage.set('provider_attempt', {
+			provider: 'aisonggenerator',
+			status: 'ambiguous',
+			attempt_id: attemptId,
+			source_smol_id: oldId,
+			error_code: 'submit_outcome_unknown',
+			updated_at: '2026-11-24T00:00:00.000Z',
+		})
+	}
+
+	try {
+		const wf = new workflowModule.Workflow({} as ExecutionContext, harness.env)
+
+		// 1. Stored receipt is accepted -> replay returns the task id, discovery + polling resume, no new key.
+		const okOldId = 'a1'.repeat(32)
+		const okNewId = 'a2'.repeat(32)
+		seedCarried(okOldId)
+		await wf.run(
+			{ payload: { retry_id: okOldId }, instanceId: okNewId, timestamp: new Date() } as never,
+			createWorkflowStep(new Map()).step as never
+		)
+		assert.equal(replays.length, 1, 'exactly one keyed replay')
+		assert.equal(replays[0].key, attemptId, 'replay reuses the stored Idempotency-Key')
+		assert.equal(replays[0].body.attempt_id, attemptId)
+		assert.equal(replays[0].body.public, false, 'replay payload must match the original submit (payload hash)')
+		assert.equal(replays[0].body.instrumental, false)
+		assert.equal(replays[0].body.description, 'Replay desc')
+		assert.equal(otherCalls.length, 0, 'no call to the nonexistent GET /api/attempts route')
+		assert.equal(harness.smolsTable.get(okNewId)?.Song_1, 'a1-song-1')
+		assert.equal(harness.smolsTable.get(okNewId)?.Song_2, 'a1-song-2')
+
+		// 2. Receipt still unresolved -> 504 aisg_dispatch_unknown -> refuse another charge, no discovery.
+		replayResponder = () => Response.json(
+			{ error: 'outcome unknown', provider: 'aisonggenerator', code: 'aisg_dispatch_unknown', retryable: false, outcome: 'unknown' },
+			{ status: 504 }
+		)
+		const pendOldId = 'a3'.repeat(32)
+		seedCarried(pendOldId)
+		await assert.rejects(
+			() => wf.run(
+				{ payload: { retry_id: pendOldId }, instanceId: 'a4'.repeat(32), timestamp: new Date() } as never,
+				createWorkflowStep(new Map()).step as never
+			),
+			/requires reconciliation before authorizing another charge/
+		)
+		assert.equal(replays.length, 2, 'unresolved replay is not retried within the step')
+		assert.equal(otherCalls.length, 0)
+	} finally {
+		globalThis.fetch = originalFetch
+	}
+})
+
+test('A1 quota: a legacy claimed AISG attempt with no reservation never replays POST /api/tasks without first holding an AISG quota reservation (missing AND existing worker receipt)', async () => {
+	const makeAudio = (seed: number) => Uint8Array.from({ length: 40_000 }, (_, i) => (seed + i * 13) & 0xff)
+	const audio1 = makeAudio(21)
+	const audio2 = makeAudio(87)
+	type Reservation = { status: string; provider: string } | null
+
+	const run = async (opts: {
+		label: string
+		receipts: Map<string, string>
+		dailyClassic?: string
+		carriedReservation?: boolean
+		replayStatus?: { status: number; body: Record<string, unknown> }
+	}) => {
+		const harness = createRetryCrudHarness()
+		if (opts.dailyClassic !== undefined) (harness.env as any).DAILY_LIMIT_CLASSIC = opts.dailyClassic
+		const quotaStub = () => (harness.env as any).USER_QUOTA.get((harness.env as any).USER_QUOTA.idFromName(`user:${OWNER}`))
+		const oldId = `${opts.label}`.padEnd(64, '0')
+		const newId = `${opts.label}`.padEnd(64, '1')
+		const attemptId = `smol-${oldId}-aisg`
+		const reconcileReservationId = `${newId}:reconcile:aisonggenerator`
+		const posts: Array<{ key: string | null; reservationAtPost: Reservation }> = []
+		let freshPaidDispatches = 0
+
+		;(harness.env as any).AISONGGENERATOR = {
+			fetch: async (url: string, init?: RequestInit) => {
+				if (url.endsWith('/api/tasks') && init?.method === 'POST') {
+					const key = new Headers(init.headers).get('Idempotency-Key')
+					posts.push({ key, reservationAtPost: await quotaStub().getReservation(reconcileReservationId) })
+					if (opts.replayStatus) return Response.json(opts.replayStatus.body, { status: opts.replayStatus.status })
+					// Mirrors aisonggenerator-worker postTask: stored receipt answers; a miss is a FIRST paid submit.
+					let taskId = opts.receipts.get(key!)
+					if (!taskId) {
+						freshPaidDispatches += 1
+						taskId = `task-${opts.label}`
+						opts.receipts.set(key!, taskId)
+					}
+					return Response.json({ task_id: taskId })
+				}
+				if (url.includes(`/api/tasks/task-${opts.label}`)) {
+					return Response.json({ task_id: `task-${opts.label}`, music_ids: [`${opts.label}-s1`, `${opts.label}-s2`] })
+				}
+				if (url.includes('/api/songs?ids=')) {
+					return Response.json([
+						{ music_id: `${opts.label}-s1`, status: 4, audio: `https://cdn.aisg.test/${opts.label}-1.mp3`, service: 'aisonggenerator' },
+						{ music_id: `${opts.label}-s2`, status: 4, audio: `https://cdn.aisg.test/${opts.label}-2.mp3`, service: 'aisonggenerator' },
+					])
+				}
+				throw new Error(`Unexpected AISG call: ${url}`)
+			},
+		}
+
+		const storage = harness.doNs.getStorage(oldId)
+		storage.set('payload', { address: OWNER, prompt: 'legacy claimed', public: true, provider: 'aisonggenerator' })
+		storage.set('image_base64', Buffer.from('img').toString('base64'))
+		storage.set('description', 'Legacy desc')
+		storage.set('lyrics', { title: 'Legacy', style: ['pop', 'synth'], lyrics: 'verse' })
+		storage.set('nsfw', { safe: true, categories: [] })
+		storage.set('provider_attempt', {
+			provider: 'aisonggenerator',
+			status: 'claimed',
+			attempt_id: attemptId,
+			source_smol_id: oldId,
+			updated_at: '2026-11-24T00:00:00.000Z',
+		})
+		if (opts.carriedReservation) {
+			storage.set('quota_reservation_id', oldId)
+			storage.set('quota_provider', 'aisonggenerator')
+			const held = await quotaStub().reserve(oldId, 'aisonggenerator', { classic: 100, elevenlabs: 100 })
+			assert.equal(held.ok, true)
+		}
+
+		const wf = new workflowModule.Workflow({} as ExecutionContext, harness.env)
+		let error: unknown
+		try {
+			await wf.run(
+				{ payload: { retry_id: oldId }, instanceId: newId, timestamp: new Date() } as never,
+				createWorkflowStep(new Map()).step as never
+			)
+		} catch (err) {
+			error = err
+		}
+		return {
+			harness,
+			posts,
+			error,
+			freshPaidDispatches: () => freshPaidDispatches,
+			attemptId,
+			newId,
+			reservation: async (): Promise<Reservation> => await quotaStub().getReservation(reconcileReservationId),
+		}
+	}
+
+	const originalFetch = globalThis.fetch
+	globalThis.fetch = (async (input: string | URL | Request) => {
+		const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+		if (url.endsWith('-1.mp3')) return new Response(audio1, { status: 200 })
+		if (url.endsWith('-2.mp3')) return new Response(audio2, { status: 200 })
+		if (url.includes('/purge_cache')) return Response.json({ success: true })
+		throw new Error(`Unexpected fetch: ${url}`)
+	}) as typeof fetch
+
+	try {
+		// 1. MISSING worker receipt: the replay is a first paid submit -> it must already hold a reservation.
+		const missing = await run({ label: 'c1', receipts: new Map() })
+		assert.equal(missing.error, undefined, String(missing.error))
+		assert.equal(missing.posts.length, 1)
+		assert.equal(missing.freshPaidDispatches(), 1)
+		assert.equal(missing.posts[0].reservationAtPost?.status, 'reserved', 'AISG reservation held BEFORE the paid replay dispatch')
+		assert.equal(missing.posts[0].reservationAtPost?.provider, 'aisonggenerator')
+		assert.equal((await missing.reservation())?.status, 'committed', 'fresh dispatch commits the reconcile reservation')
+		assert.equal(missing.harness.smolsTable.get(missing.newId)?.Song_1, 'c1-s1')
+		const missingState = missing.harness.doNs.getStorage(missing.newId)
+		assert.equal(missingState.get('quota_reservation_id'), `${missing.newId}:reconcile:aisonggenerator`, 'reconcile reservation persisted for successor retries')
+		assert.equal(missingState.get('quota_provider'), 'aisonggenerator')
+
+		// 2. EXISTING worker receipt: no new upstream charge, but the legacy generation was never counted, so it
+		//    is still admitted under a reservation (counted exactly once) before the replay is sent.
+		const existing = await run({ label: 'c2', receipts: new Map([[`smol-${'c2'.padEnd(64, '0')}-aisg`, 'task-c2']]) })
+		assert.equal(existing.error, undefined, String(existing.error))
+		assert.equal(existing.posts.length, 1)
+		assert.equal(existing.freshPaidDispatches(), 0, 'stored receipt answers the replay')
+		assert.equal(existing.posts[0].reservationAtPost?.status, 'reserved')
+		assert.equal((await existing.reservation())?.status, 'committed')
+		assert.equal(existing.harness.smolsTable.get(existing.newId)?.Song_2, 'c2-s2')
+
+		// 3. Quota exhausted: NO POST /api/tasks at all (missing receipt can never buy an unreserved generation).
+		const denied = await run({ label: 'c3', receipts: new Map(), dailyClassic: '0' })
+		assert.match(String(denied.error), /blocked by quota/)
+		assert.equal(denied.posts.length, 0, 'no replay dispatch without a reservation')
+		assert.equal(denied.freshPaidDispatches(), 0)
+		assert.equal(await denied.reservation(), null)
+
+		// 4. Replay rejected (409 conflict = worker did not dispatch) -> the reconcile reservation is refunded.
+		const conflict = await run({
+			label: 'c4',
+			receipts: new Map(),
+			replayStatus: { status: 409, body: { error: 'conflict', code: 'idempotency_conflict', retryable: false, outcome: 'rejected' } },
+		})
+		assert.match(String(conflict.error), /requires reconciliation before authorizing another charge/)
+		assert.equal(conflict.posts.length, 1)
+		assert.equal((await conflict.reservation())?.status, 'refunded')
+
+		// 5. Replay outcome unknown (504) -> reservation retained (never refunded on a possible charge).
+		const unknown = await run({
+			label: 'c5',
+			receipts: new Map(),
+			replayStatus: { status: 504, body: { error: 'unknown', code: 'aisg_dispatch_unknown', retryable: false, outcome: 'unknown' } },
+		})
+		assert.match(String(unknown.error), /requires reconciliation before authorizing another charge/)
+		assert.equal((await unknown.reservation())?.status, 'ambiguous')
+
+		// 6. Carried AISG reservation already covers the attempt -> no second reservation is taken.
+		const carried = await run({ label: 'c6', receipts: new Map(), carriedReservation: true })
+		assert.equal(carried.error, undefined, String(carried.error))
+		assert.equal(carried.posts.length, 1)
+		assert.equal(await carried.reservation(), null, 'carried AISG reservation is reused, not doubled')
+	} finally {
+		globalThis.fetch = originalFetch
+	}
+})
+
+test('A1 refunded carry: after a typed 402 rejection refunds the reconcile reservation, the next retry verifies the carried ID in the quota DO and reserves a fresh AISG slot before replaying POST /api/tasks', async () => {
+	const makeAudio = (seed: number) => Uint8Array.from({ length: 40_000 }, (_, i) => (seed + i * 29) & 0xff)
+	const audio1 = makeAudio(31)
+	const audio2 = makeAudio(97)
+	type Reservation = { status: string; provider: string } | null
+
+	const originalFetch = globalThis.fetch
+	globalThis.fetch = (async (input: string | URL | Request) => {
+		const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+		if (url.endsWith('-1.mp3')) return new Response(audio1, { status: 200 })
+		if (url.endsWith('-2.mp3')) return new Response(audio2, { status: 200 })
+		if (url.includes('/purge_cache')) return Response.json({ success: true })
+		throw new Error(`Unexpected fetch: ${url}`)
+	}) as typeof fetch
+
+	const scenario = async (label: string, denyOnRetry: boolean) => {
+		const harness = createRetryCrudHarness()
+		const quotaStub = () => (harness.env as any).USER_QUOTA.get((harness.env as any).USER_QUOTA.idFromName(`user:${OWNER}`))
+		const idA = `${label}`.padEnd(64, 'a')
+		const idB = `${label}`.padEnd(64, 'b')
+		const idC = `${label}`.padEnd(64, 'c')
+		const attemptId = `smol-${idA}-aisg`
+		const reservationB = `${idB}:reconcile:aisonggenerator`
+		const reservationC = `${idC}:reconcile:aisonggenerator`
+		// Mirrors aisonggenerator-worker: a typed rejection clears the receipt, so the next keyed POST is a FIRST paid submit.
+		const receipts = new Map<string, string>()
+		let rejectNext = true
+		let freshPaidDispatches = 0
+		const posts: Array<{ key: string | null; b: Reservation; c: Reservation }> = []
+
+		;(harness.env as any).AISONGGENERATOR = {
+			fetch: async (url: string, init?: RequestInit) => {
+				if (url.endsWith('/api/tasks') && init?.method === 'POST') {
+					const key = new Headers(init.headers).get('Idempotency-Key')!
+					posts.push({
+						key,
+						b: await quotaStub().getReservation(reservationB),
+						c: await quotaStub().getReservation(reservationC),
+					})
+					if (rejectNext) {
+						rejectNext = false
+						receipts.delete(key)
+						return Response.json(
+							{ error: 'insufficient credits', code: 'aisg_insufficient_credits', retryable: false, outcome: 'rejected' },
+							{ status: 402 }
+						)
+					}
+					let taskId = receipts.get(key)
+					if (!taskId) {
+						freshPaidDispatches += 1
+						taskId = `task-${label}`
+						receipts.set(key, taskId)
+					}
+					return Response.json({ task_id: taskId })
+				}
+				if (url.includes(`/api/tasks/task-${label}`)) {
+					return Response.json({ task_id: `task-${label}`, music_ids: [`${label}-s1`, `${label}-s2`] })
+				}
+				if (url.includes('/api/songs?ids=')) {
+					return Response.json([
+						{ music_id: `${label}-s1`, status: 4, audio: `https://cdn.aisg.test/${label}-1.mp3`, service: 'aisonggenerator' },
+						{ music_id: `${label}-s2`, status: 4, audio: `https://cdn.aisg.test/${label}-2.mp3`, service: 'aisonggenerator' },
+					])
+				}
+				throw new Error(`Unexpected AISG call: ${url}`)
+			},
+		}
+
+		const storage = harness.doNs.getStorage(idA)
+		storage.set('payload', { address: OWNER, prompt: 'refund then retry', public: true, provider: 'aisonggenerator' })
+		storage.set('image_base64', Buffer.from('img').toString('base64'))
+		storage.set('description', 'Refund desc')
+		storage.set('lyrics', { title: 'Refund', style: ['pop', 'synth'], lyrics: 'verse' })
+		storage.set('nsfw', { safe: true, categories: [] })
+		storage.set('provider_attempt', {
+			provider: 'aisonggenerator',
+			status: 'claimed',
+			attempt_id: attemptId,
+			source_smol_id: idA,
+			updated_at: '2026-11-24T00:00:00.000Z',
+		})
+
+		const wf = new workflowModule.Workflow({} as ExecutionContext, harness.env)
+
+		// Retry 1 (A -> B): legacy claimed attempt reserves B's reconcile slot, the replay gets a typed 402 rejection.
+		await assert.rejects(
+			() => wf.run(
+				{ payload: { retry_id: idA }, instanceId: idB, timestamp: new Date() } as never,
+				createWorkflowStep(new Map()).step as never
+			),
+			/requires reconciliation before authorizing another charge/
+		)
+		assert.equal(posts.length, 1)
+		assert.equal(posts[0].b?.status, 'reserved', 'first replay held B reconcile reservation')
+		assert.equal((await quotaStub().getReservation(reservationB))?.status, 'refunded', 'typed 402 rejection refunds B reservation')
+		const stateB = harness.doNs.getStorage(idB)
+		assert.equal(stateB.get('quota_reservation_id'), reservationB, 'B carries the (now refunded) reservation ID')
+		assert.equal((stateB.get('provider_attempt') as { status?: string } | undefined)?.status, 'claimed', 'B attempt is still claimed')
+		assert.equal(receipts.size, 0, 'worker cleared its receipt on rejection')
+
+		if (denyOnRetry) (harness.env as any).DAILY_LIMIT_CLASSIC = '0'
+
+		// Retry 2 (B -> C): the carried ID alone must not authorize the replay.
+		let error: unknown
+		try {
+			await wf.run(
+				{ payload: { retry_id: idB }, instanceId: idC, timestamp: new Date() } as never,
+				createWorkflowStep(new Map()).step as never
+			)
+		} catch (err) {
+			error = err
+		}
+		return { harness, quotaStub, posts, error, idC, reservationB, reservationC, freshPaidDispatches: () => freshPaidDispatches }
+	}
+
+	try {
+		// Quota available: a fresh C reservation is held at the moment of the (paid) replay and committed after.
+		const ok = await scenario('d1', false)
+		assert.equal(ok.error, undefined, String(ok.error))
+		assert.equal(ok.posts.length, 2)
+		assert.equal(ok.posts[1].b?.status, 'refunded')
+		assert.equal(ok.posts[1].c?.status, 'reserved', 'retry reserved a fresh AISG slot BEFORE the paid replay')
+		assert.equal(ok.posts[1].c?.provider, 'aisonggenerator')
+		assert.equal(ok.freshPaidDispatches(), 1, 'the replay after a cleared receipt is a fresh paid dispatch')
+		assert.equal((await ok.quotaStub().getReservation(ok.reservationC))?.status, 'committed', 'fresh dispatch is counted exactly once')
+		assert.equal((await ok.quotaStub().getReservation(ok.reservationB))?.status, 'refunded', 'refunded slot is never resurrected')
+		assert.equal(ok.harness.doNs.getStorage(ok.idC).get('quota_reservation_id'), ok.reservationC)
+		assert.equal(ok.harness.smolsTable.get(ok.idC)?.Song_1, 'd1-s1')
+
+		// Quota exhausted: the refunded carried ID cannot buy an uncounted generation -> no POST at all.
+		const denied = await scenario('d2', true)
+		assert.match(String(denied.error), /blocked by quota/)
+		assert.equal(denied.posts.length, 1, 'no replay dispatch after the refund without a fresh reservation')
+		assert.equal(denied.freshPaidDispatches(), 0)
+		assert.equal(await denied.quotaStub().getReservation(denied.reservationC), null)
+	} finally {
+		globalThis.fetch = originalFetch
+	}
 })

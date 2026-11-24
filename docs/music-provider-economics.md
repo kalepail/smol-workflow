@@ -1,6 +1,6 @@
 # SMOL Music Provider Economics, Plan Sizing & XLM Pricing
 
-> **Snapshot date:** 2026-11-23
+> **Snapshot date:** 2026-11-23 (length policy and spend ceiling updated 2026-11-24 for `37bd537`)
 > **Applies to:** `smol-workflow`, `aisonggenerator-worker`, and `smol-fe` (`next.smol.xyz`)
 > **Related docs:** [`docs/workflows-and-media.md`](./workflows-and-media.md), `aisonggenerator-worker/docs/aisg-api-notes.md`
 
@@ -13,10 +13,12 @@ This document records the vendor pricing research, live SMOL production usage ba
 - **AISongGenerator (`aisonggenerator.io`) native `v6` ("V4")** remains the most cost-effective default engine at **4 credits flat per generation for 2 × ~3-minute tracks** (**~$0.05–$0.14 / Smol** total including non-music overhead).
 - **ElevenLabs Music API directly** (`music_v2_5` via Cloudflare AI Gateway BYOK) costs a flat **$0.15 / min** across Pay-As-You-Go and all monthly tiers (**~$0.125 / min** annual), which is cheaper than routing ElevenLabs through AISongGenerator on every monthly and one-time credit-pack tier (**$0.165–$0.30 / min** on AISG) and is the only option with a real developer API.
 - **Active ElevenLabs Plan:** **Creator ($22 / mo, 147 min included + $0.15/min usage-based overages, commercial streaming rights)**. Fits SMOL's fallback role and normal baseline usage without overpaying for idle capacity.
-- **Settled Track Shape (Q5):** AISG `v6` generates **2 tracks** (`Song_1`, `Song_2`); ElevenLabs generates **1 track** (`Song_2 = NULL`, `DEFAULT_ELEVENLABS_MUSIC_LENGTH_MS = 120_000` / 2 min for instrumentals, ~2–3 min for vocal composition plans).
+- **Settled Track Shape (Q5):** AISG `v6` generates **2 tracks** (`Song_1`, `Song_2`); ElevenLabs generates **1 track** (`Song_2 = NULL`).
+- **ElevenLabs track length (since `37bd537`):** there is **no fixed 2-minute default any more**. Instrumentals omit `music_length_ms`, so `music_v2_5` picks the length itself (anything from 3 s to 600 s). Vocal composition plans are paced per chunk by `@cf/zai-org/glm-5.3` and clamped to 3–120 s per chunk and **600 s total**. Typical output is still ~2–3 min, but the per-song cost is **not bounded below $1.50** (10 min × $0.15/min) unless `ELEVENLABS_MUSIC_LENGTH_MS` is set. The 2-min and 3-min figures below are typical-case estimates, not caps.
+- **Spend ceiling:** `GLOBAL_DAILY_LIMIT_ELEVENLABS = 20` paid ElevenLabs generations per UTC day (per-user `DAILY_LIMIT_ELEVENLABS = 3`). Worst case is **20 × $1.50 = ~$30/day (~$900 per 30-day month)**, assuming the global quota Durable Object responds; at a typical 2–3 min it is ~$6–$9/day. Global quota RPC errors deliberately fail open (`src/utils/quota.ts`), so while the global DO is unreachable only the per-user cap applies and the ~$30/day ceiling does not hold (bounded instead by `DAILY_LIMIT_ELEVENLABS` × active users). No AI Gateway spend limit or ElevenLabs balance alert is recorded yet (audit 47a H3).
 - **Recommended XLM Pricing (at $0.1325 / XLM):**
   - **AISongGenerator (`v6`, 2 tracks):** **2 XLM** (~$0.27)
-  - **ElevenLabs (`music_v2_5`, 1 track × 2 min default):** **4 XLM** (~$0.53)
+  - **ElevenLabs (`music_v2_5`, 1 track × ~2 min typical):** **4 XLM** (~$0.53)
   - **ElevenLabs (`music_v2_5`, 1 track × 3 min):** **5–6 XLM** (~$0.66–$0.80)
   - **Best long-term pattern:** Quote in **USD** (`$0.25` AISG / `$0.55–$0.75` ElevenLabs) and convert using a cached XLM/USD spot feed at generation time (rounded up to `0.5 XLM`) so crypto volatility cannot erode margins.
 
@@ -87,9 +89,10 @@ Measured from production `api.smol.xyz` (2,541 public Smols over 20 months) and 
 | **Scale** | $299/mo ($249.17/mo yr) | 1,993 min | $0.15/min | Same + 15 conc. | Only for >600+ ElevenLabs Smols/mo |
 
 Because the per-minute API rate is flat (**$0.15/min**) across Creator and Pro monthly plans, there is **no monthly volume discount** for jumping to Pro early. **Creator ($22/mo)** covers:
-- **~73 ElevenLabs Smols/mo** at the implemented 2-minute default (`DEFAULT_ELEVENLABS_MUSIC_LENGTH_MS = 120_000`), or
-- **~49 ElevenLabs Smols/mo** at 3 minutes per track,
-with seamless `$0.15/min` overages during burst weeks or AISG outages.
+- **~73 ElevenLabs Smols/mo** at ~2 minutes per track, or
+- **~49 ElevenLabs Smols/mo** at 3 minutes per track, or
+- as few as **~14 ElevenLabs Smols/mo** if every track ran to the 10-minute maximum,
+with seamless `$0.15/min` overages during burst weeks or AISG outages. Lengths are no longer pinned (see §1), so size the plan from measured ElevenLabs durations, not from a configured default. At the global cap of 20/day, overages are bounded at ~$30/day while the global quota DO responds (global RPC errors fail open to per-user limits only).
 
 ---
 
@@ -110,14 +113,15 @@ Reference spot rate on 2026-11-23: **$0.1325 / XLM** (~7.55 XLM per $1; Coinbase
 | Provider & Track Config | Music Cost | Total Cost (incl. $0.02) | Break-Even (XLM) | Recommended Charge | Downside XLM Floor |
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | **AISG `v6` (2 × ~3 min)** | $0.05–$0.12 | **$0.07–$0.14** | 0.5–1.1 XLM | **2 XLM** (~$0.27) | Profitable down to **$0.07 / XLM** |
-| **ElevenLabs `music_v2_5` — 1 × 2 min** *(current default)* | $0.30 | **$0.32** | 2.42 XLM | **4 XLM** (~$0.53) | Profitable down to **$0.08 / XLM** |
+| **ElevenLabs `music_v2_5` — 1 × 2 min** *(typical)* | $0.30 | **$0.32** | 2.42 XLM | **4 XLM** (~$0.53) | Profitable down to **$0.08 / XLM** |
 | **ElevenLabs `music_v2_5` — 1 × 3 min** *(longer vocal)* | $0.45 | **$0.47** | 3.55 XLM | **5–6 XLM** (~$0.66–$0.80) | Profitable down to **$0.08–$0.09 / XLM** |
+| *ElevenLabs `music_v2_5` — 1 × 10 min* *(worst case, uncapped)* | $1.50 | $1.52 | 11.47 XLM | — (cap length or price by duration) | — |
 | *Ref: ElevenLabs 2 × 2 min* | $0.60 | $0.62 | 4.68 XLM | 7 XLM (~$0.93) | Profitable down to $0.09 / XLM |
 | *Ref: ElevenLabs 2 × 3 min* | $0.90 | $0.92 | 6.94 XLM | 10–11 XLM (~$1.33–$1.46) | Profitable down to $0.085–$0.09 / XLM |
 
 ### 5.3 Pricing Policy Guidelines
 
-1. **Tie pricing to the UI provider toggle:** Do not charge one flat price across AISG and ElevenLabs. Price AISG at **2 XLM** (Standard) and ElevenLabs at **4 XLM** (2-min default) or **5–6 XLM** (3-min).
+1. **Tie pricing to the UI provider toggle:** Do not charge one flat price across AISG and ElevenLabs. Price AISG at **2 XLM** (Standard) and ElevenLabs at **4 XLM** (~2-min typical) or **5–6 XLM** (3-min). A flat ElevenLabs price only holds if length is capped via `ELEVENLABS_MUSIC_LENGTH_MS`; otherwise price by delivered duration.
 2. **Prefer USD-pegged dynamic XLM quoting:** Store USD target prices (e.g., `$0.25` AISG, `$0.55` ElevenLabs 2-min / `$0.75` ElevenLabs 3-min) and compute the XLM amount from a cached XLM/USD oracle/spot feed (rounded up to `0.5 XLM`) so XLM rallies do not overcharge users and 40%+ drawdowns do not put generation underwater.
-3. **Creator base-fee break-even ($22/mo):** At **4 XLM** (~$0.53) per 2-min ElevenLabs track, **~42 paid ElevenLabs Smols/mo** cover the entire $22/mo Creator subscription (or **~30–33 Smols/mo** at 5–6 XLM for 3-min tracks). Beyond the 147 included minutes, every additional Smol stays net-positive against the `$0.15/min` overage rate.
+3. **Creator base-fee break-even ($22/mo):** At **4 XLM** (~$0.53) per 2-min ElevenLabs track, **~42 paid ElevenLabs Smols/mo** cover the entire $22/mo Creator subscription (or **~30–33 Smols/mo** at 5–6 XLM for 3-min tracks). Beyond the 147 included minutes, every additional Smol stays net-positive against the `$0.15/min` overage rate at typical 2–3 min lengths (a 4 XLM flat price goes negative above ~3.4 min while lengths are uncapped).
 4. **Silent AISG → ElevenLabs fallback absorption:** If a user pays the 2 XLM AISG price and AISG fails over to ElevenLabs (1 × 2-min = $0.32 cost vs. ~$0.27 revenue = -$0.05 net on that run), the ~$0.15–$0.19 surplus per successful AISG generation comfortably absorbs fallback rates up to ~50% without losing money overall.

@@ -9,7 +9,6 @@ declare namespace Cloudflare {
 	interface Env {
 		SMOL_KV: KVNamespace;
 		RPC_URL: string;
-		RPC_URL_TESTNET: string;
 		NETWORK_PASSPHRASE: string;
 		SMOL_CONTRACT_ID: string;
 		DURABLE_OBJECT: DurableObjectNamespace<import("./src/index").SmolDurableObject>;
@@ -30,7 +29,7 @@ type StringifyValues<EnvType extends Record<string, unknown>> = {
 	[Binding in keyof EnvType]: EnvType[Binding] extends string ? EnvType[Binding] : string;
 };
 declare namespace NodeJS {
-	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "RPC_URL" | "RPC_URL_TESTNET" | "NETWORK_PASSPHRASE" | "SMOL_CONTRACT_ID">> {}
+	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "RPC_URL" | "NETWORK_PASSPHRASE" | "SMOL_CONTRACT_ID">> {}
 }
 
 // Begin runtime types

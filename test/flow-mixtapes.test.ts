@@ -151,9 +151,10 @@ function buildHarness(options: { ai?: AiHandler; aiEnabled?: string; seed?: numb
 	} as unknown as Env
 
 	/** Each request gets its own ExecutionContext; `noFlush` leaves its waitUntil work pending. */
-	async function send(path: string, init: { method?: string; body?: unknown; as?: string; noFlush?: boolean } = {}) {
+	async function send(path: string, init: { method?: string; body?: unknown; as?: string; noFlush?: boolean; origin?: string } = {}) {
 		const ctx = createMockExecutionContext()
 		const headers = new Headers()
+		if (init.origin) headers.set('Origin', init.origin)
 		if (init.as) headers.set('Authorization', `Bearer ${init.as === 'admin' ? TEST_SECRET : await createAuthToken(init.as, TEST_SECRET)}`)
 		if (init.body !== undefined) headers.set('Content-Type', 'application/json')
 		const res = await appModule.app.fetch(
@@ -1647,4 +1648,60 @@ test('Pass 9 P2: an owner DELETE or PATCH while an active recovery awaits Clef r
 		const replay = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
 		assert.deepEqual([replay.status, replay.body.id], [200, recovery.body.id])
 	}
+})
+
+test('47b B1: the shared GET /mixtapes edge copy never replays one origin\'s CORS headers to another', async () => {
+	const h = buildHarness()
+
+	const first = await h.send('/mixtapes', { origin: 'https://next.smol.xyz' })
+	assert.equal(first.status, 200)
+	assert.equal(first.headers.get('Access-Control-Allow-Origin'), 'https://next.smol.xyz')
+	await first.text()
+
+	const stored = h.cache.entries()
+	assert.equal(stored.length, 1, 'miss stores exactly one edge copy')
+	const storedNames = stored[0][1].headers.map(([name]) => name.toLowerCase())
+	assert.equal(storedNames.some((name) => name.startsWith('access-control-')), false, 'edge copy must carry no Access-Control-* headers')
+	assert.equal(storedNames.includes('vary'), false, 'edge copy must carry no Vary header')
+
+	const hitsBefore = h.cache.stats.hits
+	const second = await h.send('/mixtapes', { origin: 'https://smol.xyz' })
+	assert.equal(second.status, 200)
+	assert.equal(h.cache.stats.hits, hitsBefore + 1, 'second origin is served from the edge copy')
+	assert.equal(second.headers.get('Access-Control-Allow-Origin'), 'https://smol.xyz')
+
+	const foreign = await h.send('/mixtapes', { origin: 'https://evil.example' })
+	assert.equal(foreign.status, 200)
+	assert.equal(h.cache.stats.hits, hitsBefore + 2)
+	assert.equal(foreign.headers.get('Access-Control-Allow-Origin'), null, 'a disallowed origin never inherits a cached allow-origin')
+})
+
+test('48b: a warm pre-deploy edge entry that still carries CORS/Vary headers is stripped on the HIT path', async () => {
+	const h = buildHarness()
+
+	const first = await h.send('/mixtapes', { origin: 'https://next.smol.xyz' })
+	assert.equal(first.status, 200)
+	await first.text()
+
+	// Simulate an entry written by the previous deploy (no strip-on-write): first requester's CORS + Vary.
+	const stored = h.cache.entries()
+	assert.equal(stored.length, 1)
+	stored[0][1].headers.push(
+		['access-control-allow-origin', 'https://next.smol.xyz'],
+		['access-control-allow-credentials', 'true'],
+		['access-control-expose-headers', 'X-Stale'],
+		['vary', 'Origin, X-Stale-Vary'],
+	)
+
+	const hitsBefore = h.cache.stats.hits
+	const foreign = await h.send('/mixtapes', { origin: 'https://evil.example' })
+	assert.equal(foreign.status, 200)
+	assert.equal(h.cache.stats.hits, hitsBefore + 1, 'served from the stale edge entry')
+	assert.equal(foreign.headers.get('Access-Control-Allow-Origin'), null, 'stale allow-origin never replayed')
+	assert.ok(!(foreign.headers.get('Access-Control-Expose-Headers') ?? '').includes('X-Stale'), 'stale expose-headers never replayed')
+	assert.ok(!(foreign.headers.get('Vary') ?? '').includes('X-Stale-Vary'), 'stale Vary from the cached entry is not replayed')
+	assert.equal(foreign.headers.get('Cache-Control'), 'public, max-age=0, must-revalidate')
+
+	const allowed = await h.send('/mixtapes', { origin: 'https://smol.xyz' })
+	assert.equal(allowed.headers.get('Access-Control-Allow-Origin'), 'https://smol.xyz', 'cors() re-adds the correct origin on a hit')
 })

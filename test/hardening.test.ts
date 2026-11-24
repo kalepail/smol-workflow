@@ -145,7 +145,6 @@ function createHarness(envOverrides: Partial<Env> = {}) {
 	const env = {
 		SECRET,
 		RPC_URL: 'https://mainnet-unused.invalid',
-		RPC_URL_TESTNET: 'https://testnet-unused.invalid',
 		NETWORK_PASSPHRASE: Networks.PUBLIC,
 		SMOL_D1: d1,
 		SMOL_KV: {

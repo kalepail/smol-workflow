@@ -526,7 +526,6 @@ test('mainnet login accepts archived signers for both protocols and rejects test
 		return { latestLedger: LEDGER, archiveAware: true, entries: entries.filter(({ key }) => keys.includes(key)) }
 	} } as KaleWorkerBinding
 	env.RPC_URL = 'https://mainnet-unused.invalid'
-	env.RPC_URL_TESTNET = 'https://testnet-fixture.invalid'
 	const testnet: number[] = []
 	const fetchBefore = globalThis.fetch
 	globalThis.fetch = (async () => {

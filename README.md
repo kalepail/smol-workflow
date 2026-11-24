@@ -11,7 +11,8 @@ smol-native-api (SONG_GENERATOR)    ──┼──► smol-workflow (Hono + Wor
                                            ├─► Cloudflare Workers AI (moondream3.1, llama-guard-3-8b, gemma-4, bge-m3)
                                            ├─► aisonggenerator-worker (HTTP Service Binding: lyrics + AISG v6 2-track music)
                                            ├─► Cloudflare AI Gateway BYOK -> ElevenLabs Music v2.5 (1-track direct MP3 to R2)
-                                           ├─► kale-worker (RPC Service Binding: Stellar relay submitTransaction)
+                                           ├─► kale-worker (RPC Service Binding: Stellar relay submitTransaction + mainnet chain reads)
+                                           ├─► UserQuotaDO (generation quota + play-beacon gate shards)
                                            └─► D1 (smol-d1) · KV (SMOL_KV) · R2 (smol-r2) · Vectorize · Queues
 ```
 
@@ -27,33 +28,47 @@ src/
 ├── index.ts                 # Hono entrypoint, CORS (exposing Range/ETag headers), Queue & Cron handlers
 ├── passkey.ts               # WebAuthn registration/auth verification (approved smol.xyz RP IDs)
 ├── workflow.ts              # Main Smol generation Workflow (replay-safe, 1- & 2-track)
-├── tx-workflow.ts           # Stellar minting Workflow (split sign -> submit -> confirm -> persist)
+├── tx-workflow.ts           # Stellar minting Workflow (sign -> submit -> confirm -> persist, D1 phase records)
 ├── do.ts                    # Durable Objects: SmolDurableObject (v1) & SmolState (v2, retained)
+├── quota-do.ts              # UserQuotaDO (SQLite): daily/burst generation quota + play-beacon admission
+├── middleware/auth.ts       # parseAuth / optionalAuth / requireAdmin
 ├── utils.ts                 # RFC 9110 byte-range parser
 ├── ai/
-│   ├── pixellab.ts          # Pixel art generation (pixflux, timeout + NonRetryableError)
+│   ├── pixellab.ts          # Pixel art generation (pixflux, bounded body, fixed error copy)
 │   ├── cf.ts                # Image description (@cf/moondream/moondream3.1-9B-A2B)
 │   ├── nsfw.ts              # Fail-closed NSFW classification (@cf/meta/llama-guard-3-8b)
 │   ├── aisonggenerator.ts   # AISG v6 HTTP Service Binding client (lyrics, split tasks, songs)
-│   └── elevenlabs.ts        # ElevenLabs Music v2.5 via Cloudflare AI Gateway BYOK -> R2
+│   ├── elevenlabs.ts        # ElevenLabs Music v2.5 via Cloudflare AI Gateway BYOK -> R2
+│   └── mixtape-dedupe.ts    # Tier 2 clef-flash mixtape uniqueness tie-breaker (fail-open)
 ├── api/
 │   ├── auth.ts              # POST /login, POST /logout
 │   ├── smols.ts             # CRUD, provider create/retry, guarded 1-/2-track swap, bulk delete
 │   ├── media.ts             # RFC 9110 Range/206, HEAD, ETag/If-Range, edge cache, play counting
-│   ├── mint.ts              # Deduped single & batch Stellar mint submission
+│   ├── mint.ts              # Deduped single & batch Stellar mint submission + mint status
+│   ├── chain.ts             # Authenticated mainnet chain snapshot (SAC/pool/balance/quotes)
+│   ├── quota.ts             # Authenticated quota snapshot
+│   ├── plays.ts             # Play beacon (no-op in `server` mode, counted in `beacon` mode)
 │   ├── likes.ts             # Likes endpoints
-│   ├── mixtapes.ts          # Mixtape CRUD
+│   ├── mixtapes.ts          # Mixtape lifecycle: public reads + owner CRUD, restore, merge
 │   ├── playlists.ts         # Playlist reads
 │   ├── artists.ts           # Artist public Smols
 │   └── search.ts            # Semantic search, similar tracks, admin backfill/reconcile
 └── utils/
     ├── songs.ts             # Provider strategy, retry reuse, fallback, bounded polling, R2 commit
+    ├── bounded-read.ts      # Size-capped upstream body reader (cancels past the cap)
+    ├── quota.ts             # Quota reserve / fallback transition / commit / refund helpers
+    ├── chain.ts             # Mainnet ledger-entry reads + Comet quotes via KALE_WORKER
+    ├── chain-target.ts      # Mint status target resolution
+    ├── mixtape-visibility.ts# Tier 1 derived mixtape visibility rubric
     ├── audio-fingerprint.ts # Stream-capped 32KB audio swap fingerprinting (2-track AISG only)
     ├── search.ts            # Vectorize v2 indexing, queue consumer, DLQ recovery, cron backfill
     ├── cache.ts             # Cloudflare cache tag invalidation
     └── pagination.ts        # Cursor-based pagination
 migrations/
-└── 0001_smol_music_providers.sql  # Nullable Song_2 + Requested_Provider / Actual_Provider migration
+├── 0001_smol_music_providers.sql        # Nullable Song_2 + Requested_Provider / Actual_Provider
+├── 0002_mixtapes_lifecycle.sql          # Mixtape soft delete, merge, derived visibility
+├── 0003_storage_query_optimization.sql  # Smols.Tags + minted/playlist indexes
+└── 0004_users_address_unique.sql        # Unique Users.Address
 ext/smol-sdk/                # Soroban smart contract SDK (built via scripts/build-sdk.mjs)
 ```
 
@@ -69,21 +84,28 @@ ext/smol-sdk/                # Soroban smart contract SDK (built via scripts/bui
 - `GET /liked` — List authenticated user's liked Smols
 - `GET /:id` — Fetch completed or in-progress Smol (`d1.Song_2` normalized to `null` for 1-track Smols; `kv_do` exposes `payload.provider`, `actual_provider`, `generation_meta`)
 - `POST /` — Create Smol (`{ prompt, public?, instrumental?, playlist?, provider?: 'aisonggenerator' | 'elevenlabs' }`) → `200 text/plain` instance ID
-- `POST /retry/:id` — Retry failed Smol (caller-independent, deduplicated, preserves original creator & provider; optional `{ override_provider }` or `{ provider }`) → `200 text/plain` instance ID
+- `POST /retry/:id` — Retry failed Smol (caller-independent, deduplicated, preserves original creator & provider) → `200 text/plain` instance ID. An optional `{ override_provider }` / `{ provider }` body requires the creator's session (`401` / `403` otherwise)
 - `PUT /:id` — Toggle public/private visibility (blocked when NSFW is unsafe or unclassified)
 - `PUT /:smol_id/:song_id` — Swap `Song_1`/`Song_2` on 2-track Smols (guarded against `NULL`/empty `Song_2` on 1-track Smols)
 - `DELETE /:id` — Delete owned Smol, clean `Likes`/`Playlists`, protect shared MP3s, purge caches
 - `DELETE /admin/bulk` — Admin bulk delete (gated behind dedicated `ADMIN_SECRET` via `x-admin-secret` or `Authorization: Bearer`; fails closed with 404 when unset; skips minted and by default public rows)
 
 ### Media, Likes, Playlists, Mixtapes, Artists, Search, Minting
-- `GET` / `HEAD /song/:id.mp3` — RFC 9110 Range/206, suffix & EOF-clamped ranges, `416` with `Content-Range`, `If-None-Match` (`304`), `If-Range`, edge caching without partial-body poisoning, play counting excluding `HEAD` and `bytes=0-1` probes
+- `GET` / `HEAD /song/:id.mp3` — RFC 9110 Range/206, suffix & EOF-clamped ranges, `416` with `Content-Range`, `If-None-Match` (`304`), `If-Range`, edge caching without partial-body poisoning, play counting (in `server` mode) excluding `HEAD` and `bytes=0-1` probes
 - `GET` / `HEAD /image/:id.png[?scale=1..32]` — Pixel art serving with nearest-neighbor scaling and per-scale edge caching
 - `GET /likes`, `PUT /likes/:id` — User likes
 - `GET /playlist/:title` — Public playlist feed
-- `GET /mixtapes`, `GET /mixtapes/:id`, `POST /mixtapes` — Public mixtapes
+- `GET /mixtapes`, `GET /mixtapes/:id` — Public mixtapes (derived visibility)
+- `GET /mixtapes/mine`, `POST /mixtapes/check-uniqueness`, `POST /mixtapes`, `PUT`/`PATCH`/`DELETE /mixtapes/:id`, `POST /mixtapes/:id/restore`, `POST /mixtapes/:id/merge` — Owner mixtape management (soft delete, restore, merge)
 - `GET /artists/:address/smols` — Public artist feed
 - `GET /search`, `GET /search/:id/similar`, `POST /search/admin/{reindex/:id,backfill,reconcile}`, `GET /search/admin/backfill/status` — Semantic search & indexing ops
 - `POST /mint/:id`, `POST /mint` — Deduplicated single & batch Stellar minting (`202`)
+- `POST /mint/status` — Authenticated per-batch mint progress and track `Mint_Token` / `Mint_Amm`
+- `POST /chain/snapshot` — Authenticated mainnet ledger snapshot (SAC, pool, reserves, balance, optional Comet quote)
+
+### Quota & Plays
+- `GET /quota` — Authenticated per-provider daily quota snapshot (`no-store`)
+- `POST /plays/:musicId` — Play beacon. `202 { counted: false }` while `PLAY_COUNT_MODE=server`; deduped, rate-limited `Plays` increment in `beacon` mode
 
 ## Bindings, Vars & Secrets
 
@@ -101,14 +123,19 @@ ext/smol-sdk/                # Soroban smart contract SDK (built via scripts/bui
 - `ELEVENLABS_MUSIC_LENGTH_MS` — Optional track duration override in ms (`3000..600000`); omitted on instrumentals by default so ElevenLabs chooses length naturally
 - `ELEVENLABS_OUTPUT_FORMAT` — Audio format (default: `mp3_44100_128`)
 - `ELEVENLABS_FALLBACK_ENABLED` — Enable automatic AISG → ElevenLabs fallback (`true` / `false`)
-- `RPC_URL`, `RPC_URL_TESTNET`, `NETWORK_PASSPHRASE`, `SMOL_CONTRACT_ID` — Stellar RPC & contract config
-- `SEARCH_BACKFILL_CRON_*` — Search backfill cron controls
+- `DAILY_LIMIT_CLASSIC` (10), `DAILY_LIMIT_ELEVENLABS` (3), `BURST_LIMIT_PER_MINUTE` (5) — Per-user generation quota
+- `GLOBAL_DAILY_LIMIT_CLASSIC` (500), `GLOBAL_DAILY_LIMIT_ELEVENLABS` (20) — Global per-UTC-day generation ceilings (the ElevenLabs cap bounds worst-case spend at ~$30/day while lengths are uncapped, assuming the global quota Durable Object responds: global quota RPC errors fail open to per-user limits only, so during a global-quota outage spend is bounded by `DAILY_LIMIT_ELEVENLABS` × active users instead)
+- `PLAY_COUNT_MODE` — `server` (count on media GET, current) or `beacon` (count via `POST /plays/:musicId`); optional `PLAY_BEACON_COOLDOWN_SECONDS` (30), `PLAY_BEACON_RATE_LIMIT_PER_MINUTE` (30)
+- `MIXTAPE_DEDUPE_AI_ENABLED` — Tier 2 clef-flash mixtape tie-breaker (enabled unless exactly `false`)
+- `RPC_URL`, `NETWORK_PASSPHRASE`, `SMOL_CONTRACT_ID` — Stellar mainnet RPC & contract config
+- `SEARCH_BACKFILL_CRON_*` — Search backfill cron controls (`ENABLED`, `PAGE_LIMIT`, `STALL_RUNS`, `MAX_WAVES`)
 
 ### Bindings
 - **Workflows**: `WORKFLOW` (`Workflow`), `TX_WORKFLOW` (`TxWorkflow`)
-- **Durable Objects**: `DURABLE_OBJECT` (`SmolDurableObject`, v1) and `DO_STATE` (`SmolState`, v2 — retained; live namespace contains stored data)
+- **Durable Objects**: `DURABLE_OBJECT` (`SmolDurableObject`, v1), `DO_STATE` (`SmolState`, v2 — retained; live namespace contains stored data), and `USER_QUOTA` (`UserQuotaDO`, SQLite, v3 — quota + `play-gate:NN` beacon shards)
 - **Storage**: `SMOL_D1` (`smol-d1`), `SMOL_KV`, `SMOL_BUCKET` (`smol-r2`), `SMOL_SEARCH_INDEX` (`smol-search-index`), `SEARCH_QUEUE` (`smol-search-queue` + `smol-search-queue-dlq`)
-- **Services & AI**: `AI`, `AISONGGENERATOR` (`aisonggenerator-worker`), `KALE_WORKER` (`kale-worker`)
+- **Services & AI**: `AI`, `AISONGGENERATOR` (`aisonggenerator-worker`), `KALE_WORKER` (`kale-worker`: relay + chain reads)
+- **Cron**: `0 * * * *` (search backfill; a no-op once a full pass completes — see `docs/search-index-setup.md`)
 
 ## Development & Verification
 
@@ -122,14 +149,17 @@ pnpm run typecheck
 # Run full test suite (zero paid calls)
 pnpm test
 
-# Dry-run Wrangler bundle verification
-npx wrangler deploy --dry-run
+# Dry-run Wrangler bundle verification (no credentials, no local .dev.vars)
+EMPTY_ENV=$(mktemp) && CLOUDFLARE_API_TOKEN='' npx wrangler deploy --dry-run --env-file "$EMPTY_ENV"; rm -f "$EMPTY_ENV"
+
+# Whitespace check
+git diff --check
 
 # Local dev
 pnpm start
 ```
 
-See [docs/workflows-and-media.md](./docs/workflows-and-media.md), [docs/search-index-setup.md](./docs/search-index-setup.md), and [docs/up-next.md](./docs/up-next.md) for detailed workflow, media streaming, migration, search index operations, and backlog items.
+See [docs/workflows-and-media.md](./docs/workflows-and-media.md) (providers, quota, migrations, media, plays, mixtapes, chain, minting), [docs/music-provider-economics.md](./docs/music-provider-economics.md), [docs/search-index-setup.md](./docs/search-index-setup.md), and [docs/up-next.md](./docs/up-next.md) for details and backlog. The production cutover runbook is `smol/orchestration/CUTOVER_CHECKLIST.md`.
 
 ## License
 

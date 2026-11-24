@@ -50,13 +50,16 @@ export interface AisgTaskDiscoveryResult {
 	next_page?: number;
 }
 
-export interface AisgAttemptReceipt {
-	attempt_id: string;
-	status: 'in_flight' | 'accepted' | 'completed' | 'ambiguous';
-	task_id?: string;
-	workspace_id?: string;
-	music_ids?: string[];
-}
+/**
+ * Outcome of replaying a keyed AISG submit for reconciliation.
+ * - `task`: aisonggenerator-worker holds an accepted/completed receipt for this Idempotency-Key
+ *   (or the key had no receipt and this replay was the first dispatch under it).
+ * - `unresolved`: the receipt is still in_flight/ambiguous (504 `aisg_dispatch_unknown`), the
+ *   payload no longer matches the key (409), or the replay itself failed. Never authorizes a new key.
+ */
+export type AisgAttemptReplayResult =
+	| { kind: 'task'; task_id: string; workspace_id?: string }
+	| { kind: 'unresolved'; code: AisgErrorCode; status?: number; outcome: 'rejected' | 'unknown' };
 
 const CONTENT_POLICY_PATTERN = /content\s*policy|policy\s*violation|moderation|copyright|nsfw|prohibited|inappropriate|sensitive|explicit|safety/i;
 const CREDITS_PATTERN = /insufficient\s*credit|no\s*credit|out\s*of\s*credit|credit.*exhaust|balance|payment\s*required|quota/i;
@@ -366,31 +369,66 @@ export async function submitAisgTask(
 }
 
 /**
- * Read-only lookup of a previously submitted AISG attempt receipt for reconciliation.
- * Returns null if the attempt does not exist (404) or endpoint is unavailable.
+ * Reconcile a claimed/ambiguous AISG attempt by replaying POST /api/tasks with the SAME
+ * Idempotency-Key and the SAME request payload (aisonggenerator-worker has no read-only attempt
+ * route; its ProviderState DO answers a keyed replay from the stored receipt instead):
+ * - accepted/completed receipt -> 200 `{ task_id, workspace_id? }`, no new upstream submit
+ * - in_flight/ambiguous receipt -> 504 `aisg_dispatch_unknown` (outcome unknown, never re-submits)
+ * - payload hash mismatch       -> 409 `idempotency_conflict`
+ * - no receipt (never dispatched, or a confirmed rejection cleared it) -> first submit under this key
+ * The payload must match submitAisgTask byte-for-byte in its fields, or the hash check returns 409.
+ * Never falls back to the legacy /api/songs route.
  */
-export async function getAisgAttemptReceipt(
+export async function replayAisgTaskSubmit(
 	env: Env,
+	prompt: string,
+	description: string,
+	lyrics: AiSongGeneratorLyrics,
+	is_public: boolean,
+	is_instrumental: boolean,
 	attemptId: string
-): Promise<AisgAttemptReceipt | null> {
-	const res = await env.AISONGGENERATOR.fetch(
-		`http://aisonggenerator-worker/api/attempts/${encodeURIComponent(attemptId)}`,
-		{
-			method: 'GET',
-			signal: AbortSignal.timeout(15_000),
-		}
-	);
-
-	if (res.status === 404) {
-		return null;
+): Promise<AisgAttemptReplayResult> {
+	let res: Response;
+	try {
+		res = await env.AISONGGENERATOR.fetch('http://aisonggenerator-worker/api/tasks', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'Idempotency-Key': attemptId,
+			},
+			body: JSON.stringify({
+				...lyrics,
+				prompt,
+				description,
+				public: is_public,
+				instrumental: is_instrumental,
+				attempt_id: attemptId,
+			}),
+			signal: AbortSignal.timeout(30_000),
+		});
+	} catch {
+		return { kind: 'unresolved', code: 'submit_outcome_unknown', outcome: 'unknown' };
 	}
 
 	if (!res.ok) {
 		const errText = await res.text().catch(() => '');
-		throw classifyAisgHttpError(res.status, errText, { isPaidSubmit: false });
+		const err = classifyAisgHttpError(res.status, errText, { isPaidSubmit: true });
+		// `rejected` is positive evidence that no paid submit happened on THIS request (4xx incl. 409
+		// idempotency_conflict, or typed outcome:'rejected'); everything else may have dispatched.
+		return { kind: 'unresolved', code: err.code, status: res.status, outcome: err.outcome === 'rejected' ? 'rejected' : 'unknown' };
 	}
 
-	return await res.json() as AisgAttemptReceipt;
+	const data = await res.json().catch(() => null) as { task_id?: unknown; workspace_id?: unknown } | null;
+	const taskId = typeof data?.task_id === 'string' && data.task_id.trim() ? data.task_id.trim() : undefined;
+	const workspaceId = typeof data?.workspace_id === 'string' && data.workspace_id.trim() ? data.workspace_id.trim() : undefined;
+	if (!taskId) {
+		return { kind: 'unresolved', code: 'submit_outcome_unknown', status: res.status, outcome: 'unknown' };
+	}
+	return {
+		kind: 'task',
+		task_id: taskId,
+		...(workspaceId ? { workspace_id: workspaceId } : {}),
+	};
 }
 
 /**

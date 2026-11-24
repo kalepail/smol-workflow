@@ -49,11 +49,13 @@ Durable research notes and upcoming work for `smol-workflow` and the `next.smol.
   - Pre-submit workflow step (`plan elevenlabs vocal pacing`) runs `@cf/zai-org/glm-5.3` (`reasoning_effort: "low"`) anchored on an L1-fitted empirical baseline (`12s/chunk + 2.5s/sungLine`), sizing each chunk strictly to perform its lyrics/style while ignoring arbitrary prompt runtime claims (e.g., `"9-minute suite"`).
   - Gracefully falls back to the pure empirical baseline on any AI error or malformed output; explicit `ELEVENLABS_MUSIC_LENGTH_MS` still works as an optional env override.
   - Also splits unheaded multi-stanza and `> 30`-line chunks (caught in 5/117 live Smols) so ElevenLabs never rejects valid songs with `422`.
-- **Follow-up:** Monitor live ElevenLabs per-minute spend (`$0.15/min`) and listen to uncapped instrumental + vocal tracks to confirm feel (`docs/music-provider-economics.md`).
+- **Follow-up:** Monitor live ElevenLabs per-minute spend (`$0.15/min`) and listen to uncapped instrumental + vocal tracks to confirm feel (`docs/music-provider-economics.md`). With lengths uncapped (up to 600 s, $1.50 each) and `GLOBAL_DAILY_LIMIT_ELEVENLABS = 20`, worst-case spend is ~$30/day, assuming the global quota Durable Object responds (global quota RPC errors fail open to per-user limits only, so during a global-quota outage spend is bounded by `DAILY_LIMIT_ELEVENLABS` × active users instead; see `docs/music-provider-economics.md` §1); an AI Gateway spend limit and ElevenLabs usage alert are still open (audit 47a H3).
 
 ---
 
 ## 3. `next.smol.xyz` → `smol.xyz` (`main`) Cutover
+
+> **Source of truth:** the step-by-step runbook (gates, `smol-fe` deploy, `noindex` checks, the `PLAY_COUNT_MODE='beacon'` flip, rollback) lives in `smol/orchestration/CUTOVER_CHECKLIST.md`, outside this repo. The notes below are background only; follow the checklist when cutting over.
 
 - **ElevenLabs automatic fallback:** Already enabled by default on `api.smol.xyz` (`ELEVENLABS_FALLBACK_ENABLED: "true"` in `wrangler.jsonc`), serving both `next.smol.xyz` and `smol.xyz`. Keep enabled through and after cutover to `main`.
 - **Frontend cutover checks:** Verify 1-track fallback notice (`"Made with ElevenLabs — Classic was unavailable."`), provider badges, and daily quota display carry cleanly when `smol-fe` `next` merges into `main`.

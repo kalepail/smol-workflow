@@ -1,4 +1,5 @@
 import { NonRetryableError } from 'cloudflare:workflows';
+import { BoundedReadError, readBoundedStream } from '../utils/bounded-read';
 
 export const ELEVENLABS_MODEL_ID = 'music_v2_5';
 export const ELEVENLABS_PACING_MODEL = '@cf/zai-org/glm-5.3' as const;
@@ -10,6 +11,7 @@ export const MAX_ELEVENLABS_TOTAL_MS = 600_000;
 export const MAX_ELEVENLABS_CHUNKS = 30;
 export const MAX_ELEVENLABS_CHUNK_LINES = 30;
 export const MAX_ELEVENLABS_LINE_CHARS = 200;
+export const MAX_ELEVENLABS_SECTION_NAME_CHARS = 100;
 export const MAX_ELEVENLABS_STYLES = 50;
 // Pure empirical fallback fitted via L1 minimization on 116 live measured SMOL vocal songs
 // (no genre/tempo keyword lists). Used as the neutral anchor for agentic pacing and fallback.
@@ -140,24 +142,45 @@ Assign a natural duration_ms (integer, 3000 to 120000) to EACH chunk strictly ba
 
 Return ONLY valid JSON: {"estimated_bpm": <integer>, "durations_ms": [<one integer per chunk, exact same length as chunks>]}.`;
 
-function wrapLineToMaxChars(line: string, maxChars = MAX_ELEVENLABS_LINE_CHARS): string[] {
-	if (line.length <= maxChars) {
+/** Length in Unicode code points (what ElevenLabs' 100/200-character limits count), not UTF-16 units. */
+export function codePointLength(text: string): number {
+	return Array.from(text).length;
+}
+
+/**
+ * Wrap one lyric line into pieces of <= maxChars Unicode code points, preferring word boundaries.
+ * Works on whole code points, so an emoji / astral CJK character is never cut in half and counts as
+ * one character (a line of 101 astral characters is 101 characters, not 202).
+ */
+export function wrapLineToMaxChars(line: string, maxChars = MAX_ELEVENLABS_LINE_CHARS): string[] {
+	if (codePointLength(line) <= maxChars) {
 		return [line];
 	}
 	const wrapped: string[] = [];
-	let remaining = line.trim();
+	let remaining = Array.from(line.trim());
 	while (remaining.length > maxChars) {
 		let splitAt = remaining.lastIndexOf(' ', maxChars);
 		if (splitAt < Math.floor(maxChars * 0.4)) {
 			splitAt = maxChars;
 		}
-		wrapped.push(remaining.slice(0, splitAt).trim());
-		remaining = remaining.slice(splitAt).trim();
+		wrapped.push(remaining.slice(0, splitAt).join('').trim());
+		remaining = Array.from(remaining.slice(splitAt).join('').trim());
 	}
-	if (remaining) {
-		wrapped.push(remaining);
+	if (remaining.length > 0) {
+		wrapped.push(remaining.join(''));
 	}
-	return wrapped;
+	return wrapped.filter(Boolean);
+}
+
+/**
+ * Normalize a `[Section Name]` heading so its interior is <= MAX_ELEVENLABS_SECTION_NAME_CHARS
+ * Unicode code points (never half a surrogate pair) and the closing `]` is always kept.
+ */
+export function normalizeSectionHeading(line: string): string {
+	const match = /^\s*\[([^\]]+)\]\s*$/.exec(line);
+	const interior = (match ? match[1] : line).trim();
+	const bounded = Array.from(interior).slice(0, MAX_ELEVENLABS_SECTION_NAME_CHARS).join('');
+	return `[${bounded.trim() || 'Section'}]`;
 }
 
 function countSungLines(sectionText: string): number {
@@ -204,9 +227,21 @@ function clampChunkDurationsToTotalCap(rawDurations: number[], maxTotalMs = MAX_
  * Split saved lyrics into ElevenLabs Music v2.5 compliant section chunks:
  * - Preserves existing [Section] headings and exact lyrics verbatim
  * - Splits unheaded multi-stanza lyrics on blank lines so they don't collapse into one giant chunk
- * - Enforces ElevenLabs limits: <= 30 lines/chunk, <= 200 chars/line, <= 30 chunks total
+ * - Enforces ElevenLabs limits: <= 30 lines/chunk, <= 200 chars/line, <= maxChunks (default 30) chunks
+ *   total, counting characters as Unicode code points
+ * - Packs ONCE from the structured sections, so a smaller budget (explicit length override) never
+ *   re-parses already-merged chunks
  */
-export function splitElevenLabsLyricSections(lyricsText: string): string[] {
+export function splitElevenLabsLyricSections(lyricsText: string, maxChunks = MAX_ELEVENLABS_CHUNKS): string[] {
+	return packLyricSectionsLossless(parseElevenLabsLyricSections(lyricsText), maxChunks);
+}
+
+/**
+ * Parse saved lyrics into structured sections (heading + sung body lines), each already within the
+ * per-chunk line and per-line character limits. Headings stay separate from sung lines, so packing
+ * can never mistake an interior `[Section]` heading for a lyric.
+ */
+function parseElevenLabsLyricSections(lyricsText: string): ParsedLyricSection[] {
 	const normalized = lyricsText.replace(/\r\n/g, '\n').trim();
 	if (!normalized) {
 		throw new ElevenLabsProviderError({
@@ -237,7 +272,7 @@ export function splitElevenLabsLyricSections(lyricsText: string): string[] {
 	}
 
 	// Expand unheaded multi-stanza blocks and enforce per-chunk line & char caps
-	const expanded: string[] = [];
+	const expanded: ParsedLyricSection[] = [];
 	let verseCounter = 1;
 	for (const rawSection of rawSections) {
 		const trimmedSection = rawSection.trim();
@@ -255,13 +290,13 @@ export function splitElevenLabsLyricSections(lyricsText: string): string[] {
 					.flatMap((l) => wrapLineToMaxChars(l));
 				const maxBodyLines = MAX_ELEVENLABS_CHUNK_LINES - 1;
 				for (let i = 0; i < wrappedLines.length; i += maxBodyLines) {
-					expanded.push(`[Verse ${verseCounter++}]\n${wrappedLines.slice(i, i + maxBodyLines).join('\n')}`);
+					expanded.push({ heading: `[Verse ${verseCounter++}]`, body: wrappedLines.slice(i, i + maxBodyLines) });
 				}
 			}
 			continue;
 		}
 
-		const heading = sectionLines[0].trim().slice(0, MAX_ELEVENLABS_LINE_CHARS);
+		const heading = normalizeSectionHeading(sectionLines[0]);
 		const bodyLines = sectionLines
 			.slice(1)
 			.map((l) => l.trim())
@@ -269,13 +304,13 @@ export function splitElevenLabsLyricSections(lyricsText: string): string[] {
 			.flatMap((l) => wrapLineToMaxChars(l));
 
 		if (bodyLines.length === 0) {
-			expanded.push(heading);
+			expanded.push({ heading, body: [] });
 			continue;
 		}
 
 		const maxBodyLines = MAX_ELEVENLABS_CHUNK_LINES - 1;
 		for (let i = 0; i < bodyLines.length; i += maxBodyLines) {
-			expanded.push(`${heading}\n${bodyLines.slice(i, i + maxBodyLines).join('\n')}`);
+			expanded.push({ heading, body: bodyLines.slice(i, i + maxBodyLines) });
 		}
 	}
 
@@ -288,22 +323,102 @@ export function splitElevenLabsLyricSections(lyricsText: string): string[] {
 		});
 	}
 
-	if (expanded.length <= MAX_ELEVENLABS_CHUNKS) {
-		return expanded;
+	return expanded;
+}
+
+interface ParsedLyricSection {
+	heading?: string;
+	body: string[];
+}
+
+function formatLyricSection(section: ParsedLyricSection): string {
+	return (section.heading ? [section.heading, ...section.body] : section.body).join('\n');
+}
+
+function unrepresentableLyricsError(sungLines: number, maxChunks: number): ElevenLabsProviderError {
+	return new ElevenLabsProviderError({
+		message: `Lyrics have ${sungLines} sung lines but an ElevenLabs composition_plan holds at most ${maxChunks * MAX_ELEVENLABS_CHUNK_LINES} (${maxChunks} chunks x ${MAX_ELEVENLABS_CHUNK_LINES} lines); refusing to drop lyrics`,
+		code: 'invalid_composition_plan',
+		retryable: false,
+		outcome: 'rejected',
+	});
+}
+
+/** Greedy whole-section packing: sections are never split and keep their headings. */
+function packWholeSections(sections: ParsedLyricSection[]): string[][] {
+	const chunks: string[][] = [];
+	let current: string[] = [];
+	for (const section of sections) {
+		const lines = section.heading ? [section.heading, ...section.body] : [...section.body];
+		if (current.length > 0 && current.length + lines.length > MAX_ELEVENLABS_CHUNK_LINES) {
+			chunks.push(current);
+			current = [];
+		}
+		current.push(...lines);
+	}
+	if (current.length > 0) chunks.push(current);
+	return chunks;
+}
+
+/** Line-stream packing: sections may be split across chunks; headings optional / repeated on continuation. */
+function packLineStream(
+	sections: ParsedLyricSection[],
+	opts: { headings: boolean; repeatHeading: boolean }
+): string[][] {
+	const chunks: string[][] = [];
+	let current: string[] = [];
+	const flush = () => {
+		if (current.length > 0) chunks.push(current);
+		current = [];
+	};
+	for (const section of sections) {
+		const heading = opts.headings ? section.heading : undefined;
+		if (heading) {
+			// Never strand a heading as the last line of a chunk when its body follows.
+			if (current.length + (section.body.length > 0 ? 2 : 1) > MAX_ELEVENLABS_CHUNK_LINES) flush();
+			current.push(heading);
+		}
+		for (const line of section.body) {
+			if (current.length >= MAX_ELEVENLABS_CHUNK_LINES) {
+				flush();
+				if (heading && opts.repeatHeading) current.push(heading);
+			}
+			current.push(line);
+		}
+	}
+	flush();
+	return chunks;
+}
+
+/**
+ * Pack structured sections (each already <= MAX_ELEVENLABS_CHUNK_LINES lines) into <= maxChunks chunks
+ * WITHOUT dropping a single sung line. Tries progressively denser layouts (whole sections ->
+ * split sections with repeated headings -> split sections -> sung lines only). Only `[Section]`
+ * heading lines (never sung) may be omitted. Throws a non-retryable `invalid_composition_plan`
+ * rejection (before any paid dispatch) when the sung lines exceed maxChunks x 30.
+ */
+function packLyricSectionsLossless(parsed: ParsedLyricSection[], maxChunks: number): string[] {
+	if (parsed.length <= maxChunks) {
+		return parsed.map(formatLyricSection);
+	}
+	const sungLines = parsed.reduce((acc, section) => acc + section.body.length, 0);
+	if (sungLines > maxChunks * MAX_ELEVENLABS_CHUNK_LINES) {
+		throw unrepresentableLyricsError(sungLines, maxChunks);
 	}
 
-	// Coalesce while respecting MAX_ELEVENLABS_CHUNKS and MAX_ELEVENLABS_CHUNK_LINES
-	const coalesced: string[] = [];
-	const perBucket = Math.ceil(expanded.length / MAX_ELEVENLABS_CHUNKS);
-	for (let i = 0; i < expanded.length; i += perBucket) {
-		const mergedLines = expanded
-			.slice(i, i + perBucket)
-			.join('\n')
-			.split('\n')
-			.slice(0, MAX_ELEVENLABS_CHUNK_LINES);
-		coalesced.push(mergedLines.join('\n'));
+	const layouts = [
+		() => packWholeSections(parsed),
+		() => packLineStream(parsed, { headings: true, repeatHeading: true }),
+		() => packLineStream(parsed, { headings: true, repeatHeading: false }),
+		() => packLineStream(parsed, { headings: false, repeatHeading: false }),
+	];
+	for (const layout of layouts) {
+		const chunks = layout();
+		if (chunks.length > 0 && chunks.length <= maxChunks) {
+			return chunks.map((lines) => lines.join('\n'));
+		}
 	}
-	return coalesced;
+	throw unrepresentableLyricsError(sungLines, maxChunks);
 }
 
 /**
@@ -363,12 +478,14 @@ export function parsePlannedVocalDurationsMs(raw: unknown, expectedCount: number
 		return null;
 	}
 
-	const parsed = candidate.durations_ms.map((val) => Number(val));
-	if (parsed.some((n) => !Number.isFinite(n) || n <= 0)) {
+	// Strict: every element must already be a finite JSON number. No Number() coercion, so junk like
+	// [true, [45000]] or ["3000"] is rejected and the caller falls back to the empirical baseline.
+	const durations: unknown[] = candidate.durations_ms;
+	if (!durations.every((val): val is number => typeof val === 'number' && Number.isFinite(val) && val > 0)) {
 		return null;
 	}
 
-	return clampChunkDurationsToTotalCap(parsed, MAX_ELEVENLABS_TOTAL_MS);
+	return clampChunkDurationsToTotalCap(durations as number[], MAX_ELEVENLABS_TOTAL_MS);
 }
 
 /**
@@ -449,25 +566,19 @@ export function buildElevenLabsCompositionChunks(
 	fallbackPrompt?: string,
 	plannedDurationsMs?: number[]
 ): ElevenLabsCompositionChunk[] {
-	const sections = splitElevenLabsLyricSections(lyricsText);
+	const parsedSections = parseElevenLabsLyricSections(lyricsText);
+	const sections = packLyricSectionsLossless(parsedSections, MAX_ELEVENLABS_CHUNKS);
 	const positiveStyles = cleanStyleList(styles, fallbackPrompt);
 
 	let durations: number[];
 	if (plannedDurationsMs && plannedDurationsMs.length === sections.length) {
 		durations = clampChunkDurationsToTotalCap(plannedDurationsMs, MAX_ELEVENLABS_TOTAL_MS);
 	} else if (totalDurationMs !== undefined) {
-		// Explicit ELEVENLABS_MUSIC_LENGTH_MS override: distribute proportionally by char weight
+		// Explicit ELEVENLABS_MUSIC_LENGTH_MS override: distribute proportionally by char weight.
+		// Pack the structured sections once against the final chunk budget (never re-parse merged chunks,
+		// whose interior [Section] headings would otherwise be counted as sung lines).
 		const maxChunksForDuration = Math.max(1, Math.min(MAX_ELEVENLABS_CHUNKS, Math.floor(totalDurationMs / MIN_ELEVENLABS_CHUNK_MS)));
-		const targetSections = sections.length <= maxChunksForDuration
-			? sections
-			: (() => {
-				const out: string[] = [];
-				const perBucket = Math.ceil(sections.length / maxChunksForDuration);
-				for (let i = 0; i < sections.length; i += perBucket) {
-					out.push(sections.slice(i, i + perBucket).join('\n').split('\n').slice(0, MAX_ELEVENLABS_CHUNK_LINES).join('\n'));
-				}
-				return out;
-			})();
+		const targetSections = packLyricSectionsLossless(parsedSections, maxChunksForDuration);
 
 		const boundedTotal = Math.min(
 			Math.min(MAX_ELEVENLABS_TOTAL_MS, targetSections.length * MAX_ELEVENLABS_CHUNK_MS),
@@ -673,60 +784,35 @@ async function readBoundedAudioStream(
 	declaredLength: number | null,
 	maxBytes: number
 ): Promise<Uint8Array> {
-	const reader = body.getReader();
-	const chunks: Uint8Array[] = [];
-	let totalBytes = 0;
-
 	try {
-		while (true) {
-			const { done, value } = await reader.read();
-			if (done) {
-				break;
-			}
-			if (!value || value.byteLength === 0) {
-				continue;
-			}
-			totalBytes += value.byteLength;
-			if (totalBytes > maxBytes) {
-				await reader.cancel('Audio exceeded maximum allowed size').catch(() => {});
-				throw new ElevenLabsProviderError({
-					message: `ElevenLabs audio exceeded maximum allowed size (${maxBytes} bytes)`,
-					code: 'audio_too_large',
-					retryable: false,
-					outcome: 'rejected',
-				});
-			}
-			chunks.push(value);
+		return await readBoundedStream(body, maxBytes, declaredLength);
+	} catch (err) {
+		if (!(err instanceof BoundedReadError)) {
+			throw err;
 		}
-	} finally {
-		reader.releaseLock();
-	}
-
-	if (totalBytes <= 0) {
+		if (err.reason === 'too_large') {
+			throw new ElevenLabsProviderError({
+				message: `ElevenLabs audio exceeded maximum allowed size (${maxBytes} bytes)`,
+				code: 'audio_too_large',
+				retryable: false,
+				outcome: 'rejected',
+			});
+		}
+		if (err.reason === 'empty') {
+			throw new ElevenLabsProviderError({
+				message: 'ElevenLabs returned an empty audio response',
+				code: 'empty_audio',
+				retryable: false,
+				outcome: 'rejected',
+			});
+		}
 		throw new ElevenLabsProviderError({
-			message: 'ElevenLabs returned an empty audio response',
-			code: 'empty_audio',
-			retryable: false,
-			outcome: 'rejected',
-		});
-	}
-
-	if (declaredLength !== null && totalBytes !== declaredLength) {
-		throw new ElevenLabsProviderError({
-			message: `Truncated ElevenLabs audio response (expected ${declaredLength} bytes, received ${totalBytes})`,
+			message: `Truncated ElevenLabs audio response (expected ${declaredLength} bytes, received ${err.receivedBytes})`,
 			code: 'truncated_audio',
 			retryable: false,
 			outcome: 'rejected',
 		});
 	}
-
-	const combined = new Uint8Array(totalBytes);
-	let offset = 0;
-	for (const chunk of chunks) {
-		combined.set(chunk, offset);
-		offset += chunk.byteLength;
-	}
-	return combined;
 }
 
 export function getElevenLabsMusicId(smolId: string): string {

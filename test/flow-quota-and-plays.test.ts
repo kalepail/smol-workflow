@@ -150,7 +150,7 @@ function buildQuotaFlowHarness(options: {
 		DAILY_LIMIT_ELEVENLABS: options.dailyElevenLabs ?? '3',
 		BURST_LIMIT_PER_MINUTE: options.burstPerMinute ?? '0',
 		GLOBAL_DAILY_LIMIT_CLASSIC: options.globalClassic ?? '500',
-		GLOBAL_DAILY_LIMIT_ELEVENLABS: options.globalElevenLabs ?? '50',
+		GLOBAL_DAILY_LIMIT_ELEVENLABS: options.globalElevenLabs ?? '20',
 		PLAY_COUNT_MODE: options.playCountMode ?? 'server',
 		PLAY_BEACON_RATE_LIMIT_PER_MINUTE: options.playRateLimitPerMinute ?? '30',
 		PLAY_BEACON_COOLDOWN_SECONDS: options.playCooldownSeconds ?? '30',
@@ -780,7 +780,7 @@ test('POST /retry/:id: zero double-charge on paid/pending/complete reuse; strict
 		// Also verifies that the earlier 429 left the reserved successor DO empty & cleanly recoverable!
 		const retryOverrideOk = await harness.send(`/retry/${failedSmolId}`, {
 			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
+			headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenA}` },
 			body: JSON.stringify({ override_provider: 'elevenlabs' }),
 		})
 		assert.equal(retryOverrideOk.status, 200)
@@ -799,7 +799,7 @@ test('POST /retry/:id: zero double-charge on paid/pending/complete reuse; strict
 		})
 		const retryEl429 = await harness.send(`/retry/${failedSmolId}`, {
 			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
+			headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenA}` },
 			body: JSON.stringify({ override_provider: 'elevenlabs' }),
 		})
 		assert.equal(retryEl429.status, 429)

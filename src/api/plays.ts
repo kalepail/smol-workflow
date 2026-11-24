@@ -41,13 +41,11 @@ function resolveCallerIdentity(c: Context<HonoEnv>): string {
 	if (jwtSub) {
 		return `u:${jwtSub}`
 	}
+	// Only the edge-set cf-connecting-ip is trusted. A client-supplied x-forwarded-for would let a
+	// caller mint a fresh play-dedupe identity per request once the beacon counts plays.
 	const cfIp = c.req.header('cf-connecting-ip')?.trim()
 	if (cfIp) {
 		return `ip:${cfIp}`
-	}
-	const xff = c.req.header('x-forwarded-for')?.split(',')[0]?.trim()
-	if (xff) {
-		return `ip:${xff}`
 	}
 	return 'anon'
 }

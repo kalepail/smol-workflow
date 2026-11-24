@@ -17,14 +17,15 @@
  */
 
 import { NonRetryableError } from 'cloudflare:workflows';
+import { BoundedReadError, readBoundedStream } from './bounded-read';
 import type { WorkflowStep, WorkflowStepConfig } from 'cloudflare:workers';
 import type { SmolDurableObject } from '../do';
 import {
 	AisgProviderError,
 	discoverAisgTaskSongs,
-	getAisgAttemptReceipt,
 	getSongs,
 	isContentPolicyMessage,
+	replayAisgTaskSubmit,
 	submitAisgTask,
 } from '../ai/aisonggenerator';
 import {
@@ -33,9 +34,12 @@ import {
 	getCanonicalSongUrl,
 	getElevenLabsMusicId,
 	planElevenLabsVocalDurations,
+	estimateFallbackChunkDurationsMs,
+	splitElevenLabsLyricSections,
 	resolveOptionalElevenLabsMusicLengthMs,
 	toNonRetryableElevenLabsError,
 } from '../ai/elevenlabs';
+import { fetchHttpsFollowingSafeRedirects, UnsafeFetchUrlError } from './safe-fetch';
 import {
 	extractFingerprint,
 	InsufficientAudioDataError,
@@ -44,6 +48,7 @@ import {
 } from './audio-fingerprint';
 import {
 	commitGenerationQuota,
+	getGenerationQuotaReservation,
 	markAmbiguousGenerationQuota,
 	refundGenerationQuota,
 	reserveGenerationQuota,
@@ -372,6 +377,33 @@ async function updateAttemptIfSupported(
 	}
 }
 
+function parseDeclaredContentLength(response: Response): number | null {
+	const header = response.headers.get('content-length');
+	if (!header || !/^\d+$/.test(header.trim())) {
+		return null;
+	}
+	const value = Number(header.trim());
+	return Number.isSafeInteger(value) ? value : null;
+}
+
+/** Reads finalized AISG audio with a hard byte cap so an oversized upstream is never buffered in full. */
+async function readAisgAudioBody(response: Response, musicId: string): Promise<Uint8Array> {
+	try {
+		return await readBoundedStream(response.body, AISG_MAX_AUDIO_BYTES, parseDeclaredContentLength(response));
+	} catch (err) {
+		if (!(err instanceof BoundedReadError)) {
+			throw err;
+		}
+		if (err.reason === 'too_large') {
+			throw new NonRetryableError(`Audio for ${musicId} exceeded ${AISG_MAX_AUDIO_BYTES} bytes`);
+		}
+		if (err.reason === 'empty') {
+			throw new Error(`Empty audio downloaded for ${musicId}`);
+		}
+		throw new Error(`Truncated audio downloaded for ${musicId} (expected ${err.declaredLength} bytes, received ${err.receivedBytes})`);
+	}
+}
+
 /**
  * Commit final AISG MP3 files to R2 AFTER swap resolution completes.
  * Reuses an existing R2 object only when verified (non-empty and not remapped by a swap).
@@ -413,22 +445,25 @@ export async function commitSongsAudioToR2(params: {
 				throw new NonRetryableError(`Verified R2 audio missing for canonical song ${musicId}`);
 			}
 
-			const response = await fetch(song.audio, {
-				signal: AbortSignal.timeout(AISG_AUDIO_FETCH_TIMEOUT_MS),
-			});
+			let response: Response;
+			try {
+				response = await fetchHttpsFollowingSafeRedirects(song.audio, {
+					signal: AbortSignal.timeout(AISG_AUDIO_FETCH_TIMEOUT_MS),
+				});
+			} catch (err) {
+				if (err instanceof UnsafeFetchUrlError) {
+					throw new NonRetryableError(`Refusing non-https audio URL for ${musicId}: ${err.message}`);
+				}
+				throw err;
+			}
 			if (!response.ok) {
+				await response.body?.cancel().catch(() => {});
 				throw new Error(`Failed to fetch finalized audio for ${musicId} (${response.status})`);
 			}
 
-			const arrayBuffer = await response.arrayBuffer();
-			if (arrayBuffer.byteLength === 0) {
-				throw new Error(`Empty audio downloaded for ${musicId}`);
-			}
-			if (arrayBuffer.byteLength > AISG_MAX_AUDIO_BYTES) {
-				throw new NonRetryableError(`Audio for ${musicId} exceeded ${AISG_MAX_AUDIO_BYTES} bytes`);
-			}
+			const audioBytes = await readAisgAudioBody(response, musicId);
 
-			await env.SMOL_BUCKET.put(r2Key, arrayBuffer, {
+			await env.SMOL_BUCKET.put(r2Key, audioBytes, {
 				httpMetadata: { contentType: 'audio/mpeg' },
 				customMetadata: {
 					smolId,
@@ -496,13 +531,42 @@ async function ensureFreshPaidDispatchQuota(params: {
 		};
 	}
 
+	return await reservePaidDispatchQuota({
+		env,
+		stub,
+		step,
+		config,
+		smolId,
+		targetProvider,
+		address,
+		reservationId: `${smolId}:dispatch:${targetProvider}`,
+		stepName: `reserve ${targetProvider} dispatch quota`,
+	});
+}
+
+/**
+ * Reserve a NEW per-user (and global) quota slot under `reservationId` before a paid dispatch.
+ * On denial, records a -4 song state and throws NonRetryableError so no paid call is made.
+ */
+async function reservePaidDispatchQuota(params: {
+	env: Env;
+	stub: DurableObjectStub<SmolDurableObject>;
+	step: WorkflowStep;
+	config: WorkflowStepConfig;
+	smolId: string;
+	targetProvider: MusicProvider;
+	address?: string;
+	reservationId: string;
+	stepName: string;
+}): Promise<{ reservationId: string; dayKey?: string; provider: MusicProvider }> {
+	const { env, stub, step, config, smolId, targetProvider, address, reservationId: dispatchReservationId, stepName } = params;
+
 	type DispatchAuthResult =
 		| { ok: true; reservationId: string; dayKey: string }
 		| { ok: false; code: string; error: string };
 
-	const dispatchReservationId = `${smolId}:dispatch:${targetProvider}`;
 	const auth = await step.do(
-		`reserve ${targetProvider} dispatch quota`,
+		stepName,
 		config,
 		async (): Promise<DispatchAuthResult> => {
 			if (!address) {
@@ -793,6 +857,27 @@ async function settleElevenLabsQuotaFromOutcome(
 /**
  * Execute ElevenLabs 1-track generation (explicit or automatic fallback) inside a non-retried paid step.
  */
+/** Vocal pacing that never throws: planner -> empirical baseline -> undefined. */
+export async function planElevenLabsVocalDurationsSafely(
+	env: Env,
+	prompt: string,
+	lyrics: AiSongGeneratorLyrics
+): Promise<number[] | undefined> {
+	try {
+		return await planElevenLabsVocalDurations({ env, prompt, lyrics });
+	} catch (err) {
+		console.warn(
+			'ElevenLabs vocal pacing failed; using empirical baseline:',
+			err instanceof Error ? err.message : String(err)
+		);
+	}
+	try {
+		return estimateFallbackChunkDurationsMs(splitElevenLabsLyricSections(lyrics.lyrics ?? ''));
+	} catch {
+		return undefined;
+	}
+}
+
 async function runElevenLabsGeneration(params: {
 	env: Env;
 	stub: DurableObjectStub<SmolDurableObject>;
@@ -979,29 +1064,17 @@ async function runElevenLabsGeneration(params: {
 
 	// For vocal tracks without an explicit ELEVENLABS_MUSIC_LENGTH_MS override, run a cheap
 	// checkpointed Workers AI pacing step (glm-5.3 with empirical fallback) BEFORE the non-retried
-	// paid submit step. Skipped automatically if R2 already holds committed audio for this track.
+	// paid submit step. It runs only after the pre-claim R2 check above found no committed artifact
+	// (that result is reused; no second HEAD after quota admission). The step body NEVER throws: any
+	// AI/helper failure degrades to the empirical baseline, or to `undefined` (the paid step then
+	// derives the baseline itself or rejects the lyrics pre-dispatch with a refund), so a fresh quota
+	// reservation can never be stranded between admission and the paid step.
 	let plannedChunkDurationsMs: number[] | undefined;
 	if (!is_instrumental && resolveOptionalElevenLabsMusicLengthMs(env) === undefined) {
 		plannedChunkDurationsMs = await step.do(
 			'plan elevenlabs vocal pacing',
-			{
-				...config,
-				retries: { limit: 1, delay: '5 second' },
-			},
-			async () => {
-				const existingMusicId = getElevenLabsMusicId(targetSmolId);
-				const existingHead = typeof env.SMOL_BUCKET.head === 'function'
-					? await env.SMOL_BUCKET.head(`${existingMusicId}.mp3`)
-					: null;
-				if (existingHead && existingHead.size > 0) {
-					return undefined;
-				}
-				return await planElevenLabsVocalDurations({
-					env,
-					prompt,
-					lyrics,
-				});
-			}
+			config,
+			async () => await planElevenLabsVocalDurationsSafely(env, prompt, lyrics)
 		);
 	}
 
@@ -1270,11 +1343,13 @@ async function reconcileCarriedAttempt(params: {
 	address?: string;
 	quotaReservationId?: string;
 	quotaDayKey?: string;
+	quotaProvider?: MusicProvider;
 	retry_id?: string;
 	retry_steps: WorkflowSteps;
 	prompt: string;
 	description: string;
 	lyrics: AiSongGeneratorLyrics;
+	is_public: boolean;
 	is_instrumental: boolean;
 	requested_provider: MusicProvider;
 	override_provider?: MusicProvider;
@@ -1286,17 +1361,23 @@ async function reconcileCarriedAttempt(params: {
 		config,
 		smolId,
 		address,
-		quotaReservationId,
-		quotaDayKey,
+		quotaReservationId: carriedQuotaReservationId,
+		quotaDayKey: carriedQuotaDayKey,
+		quotaProvider,
 		retry_id,
 		retry_steps,
 		prompt,
 		description,
 		lyrics,
+		is_public,
 		is_instrumental,
 		requested_provider,
 		override_provider,
 	} = params;
+
+	// Mutable: a legacy AISG replay may need to reserve its own slot before it can dispatch.
+	let quotaReservationId = carriedQuotaReservationId;
+	let quotaDayKey = carriedQuotaDayKey;
 
 	const attempt = retry_steps.provider_attempt;
 	if (!attempt || attempt.status === 'failed') {
@@ -1351,8 +1432,9 @@ async function reconcileCarriedAttempt(params: {
 
 	// 2. AISG carried attempt (claimed / submitted / ambiguous)
 	if (attempt.provider === 'aisonggenerator') {
-		// Try read-only attempt reconciliation against aisonggenerator-worker if we have an attempt_id
-		// and don't yet have a task_id or full 2 song_ids.
+		// Reconcile against aisonggenerator-worker by replaying the keyed submit (same Idempotency-Key and
+		// payload) when we have an attempt_id but no task_id or full 2 song_ids. The worker answers from its
+		// stored receipt; an in_flight/ambiguous receipt comes back unresolved and never re-submits.
 		let resolvedTaskId = attempt.task_id;
 		let resolvedWorkspaceId = attempt.workspace_id;
 		let resolvedSongIds = toDistinctStringIds(attempt.song_ids ?? retry_steps.song_ids);
@@ -1363,19 +1445,107 @@ async function reconcileCarriedAttempt(params: {
 			&& !resolvedTaskId
 			&& resolvedSongIds.length < EXPECTED_AISG_TRACK_COUNT
 		) {
-			const receipt = await step.do('reconcile aisonggenerator attempt', config, async () => {
-				return await getAisgAttemptReceipt(env, attempt.attempt_id!);
-			});
+			// aisonggenerator-worker answers a keyed replay identically whether it came from a stored receipt
+			// or a first submit (no receipt -> fresh PAID dispatch under this key). The replay is therefore only
+			// permitted while an AISG quota reservation covers this attempt:
+			// - the carried reservation, but only when the quota DO confirms it is an AISG reservation that
+			//   still counts a slot (reserved / committed / ambiguous). The carried ID alone is not trusted:
+			//   a prior replay may have refunded it after a typed rejection (the worker then cleared its
+			//   receipt, so the next replay is a fresh paid dispatch), and a refunded row can never be committed.
+			// - otherwise (legacy attempt with no reservation, a non-AISG one, or a refunded/missing one), a NEW
+			//   reservation made here first. Denial refuses the replay. It is refunded only on positive evidence
+			//   that the worker did not dispatch (409 / typed rejection); otherwise it stays held and is committed
+			//   by the normal poll/commit path (an existing legacy receipt was never counted, so counting it once
+			//   is correct).
+			const carriedId = quotaReservationId;
+			const carriedCoversAisg = Boolean(
+				carriedId
+				&& address
+				&& (quotaProvider === undefined || quotaProvider === 'aisonggenerator')
+				&& await step.do('verify carried aisonggenerator quota', config, async () => {
+					const record = await getGenerationQuotaReservation(env, { address: address!, reservationId: carriedId! });
+					return Boolean(
+						record
+						&& record.provider === 'aisonggenerator'
+						&& (record.status === 'reserved' || record.status === 'committed' || record.status === 'ambiguous')
+					);
+				})
+			);
+			let replayReservation: { reservationId: string; dayKey?: string } | null = null;
+			if (!carriedCoversAisg) {
+				replayReservation = await reservePaidDispatchQuota({
+					env,
+					stub,
+					step,
+					config,
+					smolId,
+					targetProvider: 'aisonggenerator',
+					address,
+					reservationId: `${smolId}:reconcile:aisonggenerator`,
+					stepName: 'reserve aisonggenerator reconcile quota',
+				});
+				// Persist before the replay so a successor retry carries (and settles) this reservation
+				// instead of reserving again or leaving it orphaned.
+				const held = replayReservation;
+				await step.do('record aisonggenerator reconcile quota', config, async () => {
+					await saveStateOnlyStep(stub, 'quota_reservation_id', held.reservationId);
+					await saveStateOnlyStep(stub, 'quota_provider', 'aisonggenerator');
+					if (held.dayKey) {
+						await saveStateOnlyStep(stub, 'quota_day_key', held.dayKey);
+					}
+				});
+			}
 
-			if (receipt && (receipt.status === 'accepted' || receipt.status === 'completed')) {
-				resolvedTaskId = receipt.task_id ?? resolvedTaskId;
+			// A replay with no stored receipt dispatches under the original key, so it is a paid step: no retries.
+			const receipt = await step.do(
+				'reconcile aisonggenerator attempt',
+				{ ...config, retries: { limit: 0, delay: '1 second' } },
+				async () => await replayAisgTaskSubmit(
+					env,
+					prompt,
+					description,
+					lyrics,
+					is_public,
+					is_instrumental,
+					attempt.attempt_id!
+				)
+			);
+
+			if (receipt.kind === 'task') {
+				resolvedTaskId = receipt.task_id;
 				resolvedWorkspaceId = receipt.workspace_id ?? resolvedWorkspaceId;
-				if (Array.isArray(receipt.music_ids) && receipt.music_ids.length > 0) {
-					resolvedSongIds = toDistinctStringIds(receipt.music_ids);
+				if (replayReservation) {
+					quotaReservationId = replayReservation.reservationId;
+					quotaDayKey = replayReservation.dayKey;
 				}
 			} else {
+				if (replayReservation && address) {
+					const held = replayReservation;
+					const notDispatched = receipt.outcome === 'rejected';
+					await step.do(
+						notDispatched ? 'refund aisonggenerator reconcile quota' : 'retain aisonggenerator reconcile quota',
+						config,
+						async () => {
+							if (notDispatched) {
+								await refundGenerationQuota(env, {
+									address,
+									reservationId: held.reservationId,
+									dayKey: held.dayKey,
+									reason: `aisg_reconcile_${receipt.code}`,
+								});
+							} else {
+								await markAmbiguousGenerationQuota(env, {
+									address,
+									reservationId: held.reservationId,
+									dayKey: held.dayKey,
+									reason: `aisg_reconcile_${receipt.code}`,
+								});
+							}
+						}
+					);
+				}
 				throw new NonRetryableError(
-					`Previous aisonggenerator attempt (${attempt.attempt_id}, status=${receipt?.status ?? attempt.status}) requires reconciliation before authorizing another charge`
+					`Previous aisonggenerator attempt (${attempt.attempt_id}, status=${attempt.status}, replay=${receipt.code}) requires reconciliation before authorizing another charge`
 				);
 			}
 		}
@@ -1615,11 +1785,13 @@ export async function generateOrReuseSongs(params: {
 			address,
 			quotaReservationId,
 			quotaDayKey,
+			quotaProvider,
 			retry_id,
 			retry_steps,
 			prompt,
 			description,
 			lyrics,
+			is_public,
 			is_instrumental,
 			requested_provider,
 			override_provider,
@@ -2338,6 +2510,10 @@ async function pollAndCommitAisgOrFallback(params: {
 						if (err instanceof InsufficientAudioDataError) {
 							await saveStateOnlyStep(stub, 'songs', songs);
 							return { state: 'pending', songs };
+						}
+						if (err instanceof UnsafeFetchUrlError) {
+							// Never request (or retry) an unsafe provider URL; commit would refuse it too.
+							throw new NonRetryableError(`Refusing unsafe AISG audio URL during fingerprinting: ${err.message}`);
 						}
 						throw err;
 					}

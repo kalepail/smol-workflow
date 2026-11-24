@@ -790,7 +790,9 @@ smols.post('/', parseAuth, async (c) => {
 })
 
 // Retry smol creation (caller-independent, protects published smols, carries attempt state across chain)
-smols.post('/retry/:id', async (c) => {
+// Auth is optional for the legacy empty-body retry (smol.xyz main sends no credentials), but a
+// provider override can buy a paid call on the creator's quota, so it requires the owner (H5a).
+smols.post('/retry/:id', optionalAuth, async (c) => {
 	const { env, req } = c
 	const id = req.param('id')
 
@@ -811,6 +813,11 @@ smols.post('/retry/:id', async (c) => {
 			}
 			overrideProvider = requestedOverride
 		}
+	}
+
+	const callerSub = c.get('jwtPayload')?.sub
+	if (overrideProvider && !callerSub) {
+		throw new HTTPException(401, { message: 'Authentication required to retry with a different provider' })
 	}
 
 	// Protect EVERY existing published smol unconditionally (regardless of override_provider).
@@ -835,6 +842,10 @@ smols.post('/retry/:id', async (c) => {
 			throw new HTTPException(503, { message: 'Unable to read smol retry state right now; please try again' })
 		}
 		throw new HTTPException(404, { message: 'Smol not found' })
+	}
+
+	if (overrideProvider && callerSub !== initialLoad.steps.payload.address) {
+		throw new HTTPException(403, { message: 'Only the creator can retry with a different provider' })
 	}
 
 	// Verify the source workflow itself is terminal (or missing/expired) BEFORE claiming a successor.

@@ -1015,3 +1015,75 @@ test('Gate 1f (Pass-2 P1 regressions): ElevenLabs 504, zero-byte 200, oversize 2
 		globalThis.fetch = originalFetch
 	}
 })
+
+test('P2 pacing: vocal ElevenLabs reuses the pre-claim R2 check (no second HEAD after quota admission) and a pacing AI failure falls back without stranding the reservation', async () => {
+	const fakeMp3 = makeAudioBytes(91, 8192)
+	const elevenLabsBodies: Array<Record<string, any>> = []
+	const harness = buildMockEnv()
+	const elHeadKeys: string[] = []
+	const bucket = harness.env.SMOL_BUCKET as any
+	const originalHead = bucket.head.bind(bucket)
+	bucket.head = async (key: string) => {
+		if (key.startsWith('el-')) {
+			elHeadKeys.push(key)
+		}
+		return await originalHead(key)
+	}
+	const ai = harness.env.AI as any
+	const originalRun = ai.run
+	ai.run = async (model: string, input: unknown) => {
+		if (model === '@cf/zai-org/glm-5.3') throw new Error('Workers AI pacing outage')
+		return await originalRun(model, input)
+	}
+
+	const originalFetch = globalThis.fetch
+	globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+		const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+		if (url.includes('api.pixellab.ai')) {
+			return new Response(JSON.stringify({ image: { base64: FAKE_IMAGE_B64 } }), { status: 200 })
+		}
+		if (url.includes('/elevenlabs/v1/music')) {
+			elevenLabsBodies.push(JSON.parse(String(init?.body ?? '{}')))
+			return new Response(fakeMp3, { status: 200, headers: { 'Content-Type': 'audio/mpeg', 'Content-Length': String(fakeMp3.byteLength) } })
+		}
+		throw new Error(`Unexpected fetch: ${url}`)
+	}) as typeof fetch
+
+	try {
+		const token = await createAuthToken(TEST_USER, TEST_SECRET)
+		const ctx = createMockExecutionContext()
+		const created = await appModule.app.fetch(
+			new Request('https://api.smol.xyz/', {
+				method: 'POST',
+				headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+				body: JSON.stringify({ prompt: 'pacing outage ballad', provider: 'elevenlabs', instrumental: false }),
+			}),
+			harness.env,
+			ctx.ctx
+		)
+		assert.equal(created.status, 200)
+		const smolId = await created.text()
+
+		const wf = new workflowModule.Workflow({} as ExecutionContext, harness.env)
+		await wf.run(
+			{ payload: harness.createdWorkflows[0].params, instanceId: smolId, timestamp: new Date() } as never,
+			createWorkflowStep(new Map()).step as never
+		)
+
+		// Pre-claim check + the paid helper's own in-step pre-dispatch check; the pacing step adds NONE
+		// (previously a third HEAD ran after quota admission and could exhaust its retries, stranding quota).
+		assert.deepEqual(elHeadKeys, [`el-${smolId}.mp3`, `el-${smolId}.mp3`])
+		assert.equal(elevenLabsBodies.length, 1)
+		const chunks = elevenLabsBodies[0].composition_plan.chunks as Array<{ duration_ms: number }>
+		assert.deepEqual(
+			chunks.map((c) => c.duration_ms),
+			[elevenLabsModule.FALLBACK_CHUNK_BASE_MS + elevenLabsModule.FALLBACK_PER_SUNG_LINE_MS, elevenLabsModule.FALLBACK_CHUNK_BASE_MS + elevenLabsModule.FALLBACK_PER_SUNG_LINE_MS],
+			'pacing outage falls back to the empirical baseline'
+		)
+		const quota = (harness.env as any).USER_QUOTA.get((harness.env as any).USER_QUOTA.idFromName(`user:${TEST_USER}`))
+		assert.equal((await quota.getReservation(smolId))?.status, 'committed', 'fresh reservation is committed, never stranded')
+		assert.equal(harness.d1Smols.get(smolId)?.Song_1, `el-${smolId}`)
+	} finally {
+		globalThis.fetch = originalFetch
+	}
+})

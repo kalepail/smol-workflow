@@ -108,7 +108,6 @@
    */
     "vars": {
         "RPC_URL": "https://rpc.lightsail.network/",
-        "RPC_URL_TESTNET": "https://soroban-testnet.stellar.org",
         "NETWORK_PASSPHRASE": "Public Global Stellar Network ; September 2015",
         "SMOL_CONTRACT_ID": "CBRNUVLGFM5OYWAGZVGU7CTMP2UJLKZCLFY2ANUCK5UGKND6BBAA5PLA",
         "CF_AI_GATEWAY_ID": "smol",
@@ -119,7 +118,7 @@
         "DAILY_LIMIT_ELEVENLABS": "3",
         "BURST_LIMIT_PER_MINUTE": "5",
         "GLOBAL_DAILY_LIMIT_CLASSIC": "500",
-        "GLOBAL_DAILY_LIMIT_ELEVENLABS": "50",
+        "GLOBAL_DAILY_LIMIT_ELEVENLABS": "20",
         "PLAY_COUNT_MODE": "server",
         "MIXTAPE_DEDUPE_AI_ENABLED": "true",
         "SEARCH_BACKFILL_CRON_ENABLED": "true",

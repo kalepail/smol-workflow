@@ -106,8 +106,19 @@ The cron worker now behaves more like the local backfill runner:
 - it still stops immediately once a page queues new work or has pending items
 - it resumes from the held cursor on the next scheduled run
 
-If you need a faster catch-up, use the manual wave runner first, then leave cron enabled as a
-safe low-pressure completion and repair loop.
+If you need a faster catch-up, use the manual wave runner first, then leave cron enabled to finish
+the remaining pages at low pressure.
+
+The cron is a one-pass backfill, not a repair loop. Once a full pass finishes, it saves
+`status: "complete"` for the current `SEARCH_INDEX_VERSION` in KV (`__internal:search-backfill:v2`)
+and every later run returns that saved state immediately without reading D1 or Vectorize
+(`src/utils/search.ts`, `runSearchBackfillCron`). After that point:
+- new smols are indexed by the workflow's `enqueue search indexing` step and the queue consumer
+- failed queue messages land in `smol-search-queue-dlq`, whose consumer handles recovery
+- anything else needs a manual `POST /search/admin/reindex/:id`, `POST /search/admin/backfill`
+  (add `force=true` to re-upsert current rows), or `POST /search/admin/reconcile`
+
+A new cron pass runs only after `SEARCH_INDEX_VERSION` changes or the KV state key is deleted.
 
 To inspect the cron monitor remotely, call:
 

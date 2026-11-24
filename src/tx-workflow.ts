@@ -9,6 +9,8 @@ import { artistSmolsCacheTag } from "./utils/cache-tags";
 import { deriveMintPair, isLedgerSequence, type MainnetChainReads } from "./utils/chain";
 import type { MintPhase } from "./utils/chain-target";
 
+const TX_HASH_RE = /^[0-9a-f]{64}$/;
+
 const config: WorkflowStepConfig = {
 	retries: {
 		limit: 5,
@@ -290,14 +292,26 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
 			'submit transaction',
 			submitConfig,
 			async (): Promise<{ hash: string }> => {
-				let result: { hash?: string; error?: string; errorCode?: string };
+				let result: Awaited<ReturnType<KaleWorkerBinding['submitTransaction']>>;
 				try {
 					result = await this.env.KALE_WORKER.submitTransaction({ xdr: signedXdr });
 				} catch {
 					throw new NonRetryableError('Relay submission outcome unknown (requires reconciliation)');
 				}
 
+				// A valid hash wins over a relay error: WAIT_TIMEOUT / ONCHAIN_FAILED results carry the
+				// hash of a transaction that may already be on-chain. Checkpoint it so the read-only
+				// confirm step records the real outcome instead of dropping a landed mint.
 				if (result?.error) {
+					const relayHash = typeof result.hash === 'string' ? result.hash.trim().toLowerCase() : '';
+					if (TX_HASH_RE.test(relayHash)) {
+						console.warn(JSON.stringify({
+							event: 'relay_error_with_hash',
+							error_code: typeof result.errorCode === 'string' ? result.errorCode.slice(0, 64) : null,
+							hash: relayHash,
+						}));
+						return { hash: relayHash };
+					}
 					throw new NonRetryableError('Relay could not confirm submission');
 				}
 

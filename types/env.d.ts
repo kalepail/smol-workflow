@@ -4,10 +4,17 @@
 type KaleWorkerChainReads = import("../src/utils/chain").MainnetChainReads
 
 interface KaleWorkerBinding extends Fetcher, KaleWorkerChainReads {
+	// kale-worker `submitTransaction` RPC. On failure it can still return the relay `hash`
+	// (e.g. WAIT_TIMEOUT / ONCHAIN_FAILED) because the transaction may already be on-chain.
 	submitTransaction(input: { xdr: string }): Promise<{
 		hash?: string
+		transactionId?: string
+		status?: string
 		error?: string
 		errorCode?: string
+		message?: string
+		category?: string
+		retryable?: boolean
 	}>
 }
 

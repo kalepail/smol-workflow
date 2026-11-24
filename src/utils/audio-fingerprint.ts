@@ -1,4 +1,5 @@
 import { parseBuffer, type IAudioMetadata } from 'music-metadata';
+import { fetchHttpsFollowingSafeRedirects } from './safe-fetch';
 
 export interface AudioFingerprint {
 	hash: string;
@@ -33,9 +34,12 @@ export class InsufficientAudioDataError extends Error {
 /**
  * Fetch up to FINGERPRINT_READ_CAP bytes from audioUrl, safely capping reads even if
  * the upstream ignores Range and responds with 200 OK for a multi-megabyte MP3.
+ * Only https URLs without credentials are fetched (redirect targets included).
  */
 async function fetchCappedAudioPrefix(audioUrl: string): Promise<Uint8Array> {
-	const response = await fetch(audioUrl, {
+	// https-only, credential-free, manually followed + re-validated redirects (throws UnsafeFetchUrlError
+	// before ANY request to an unsafe URL or redirect target).
+	const response = await fetchHttpsFollowingSafeRedirects(audioUrl, {
 		headers: { 'Range': `bytes=0-${FINGERPRINT_MIN_BYTES}` },
 		signal: AbortSignal.timeout(15_000),
 	});

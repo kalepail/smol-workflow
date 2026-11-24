@@ -14,7 +14,6 @@
 	"devDependencies": {
 		"@cloudflare/workers-types": "^4.20260115.0",
 		"@types/node": "^25.0.8",
-		"itty-fetcher": "^1.0.10",
 		"tsx": "^4.21.0",
 		"typescript": "^5.9.3",
 		"wrangler": "^4.59.2"

@@ -5,6 +5,7 @@ import {
 	type QuotaLimits,
 	type QuotaProvider,
 	type QuotaRefundOptions,
+	type QuotaReservationRecord,
 	type QuotaSnapshot,
 	type UserQuotaDO,
 } from '../quota-do'
@@ -12,7 +13,7 @@ import {
 export const DEFAULT_DAILY_LIMIT_CLASSIC = 10
 export const DEFAULT_DAILY_LIMIT_ELEVENLABS = 3
 export const DEFAULT_GLOBAL_DAILY_LIMIT_CLASSIC = 500
-export const DEFAULT_GLOBAL_DAILY_LIMIT_ELEVENLABS = 50
+export const DEFAULT_GLOBAL_DAILY_LIMIT_ELEVENLABS = 20
 export const DEFAULT_BURST_LIMIT_PER_MINUTE = 0
 
 export interface QuotaExceededPayload {
@@ -865,6 +866,20 @@ export async function transitionFallbackQuota(
 		previousDayKey,
 		quota: userResult.quota,
 	}
+}
+
+/**
+ * Read a reservation's authoritative state from the user's quota DO (null when absent or unavailable).
+ * Used to verify a carried reservation still holds a counted slot before a paid replay relies on it.
+ */
+export async function getGenerationQuotaReservation(
+	env: Env,
+	params: { address: string; reservationId: string }
+): Promise<QuotaReservationRecord | null> {
+	if (!env.USER_QUOTA || !params.address || !params.reservationId) {
+		return null
+	}
+	return await getUserQuotaStub(env, params.address).getReservation(params.reservationId)
 }
 
 export async function commitGenerationQuota(
