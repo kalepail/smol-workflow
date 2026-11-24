@@ -98,7 +98,7 @@ ext/smol-sdk/                # Soroban smart contract SDK (built via scripts/bui
 ### Variables (`wrangler.jsonc` `vars`)
 - `CF_AI_GATEWAY_ID` — AI Gateway ID configured with ElevenLabs BYOK stored key (`smol`, `byok_only: true`)
 - `CF_AIG_BYOK_ALIAS` — BYOK key alias (default: `default`)
-- `ELEVENLABS_MUSIC_LENGTH_MS` — Server-enforced track duration in ms (default: `120000`, bounded `3000..600000`)
+- `ELEVENLABS_MUSIC_LENGTH_MS` — Optional track duration override in ms (`3000..600000`); omitted on instrumentals by default so ElevenLabs chooses length naturally
 - `ELEVENLABS_OUTPUT_FORMAT` — Audio format (default: `mp3_44100_128`)
 - `ELEVENLABS_FALLBACK_ENABLED` — Enable automatic AISG → ElevenLabs fallback (`true` / `false`)
 - `RPC_URL`, `RPC_URL_TESTNET`, `NETWORK_PASSPHRASE`, `SMOL_CONTRACT_ID` — Stellar RPC & contract config
@@ -129,7 +129,7 @@ npx wrangler deploy --dry-run
 pnpm start
 ```
 
-See [docs/workflows-and-media.md](./docs/workflows-and-media.md) and [docs/search-index-setup.md](./docs/search-index-setup.md) for detailed workflow, media streaming, migration, and search index operations.
+See [docs/workflows-and-media.md](./docs/workflows-and-media.md), [docs/search-index-setup.md](./docs/search-index-setup.md), and [docs/up-next.md](./docs/up-next.md) for detailed workflow, media streaming, migration, search index operations, and backlog items.
 
 ## License
 

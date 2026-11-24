@@ -1,15 +1,22 @@
 import { NonRetryableError } from 'cloudflare:workflows';
 
 export const ELEVENLABS_MODEL_ID = 'music_v2_5';
+export const ELEVENLABS_PACING_MODEL = '@cf/zai-org/glm-5.3' as const;
 export const DEFAULT_ELEVENLABS_MUSIC_LENGTH_MS = 120_000;
 export const MIN_ELEVENLABS_CHUNK_MS = 3_000;
 export const MAX_ELEVENLABS_CHUNK_MS = 120_000;
 export const MIN_ELEVENLABS_TOTAL_MS = 3_000;
 export const MAX_ELEVENLABS_TOTAL_MS = 600_000;
 export const MAX_ELEVENLABS_CHUNKS = 30;
+export const MAX_ELEVENLABS_CHUNK_LINES = 30;
+export const MAX_ELEVENLABS_LINE_CHARS = 200;
 export const MAX_ELEVENLABS_STYLES = 50;
+// Pure empirical fallback fitted via L1 minimization on 116 live measured SMOL vocal songs
+// (no genre/tempo keyword lists). Used as the neutral anchor for agentic pacing and fallback.
+export const FALLBACK_CHUNK_BASE_MS = 12_000;
+export const FALLBACK_PER_SUNG_LINE_MS = 2_500;
 export const DEFAULT_ELEVENLABS_OUTPUT_FORMAT = 'mp3_44100_128';
-export const ELEVENLABS_MAX_AUDIO_BYTES = 8 * 1024 * 1024; // 8 MiB hard cap
+export const ELEVENLABS_MAX_AUDIO_BYTES = 25 * 1024 * 1024; // 25 MiB hard cap (matches AISG; safely fits up to 10 min auto-length tracks)
 export const CANONICAL_SONG_BASE_URL = 'https://api.smol.xyz/song';
 
 export type ElevenLabsErrorCode =
@@ -62,7 +69,7 @@ export type ElevenLabsMusicRequestBody =
 		model_id: typeof ELEVENLABS_MODEL_ID;
 		prompt: string;
 		force_instrumental: true;
-		music_length_ms: number;
+		music_length_ms?: number;
 	}
 	| {
 		model_id: typeof ELEVENLABS_MODEL_ID;
@@ -82,16 +89,20 @@ export interface ElevenLabsGenerationResult {
 	};
 }
 
-export function resolveElevenLabsMusicLengthMs(env: Env): number {
+export function resolveOptionalElevenLabsMusicLengthMs(env: Env): number | undefined {
 	const raw = env.ELEVENLABS_MUSIC_LENGTH_MS;
 	if (!raw) {
-		return DEFAULT_ELEVENLABS_MUSIC_LENGTH_MS;
+		return undefined;
 	}
 	const parsed = Number(raw);
 	if (!Number.isFinite(parsed)) {
-		return DEFAULT_ELEVENLABS_MUSIC_LENGTH_MS;
+		return undefined;
 	}
 	return Math.round(Math.min(MAX_ELEVENLABS_TOTAL_MS, Math.max(MIN_ELEVENLABS_TOTAL_MS, parsed)));
+}
+
+export function resolveElevenLabsMusicLengthMs(env: Env): number {
+	return resolveOptionalElevenLabsMusicLengthMs(env) ?? DEFAULT_ELEVENLABS_MUSIC_LENGTH_MS;
 }
 
 function cleanStyleList(styles: string[] | undefined, fallbackPrompt?: string): string[] {
@@ -117,16 +128,85 @@ function cleanStyleList(styles: string[] | undefined, fallbackPrompt?: string): 
 	return cleaned;
 }
 
+const SECTION_HEADING_RE = /^\s*\[[^\]]+\]\s*$/;
+
+const VOCAL_PACING_SYSTEM_PROMPT = `You are a veteran music producer setting section durations (in milliseconds) for an ElevenLabs Music v2.5 composition_plan.
+You receive the song style tags, a brief user prompt for musical context, and an ordered list of numbered lyric chunks (each with sung_lines and a neutral baseline_sec).
+
+Assign a natural duration_ms (integer, 3000 to 120000) to EACH chunk strictly based on how long it actually takes to perform that chunk's lyrics and musical role:
+- Match the song's genuine tempo, groove, vocal delivery, syllable/word density, and language: faster, dense, rhythmic, or chant-like deliveries (or very short 1-3 word lines) need LESS time per line than baseline_sec; slower, sustained, atmospheric, or expansive phrasing needs MORE time.
+- Give instrumental-only sections (intros, solos, breaks, outros) realistic musical space for the arrangement style.
+- Do NOT stretch a chunk to obey arbitrary total-runtime claims or timestamps in the user prompt (e.g. "9-minute suite", "20-minute epic") — size each chunk to fit the actual lyrics provided so ElevenLabs neither rushes vocals nor pads dead air.
+
+Return ONLY valid JSON: {"estimated_bpm": <integer>, "durations_ms": [<one integer per chunk, exact same length as chunks>]}.`;
+
+function wrapLineToMaxChars(line: string, maxChars = MAX_ELEVENLABS_LINE_CHARS): string[] {
+	if (line.length <= maxChars) {
+		return [line];
+	}
+	const wrapped: string[] = [];
+	let remaining = line.trim();
+	while (remaining.length > maxChars) {
+		let splitAt = remaining.lastIndexOf(' ', maxChars);
+		if (splitAt < Math.floor(maxChars * 0.4)) {
+			splitAt = maxChars;
+		}
+		wrapped.push(remaining.slice(0, splitAt).trim());
+		remaining = remaining.slice(splitAt).trim();
+	}
+	if (remaining) {
+		wrapped.push(remaining);
+	}
+	return wrapped;
+}
+
+function countSungLines(sectionText: string): number {
+	return sectionText
+		.split('\n')
+		.filter((line) => line.trim().length > 0 && !SECTION_HEADING_RE.test(line))
+		.length;
+}
+
+function clampChunkDurationsToTotalCap(rawDurations: number[], maxTotalMs = MAX_ELEVENLABS_TOTAL_MS): number[] {
+	if (rawDurations.length === 0) {
+		return [];
+	}
+
+	const clamped = rawDurations.map((ms) =>
+		Math.round(Math.min(MAX_ELEVENLABS_CHUNK_MS, Math.max(MIN_ELEVENLABS_CHUNK_MS, ms)))
+	);
+	const total = clamped.reduce((acc, d) => acc + d, 0);
+	if (total <= maxTotalMs) {
+		return clamped;
+	}
+
+	const minPossible = clamped.length * MIN_ELEVENLABS_CHUNK_MS;
+	const targetTotal = Math.max(minPossible, maxTotalMs);
+	const scale = targetTotal / total;
+	const scaled = clamped.map((d) =>
+		Math.round(Math.min(MAX_ELEVENLABS_CHUNK_MS, Math.max(MIN_ELEVENLABS_CHUNK_MS, d * scale)))
+	);
+
+	let excess = scaled.reduce((acc, d) => acc + d, 0) - targetTotal;
+	for (let i = 0; excess > 0 && i < scaled.length * 4; i++) {
+		const idx = i % scaled.length;
+		if (scaled[idx] > MIN_ELEVENLABS_CHUNK_MS) {
+			const sub = Math.min(excess, scaled[idx] - MIN_ELEVENLABS_CHUNK_MS);
+			scaled[idx] -= sub;
+			excess -= sub;
+		}
+	}
+
+	return scaled;
+}
+
 /**
- * Split saved lyrics into section-headed chunks for ElevenLabs Music v2.5 composition_plan.
- * Preserves existing [Section] headings and language; wraps unlabelled lyrics in [Verse 1].
+ * Split saved lyrics into ElevenLabs Music v2.5 compliant section chunks:
+ * - Preserves existing [Section] headings and exact lyrics verbatim
+ * - Splits unheaded multi-stanza lyrics on blank lines so they don't collapse into one giant chunk
+ * - Enforces ElevenLabs limits: <= 30 lines/chunk, <= 200 chars/line, <= 30 chunks total
  */
-export function buildElevenLabsCompositionChunks(
-	lyricsText: string,
-	styles: string[],
-	totalDurationMs: number,
-	fallbackPrompt?: string
-): ElevenLabsCompositionChunk[] {
+export function splitElevenLabsLyricSections(lyricsText: string): string[] {
 	const normalized = lyricsText.replace(/\r\n/g, '\n').trim();
 	if (!normalized) {
 		throw new ElevenLabsProviderError({
@@ -140,10 +220,9 @@ export function buildElevenLabsCompositionChunks(
 	const lines = normalized.split('\n');
 	const rawSections: string[] = [];
 	let current: string[] = [];
-	const headingRe = /^\s*\[[^\]]+\]\s*$/;
 
 	for (const line of lines) {
-		if (headingRe.test(line)) {
+		if (SECTION_HEADING_RE.test(line)) {
 			if (current.some((entry) => entry.trim().length > 0)) {
 				rawSections.push(current.join('\n').trim());
 			}
@@ -157,12 +236,50 @@ export function buildElevenLabsCompositionChunks(
 		rawSections.push(current.join('\n').trim());
 	}
 
-	const sections = rawSections
-		.map((section) => section.trim())
-		.filter(Boolean)
-		.map((section, idx) => (headingRe.test(section.split('\n')[0] ?? '') ? section : `[Verse ${idx + 1}]\n${section}`));
+	// Expand unheaded multi-stanza blocks and enforce per-chunk line & char caps
+	const expanded: string[] = [];
+	let verseCounter = 1;
+	for (const rawSection of rawSections) {
+		const trimmedSection = rawSection.trim();
+		if (!trimmedSection) continue;
+		const sectionLines = trimmedSection.split('\n');
+		const hasHeading = SECTION_HEADING_RE.test(sectionLines[0] ?? '');
 
-	if (sections.length === 0) {
+		if (!hasHeading) {
+			const stanzas = trimmedSection.split(/\n\s*\n+/).map((s) => s.trim()).filter(Boolean);
+			for (const stanza of stanzas) {
+				const wrappedLines = stanza
+					.split('\n')
+					.map((l) => l.trim())
+					.filter(Boolean)
+					.flatMap((l) => wrapLineToMaxChars(l));
+				const maxBodyLines = MAX_ELEVENLABS_CHUNK_LINES - 1;
+				for (let i = 0; i < wrappedLines.length; i += maxBodyLines) {
+					expanded.push(`[Verse ${verseCounter++}]\n${wrappedLines.slice(i, i + maxBodyLines).join('\n')}`);
+				}
+			}
+			continue;
+		}
+
+		const heading = sectionLines[0].trim().slice(0, MAX_ELEVENLABS_LINE_CHARS);
+		const bodyLines = sectionLines
+			.slice(1)
+			.map((l) => l.trim())
+			.filter(Boolean)
+			.flatMap((l) => wrapLineToMaxChars(l));
+
+		if (bodyLines.length === 0) {
+			expanded.push(heading);
+			continue;
+		}
+
+		const maxBodyLines = MAX_ELEVENLABS_CHUNK_LINES - 1;
+		for (let i = 0; i < bodyLines.length; i += maxBodyLines) {
+			expanded.push(`${heading}\n${bodyLines.slice(i, i + maxBodyLines).join('\n')}`);
+		}
+	}
+
+	if (expanded.length === 0) {
 		throw new ElevenLabsProviderError({
 			message: 'Vocal ElevenLabs composition produced no lyric sections',
 			code: 'invalid_composition_plan',
@@ -171,50 +288,224 @@ export function buildElevenLabsCompositionChunks(
 		});
 	}
 
-	// Ensure we never exceed MAX_ELEVENLABS_CHUNKS (30) and every chunk can get >= MIN_ELEVENLABS_CHUNK_MS
-	const maxChunksForDuration = Math.max(1, Math.min(MAX_ELEVENLABS_CHUNKS, Math.floor(totalDurationMs / MIN_ELEVENLABS_CHUNK_MS)));
+	if (expanded.length <= MAX_ELEVENLABS_CHUNKS) {
+		return expanded;
+	}
+
+	// Coalesce while respecting MAX_ELEVENLABS_CHUNKS and MAX_ELEVENLABS_CHUNK_LINES
 	const coalesced: string[] = [];
-	if (sections.length <= maxChunksForDuration) {
-		coalesced.push(...sections);
-	} else {
-		const perBucket = Math.ceil(sections.length / maxChunksForDuration);
-		for (let i = 0; i < sections.length; i += perBucket) {
-			coalesced.push(sections.slice(i, i + perBucket).join('\n\n'));
-		}
+	const perBucket = Math.ceil(expanded.length / MAX_ELEVENLABS_CHUNKS);
+	for (let i = 0; i < expanded.length; i += perBucket) {
+		const mergedLines = expanded
+			.slice(i, i + perBucket)
+			.join('\n')
+			.split('\n')
+			.slice(0, MAX_ELEVENLABS_CHUNK_LINES);
+		coalesced.push(mergedLines.join('\n'));
 	}
+	return coalesced;
+}
 
-	// Distribute totalDurationMs across chunks proportionally by character weight,
-	// clamping each chunk to [3000, 120000] ms.
-	const boundedTotal = Math.min(
-		Math.min(MAX_ELEVENLABS_TOTAL_MS, coalesced.length * MAX_ELEVENLABS_CHUNK_MS),
-		Math.max(coalesced.length * MIN_ELEVENLABS_CHUNK_MS, totalDurationMs)
-	);
-	const weights = coalesced.map((text) => Math.max(1, text.replace(/\s+/g, '').length));
-	const totalWeight = weights.reduce((acc, w) => acc + w, 0);
-
-	const durations = weights.map((w) => {
-		const share = Math.round((w / totalWeight) * boundedTotal);
-		return Math.min(MAX_ELEVENLABS_CHUNK_MS, Math.max(MIN_ELEVENLABS_CHUNK_MS, share));
+/**
+ * Pure empirical fallback durations per chunk fitted on 116 live SMOL vocal songs
+ * (zero hardcoded semantic/lexical genre or tempo word lists).
+ */
+export function estimateFallbackChunkDurationsMs(sections: string[]): number[] {
+	const raw = sections.map((section) => {
+		const sungLines = countSungLines(section);
+		if (sungLines === 0) {
+			return FALLBACK_CHUNK_BASE_MS;
+		}
+		return FALLBACK_CHUNK_BASE_MS + sungLines * FALLBACK_PER_SUNG_LINE_MS;
 	});
+	return clampChunkDurationsToTotalCap(raw, MAX_ELEVENLABS_TOTAL_MS);
+}
 
-	// Adjust rounding drift to match boundedTotal while staying inside per-chunk bounds
-	let diff = boundedTotal - durations.reduce((acc, d) => acc + d, 0);
-	for (let i = 0; diff !== 0 && i < durations.length * 4; i++) {
-		const idx = i % durations.length;
-		if (diff > 0 && durations[idx] < MAX_ELEVENLABS_CHUNK_MS) {
-			const add = Math.min(diff, MAX_ELEVENLABS_CHUNK_MS - durations[idx]);
-			durations[idx] += add;
-			diff -= add;
-		} else if (diff < 0 && durations[idx] > MIN_ELEVENLABS_CHUNK_MS) {
-			const sub = Math.min(-diff, durations[idx] - MIN_ELEVENLABS_CHUNK_MS);
-			durations[idx] -= sub;
-			diff += sub;
+function extractPacingContent(raw: unknown): unknown {
+	if (!raw || typeof raw !== 'object') {
+		return undefined;
+	}
+	const envelope = (raw as { result?: unknown }).result;
+	const source = (envelope && typeof envelope === 'object' ? envelope : raw) as {
+		response?: unknown;
+		choices?: Array<{ message?: { content?: unknown } }>;
+	};
+	const choiceContent = source.choices?.[0]?.message?.content;
+	if (typeof choiceContent === 'string' && choiceContent.trim()) {
+		return choiceContent;
+	}
+	return source.response;
+}
+
+export function parsePlannedVocalDurationsMs(raw: unknown, expectedCount: number): number[] | null {
+	let draft = raw;
+	if (typeof draft === 'string') {
+		const cleaned = draft.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+		try {
+			draft = JSON.parse(cleaned);
+		} catch {
+			const start = cleaned.indexOf('{');
+			const end = cleaned.lastIndexOf('}');
+			if (start >= 0 && end > start) {
+				try {
+					draft = JSON.parse(cleaned.slice(start, end + 1));
+				} catch {
+					return null;
+				}
+			} else {
+				return null;
+			}
 		}
 	}
 
+	const candidate = draft as { durations_ms?: unknown } | null;
+	if (!Array.isArray(candidate?.durations_ms) || candidate.durations_ms.length !== expectedCount) {
+		return null;
+	}
+
+	const parsed = candidate.durations_ms.map((val) => Number(val));
+	if (parsed.some((n) => !Number.isFinite(n) || n <= 0)) {
+		return null;
+	}
+
+	return clampChunkDurationsToTotalCap(parsed, MAX_ELEVENLABS_TOTAL_MS);
+}
+
+/**
+ * Agentic per-chunk duration planner for ElevenLabs Music v2.5 vocal compositions.
+ * Runs ONLY when ELEVENLABS_MUSIC_LENGTH_MS is not explicitly overridden.
+ * Uses @cf/zai-org/glm-5.3 anchored on the empirical baseline, falling back cleanly
+ * to estimateFallbackChunkDurationsMs on any AI error or invalid response.
+ */
+export async function planElevenLabsVocalDurations(params: {
+	env: Env;
+	prompt: string;
+	lyrics: AiSongGeneratorLyrics;
+	sections?: string[];
+}): Promise<number[] | undefined> {
+	if (resolveOptionalElevenLabsMusicLengthMs(params.env) !== undefined) {
+		return undefined;
+	}
+
+	const sections = params.sections ?? splitElevenLabsLyricSections(params.lyrics.lyrics);
+	const fallbackDurations = estimateFallbackChunkDurationsMs(sections);
+
+	if (typeof params.env.AI?.run !== 'function') {
+		return fallbackDurations;
+	}
+
+	const chunkPayload = sections.map((text, index) => ({
+		index,
+		sung_lines: countSungLines(text),
+		baseline_sec: Math.round(fallbackDurations[index] / 1000),
+		text,
+	}));
+
+	try {
+		const response = await params.env.AI.run(ELEVENLABS_PACING_MODEL, {
+			messages: [
+				{ role: 'system', content: VOCAL_PACING_SYSTEM_PROMPT },
+				{
+					role: 'user',
+					content: JSON.stringify({
+						prompt: params.prompt.trim().slice(0, 600),
+						styles: cleanStyleList(params.lyrics.style),
+						chunk_count: sections.length,
+						chunks: chunkPayload,
+					}),
+				},
+			],
+			max_completion_tokens: 1200,
+			temperature: 0.15,
+			reasoning_effort: 'low',
+			response_format: { type: 'json_object' },
+		});
+
+		const planned = parsePlannedVocalDurationsMs(extractPacingContent(response), sections.length);
+		if (planned) {
+			return planned;
+		}
+		console.warn('ElevenLabs vocal pacing model returned invalid durations; using empirical baseline');
+	} catch (err) {
+		console.warn(
+			'ElevenLabs vocal pacing model failed; using empirical baseline:',
+			err instanceof Error ? err.message : String(err)
+		);
+	}
+
+	return fallbackDurations;
+}
+
+/**
+ * Split saved lyrics into section-headed chunks for ElevenLabs Music v2.5 composition_plan.
+ * Preserves existing [Section] headings and language; wraps unlabelled lyrics in [Verse N].
+ * Uses explicit plannedDurationsMs when provided, explicit totalDurationMs override if set,
+ * or the empirical baseline durations otherwise.
+ */
+export function buildElevenLabsCompositionChunks(
+	lyricsText: string,
+	styles: string[],
+	totalDurationMs?: number,
+	fallbackPrompt?: string,
+	plannedDurationsMs?: number[]
+): ElevenLabsCompositionChunk[] {
+	const sections = splitElevenLabsLyricSections(lyricsText);
 	const positiveStyles = cleanStyleList(styles, fallbackPrompt);
 
-	return coalesced.map((text, idx) => ({
+	let durations: number[];
+	if (plannedDurationsMs && plannedDurationsMs.length === sections.length) {
+		durations = clampChunkDurationsToTotalCap(plannedDurationsMs, MAX_ELEVENLABS_TOTAL_MS);
+	} else if (totalDurationMs !== undefined) {
+		// Explicit ELEVENLABS_MUSIC_LENGTH_MS override: distribute proportionally by char weight
+		const maxChunksForDuration = Math.max(1, Math.min(MAX_ELEVENLABS_CHUNKS, Math.floor(totalDurationMs / MIN_ELEVENLABS_CHUNK_MS)));
+		const targetSections = sections.length <= maxChunksForDuration
+			? sections
+			: (() => {
+				const out: string[] = [];
+				const perBucket = Math.ceil(sections.length / maxChunksForDuration);
+				for (let i = 0; i < sections.length; i += perBucket) {
+					out.push(sections.slice(i, i + perBucket).join('\n').split('\n').slice(0, MAX_ELEVENLABS_CHUNK_LINES).join('\n'));
+				}
+				return out;
+			})();
+
+		const boundedTotal = Math.min(
+			Math.min(MAX_ELEVENLABS_TOTAL_MS, targetSections.length * MAX_ELEVENLABS_CHUNK_MS),
+			Math.max(targetSections.length * MIN_ELEVENLABS_CHUNK_MS, totalDurationMs)
+		);
+		const weights = targetSections.map((text) => Math.max(1, text.replace(/\s+/g, '').length));
+		const totalWeight = weights.reduce((acc, w) => acc + w, 0);
+
+		durations = weights.map((w) => {
+			const share = Math.round((w / totalWeight) * boundedTotal);
+			return Math.min(MAX_ELEVENLABS_CHUNK_MS, Math.max(MIN_ELEVENLABS_CHUNK_MS, share));
+		});
+
+		let diff = boundedTotal - durations.reduce((acc, d) => acc + d, 0);
+		for (let i = 0; diff !== 0 && i < durations.length * 4; i++) {
+			const idx = i % durations.length;
+			if (diff > 0 && durations[idx] < MAX_ELEVENLABS_CHUNK_MS) {
+				const add = Math.min(diff, MAX_ELEVENLABS_CHUNK_MS - durations[idx]);
+				durations[idx] += add;
+				diff -= add;
+			} else if (diff < 0 && durations[idx] > MIN_ELEVENLABS_CHUNK_MS) {
+				const sub = Math.min(-diff, durations[idx] - MIN_ELEVENLABS_CHUNK_MS);
+				durations[idx] -= sub;
+				diff += sub;
+			}
+		}
+
+		return targetSections.map((text, idx) => ({
+			text,
+			duration_ms: durations[idx],
+			positive_styles: positiveStyles,
+			negative_styles: [],
+		}));
+	} else {
+		durations = estimateFallbackChunkDurationsMs(sections);
+	}
+
+	return sections.map((text, idx) => ({
 		text,
 		duration_ms: durations[idx],
 		positive_styles: positiveStyles,
@@ -227,11 +518,12 @@ export function buildElevenLabsRequestBody(params: {
 	description?: string;
 	lyrics?: AiSongGeneratorLyrics;
 	isInstrumental: boolean;
-	musicLengthMs: number;
+	musicLengthMs?: number;
+	chunkDurationsMs?: number[];
 }): ElevenLabsMusicRequestBody {
-	const clampedTotalMs = Math.round(
-		Math.min(MAX_ELEVENLABS_TOTAL_MS, Math.max(MIN_ELEVENLABS_TOTAL_MS, params.musicLengthMs))
-	);
+	const clampedTotalMs = params.musicLengthMs !== undefined
+		? Math.round(Math.min(MAX_ELEVENLABS_TOTAL_MS, Math.max(MIN_ELEVENLABS_TOTAL_MS, params.musicLengthMs)))
+		: undefined;
 
 	if (params.isInstrumental) {
 		const styleSummary = cleanStyleList(params.lyrics?.style).join(', ');
@@ -254,7 +546,7 @@ export function buildElevenLabsRequestBody(params: {
 			model_id: ELEVENLABS_MODEL_ID,
 			prompt: combinedPrompt,
 			force_instrumental: true,
-			music_length_ms: clampedTotalMs,
+			...(clampedTotalMs !== undefined ? { music_length_ms: clampedTotalMs } : {}),
 		};
 	}
 
@@ -263,7 +555,8 @@ export function buildElevenLabsRequestBody(params: {
 		params.lyrics?.lyrics ?? '',
 		params.lyrics?.style ?? [],
 		clampedTotalMs,
-		params.prompt
+		params.prompt,
+		params.chunkDurationsMs
 	);
 
 	return {
@@ -455,14 +748,15 @@ export async function generateElevenLabsSong(params: {
 	description?: string;
 	lyrics?: AiSongGeneratorLyrics;
 	isInstrumental: boolean;
+	chunkDurationsMs?: number[];
 	maxBytes?: number;
 }): Promise<ElevenLabsGenerationResult> {
-	const { env, smolId, prompt, description, lyrics, isInstrumental } = params;
+	const { env, smolId, prompt, description, lyrics, isInstrumental, chunkDurationsMs } = params;
 	const maxBytes = params.maxBytes ?? ELEVENLABS_MAX_AUDIO_BYTES;
 	const musicId = getElevenLabsMusicId(smolId);
 	const r2Key = `${musicId}.mp3`;
 	const canonicalUrl = getCanonicalSongUrl(musicId);
-	const musicLengthMs = resolveElevenLabsMusicLengthMs(env);
+	const configuredMusicLengthMs = resolveOptionalElevenLabsMusicLengthMs(env);
 
 	// 1. Check R2 first: if this generation instance already committed audio, reuse without paying again.
 	// Any R2 lookup failure happens strictly BEFORE ElevenLabs dispatch, so classify as rejected/retryable
@@ -481,13 +775,18 @@ export async function generateElevenLabsSong(params: {
 		}
 	}
 	if (existing && existing.size > 0 && (!existing.customMetadata?.smolId || existing.customMetadata.smolId === smolId)) {
+		const reusedDurationSeconds = chunkDurationsMs && chunkDurationsMs.length > 0
+			? Math.round(chunkDurationsMs.reduce((acc, d) => acc + d, 0) / 1000)
+			: configuredMusicLengthMs !== undefined
+				? Math.round(configuredMusicLengthMs / 1000)
+				: undefined;
 		return {
 			song: {
 				music_id: musicId,
 				status: 4,
 				audio: canonicalUrl,
 				service: 'elevenlabs',
-				duration: Math.round(musicLengthMs / 1000),
+				...(reusedDurationSeconds !== undefined ? { duration: reusedDurationSeconds } : {}),
 			},
 			receipt: {
 				r2_key: r2Key,
@@ -517,7 +816,8 @@ export async function generateElevenLabsSong(params: {
 		description,
 		lyrics,
 		isInstrumental,
-		musicLengthMs,
+		musicLengthMs: configuredMusicLengthMs,
+		chunkDurationsMs,
 	});
 
 	const baseUrl = await env.AI.gateway(gatewayId).getUrl('elevenlabs');
@@ -700,13 +1000,19 @@ export async function generateElevenLabsSong(params: {
 		committedBytes = bytes.byteLength;
 	}
 
+	const resolvedDurationSeconds = 'composition_plan' in requestBody
+		? Math.round(requestBody.composition_plan.chunks.reduce((acc, chunk) => acc + chunk.duration_ms, 0) / 1000)
+		: requestBody.music_length_ms !== undefined
+			? Math.round(requestBody.music_length_ms / 1000)
+			: undefined;
+
 	return {
 		song: {
 			music_id: musicId,
 			status: 4,
 			audio: canonicalUrl,
 			service: 'elevenlabs',
-			duration: Math.round(musicLengthMs / 1000),
+			...(resolvedDurationSeconds !== undefined ? { duration: resolvedDurationSeconds } : {}),
 		},
 		receipt: {
 			r2_key: r2Key,

@@ -100,9 +100,52 @@ interface Base_Ai_Cf_Google_Gemma_4_26B_A4B_It {
 	postProcessedOutputs: Ai_Cf_Google_Gemma_4_26B_A4B_It_Output
 }
 
+interface Ai_Cf_Reasoning_Chat_Input {
+	messages: Ai_Cf_Chat_Completion_Message[]
+	max_completion_tokens?: number
+	max_tokens?: number
+	temperature?: number
+	top_p?: number
+	reasoning_effort?: 'max' | 'high' | 'medium' | 'low' | 'minimal' | 'none'
+	response_format?:
+		| { type: 'text' }
+		| { type: 'json_object' }
+		| { type: 'json_schema'; json_schema: Record<string, unknown> }
+}
+
+interface Ai_Cf_Reasoning_Chat_Output {
+	response?: unknown
+	choices?: Array<{
+		index?: number
+		message?: {
+			role?: string
+			content?: string | null
+			reasoning_content?: string | null
+		}
+		finish_reason?: string | null
+	}>
+	result?: {
+		response?: unknown
+		choices?: Array<{
+			index?: number
+			message?: {
+				role?: string
+				content?: string | null
+				reasoning_content?: string | null
+			}
+			finish_reason?: string | null
+		}>
+	}
+	usage?: AiWorkersAiUsage
+}
+
 interface AiModels {
 	'@cf/moondream/moondream3.1-9B-A2B': Base_Ai_Cf_Moondream_Moondream3_1_9B_A2B
 	'@cf/google/gemma-4-26b-a4b-it': Base_Ai_Cf_Google_Gemma_4_26B_A4B_It
+	'@cf/zai-org/glm-5.3': {
+		inputs: Ai_Cf_Reasoning_Chat_Input
+		postProcessedOutputs: Ai_Cf_Reasoning_Chat_Output
+	}
 }
 
 // Cloudflare Clef (Decision-1 / System One typed questions). Verified live on

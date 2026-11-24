@@ -149,7 +149,6 @@ function buildMockEnv(options: {
 		CF_AI_GATEWAY_ID: options.cfGatewayId ?? 'smol',
 		CF_AIG_TOKEN: options.cfAigToken ?? 'aig-test-token',
 		CF_AIG_BYOK_ALIAS: 'default',
-		ELEVENLABS_MUSIC_LENGTH_MS: '120000',
 		ELEVENLABS_OUTPUT_FORMAT: 'mp3_44100_128',
 		ELEVENLABS_FALLBACK_ENABLED: options.fallbackEnabled ?? 'true',
 		DAILY_LIMIT_CLASSIC: '20',
@@ -193,6 +192,15 @@ function buildMockEnv(options: {
 				}
 				if (model === '@cf/meta/llama-guard-3-8b') {
 					return { response: options.nsfwRaw ?? { safe: true, categories: [] } }
+				}
+				if (model === '@cf/zai-org/glm-5.3') {
+					return {
+						choices: [{
+							message: {
+								content: JSON.stringify({ estimated_bpm: 118, durations_ms: [18000, 22000] }),
+							},
+						}],
+					}
 				}
 				throw new Error(`Unexpected AI model: ${model}`)
 			},
@@ -462,13 +470,43 @@ test('Gate 1b: explicit ElevenLabs vocal & instrumental use BYOK AI Gateway, 1 t
 		assert.equal(vocalReq.body.composition_plan.chunks.length, 2)
 		assert.match(vocalReq.body.composition_plan.chunks[0].text, /^\[Verse 1\]/)
 		assert.match(vocalReq.body.composition_plan.chunks[1].text, /^\[Chorus\]/)
+		assert.equal(vocalReq.body.composition_plan.chunks[0].duration_ms, 18000, 'Vocal chunk 0 uses agentic glm-5.3 pacing')
+		assert.equal(vocalReq.body.composition_plan.chunks[1].duration_ms, 22000, 'Vocal chunk 1 uses agentic glm-5.3 pacing')
 
-		// Verify instrumental request
+		// Verify empirical fallback when glm-5.3 fails + safe splitting for unheaded >30-line lyrics
+		const failingAiEnv = {
+			...harness.env,
+			AI: {
+				...harness.env.AI,
+				run: async () => { throw new Error('temporary Workers AI outage') },
+			},
+		} as unknown as Env
+		const unheadedLongLyrics = Array.from({ length: 34 }, (_, idx) => `Line ${idx + 1} of an unheaded lyric sheet`).join('\n')
+		const splitLong = elevenLabsModule.splitElevenLabsLyricSections(unheadedLongLyrics)
+		assert.equal(splitLong.length, 2, 'Unheaded >30-line lyrics split into ElevenLabs-compliant <=30-line chunks')
+		assert.ok(splitLong.every((c) => c.split('\n').length <= elevenLabsModule.MAX_ELEVENLABS_CHUNK_LINES))
+		const fallbackPlanned = await elevenLabsModule.planElevenLabsVocalDurations({
+			env: failingAiEnv,
+			prompt: 'steady acoustic tune',
+			lyrics: { title: 'Long', style: ['acoustic'], lyrics: unheadedLongLyrics },
+		})
+		assert.equal(fallbackPlanned?.length, 2, 'Pacing fallback returns one duration per chunk')
+		assert.ok(fallbackPlanned!.every((ms) => ms >= 3000 && ms <= 120000))
+
+		// Verify instrumental request (omits music_length_ms by default so ElevenLabs chooses length naturally)
 		const instReq = elevenLabsRequests[1]
 		assert.equal(instReq.body.model_id, 'music_v2_5')
 		assert.equal(instReq.body.force_instrumental, true)
-		assert.equal(instReq.body.music_length_ms, 120000)
+		assert.equal('music_length_ms' in instReq.body, false, 'Instrumental must omit music_length_ms unless explicitly configured')
 		assert.equal('composition_plan' in instReq.body, false)
+
+		// Explicit musicLengthMs override is still respected when configured
+		const explicitInstBody = elevenLabsModule.buildElevenLabsRequestBody({
+			prompt: 'lo-fi study beats',
+			isInstrumental: true,
+			musicLengthMs: 90_000,
+		})
+		assert.equal('music_length_ms' in explicitInstBody && explicitInstBody.music_length_ms, 90_000)
 
 		// Verify R2 storage, canonical audio URL, and normalized Song_2: null even on pre-migration D1!
 		const expectedMusicId = `el-${vocalId}`
@@ -914,7 +952,7 @@ test('Gate 1f (Pass-2 P1 regressions): ElevenLabs 504, zero-byte 200, oversize 2
 			name: '200 with declared oversize Content-Length',
 			response: () => new Response(new Uint8Array(16), {
 				status: 200,
-				headers: { 'Content-Type': 'audio/mpeg', 'Content-Length': String(20 * 1024 * 1024) },
+				headers: { 'Content-Type': 'audio/mpeg', 'Content-Length': String(elevenLabsModule.ELEVENLABS_MAX_AUDIO_BYTES + 1) },
 			}),
 			expectedCode: 'audio_too_large',
 		},

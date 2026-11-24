@@ -32,6 +32,8 @@ import {
 	generateElevenLabsSong,
 	getCanonicalSongUrl,
 	getElevenLabsMusicId,
+	planElevenLabsVocalDurations,
+	resolveOptionalElevenLabsMusicLengthMs,
 	toNonRetryableElevenLabsError,
 } from '../ai/elevenlabs';
 import {
@@ -975,6 +977,34 @@ async function runElevenLabsGeneration(params: {
 		}
 	});
 
+	// For vocal tracks without an explicit ELEVENLABS_MUSIC_LENGTH_MS override, run a cheap
+	// checkpointed Workers AI pacing step (glm-5.3 with empirical fallback) BEFORE the non-retried
+	// paid submit step. Skipped automatically if R2 already holds committed audio for this track.
+	let plannedChunkDurationsMs: number[] | undefined;
+	if (!is_instrumental && resolveOptionalElevenLabsMusicLengthMs(env) === undefined) {
+		plannedChunkDurationsMs = await step.do(
+			'plan elevenlabs vocal pacing',
+			{
+				...config,
+				retries: { limit: 1, delay: '5 second' },
+			},
+			async () => {
+				const existingMusicId = getElevenLabsMusicId(targetSmolId);
+				const existingHead = typeof env.SMOL_BUCKET.head === 'function'
+					? await env.SMOL_BUCKET.head(`${existingMusicId}.mp3`)
+					: null;
+				if (existingHead && existingHead.size > 0) {
+					return undefined;
+				}
+				return await planElevenLabsVocalDurations({
+					env,
+					prompt,
+					lyrics,
+				});
+			}
+		);
+	}
+
 	// Paid submit step: retries MUST be 0 so an ambiguous response never triggers a silent second charge.
 	// Pre-claim R2 HEAD already ran in the retryable step above; if the provider helper itself discovers
 	// a newly committed R2 artifact (receipt.reused_from_r2 === true), quota is reconciled from reuse outcome
@@ -1003,6 +1033,7 @@ async function runElevenLabsGeneration(params: {
 					description,
 					lyrics,
 					isInstrumental: is_instrumental,
+					chunkDurationsMs: plannedChunkDurationsMs,
 				});
 
 				await updateAttemptIfSupported(stub, {

@@ -13,8 +13,8 @@
   5. Final MP3 persistence (`persist song audio`) runs in a dedicated workflow step **after** swap resolution completes.
 - For **ElevenLabs Music v2.5**:
   1. Resolves `env.AI.gateway(env.CF_AI_GATEWAY_ID).getUrl('elevenlabs')` and posts to `/v1/music?output_format=mp3_44100_128` with `model_id: "music_v2_5"`, BYOK headers (`cf-aig-authorization`, `cf-aig-byok-alias`, `cf-aig-no-wholesale: true`, `cf-aig-skip-cache: true`, `cf-aig-collect-log-payload: false`), and no `xi-api-key`.
-  2. Instrumentals send `{ model_id, prompt, force_instrumental: true, music_length_ms }`. Vocals send `{ model_id, composition_plan: { chunks: [...] } }` with no top-level `prompt`, `force_instrumental`, or `music_length_ms`.
-  3. Streams known-length responses straight into `SMOL_BUCKET` via `FixedLengthStream` (and bounds unknown-length streams at 8 MiB), rejecting truncated/overflow/empty responses before committing.
+  2. Instrumentals send `{ model_id, prompt, force_instrumental: true }` (omitting `music_length_ms` unless `ELEVENLABS_MUSIC_LENGTH_MS` is explicitly configured so `music_v2_5` chooses length naturally). Vocals send `{ model_id, composition_plan: { chunks: [...] } }` with no top-level `prompt`, `force_instrumental`, or `music_length_ms`; per-chunk `duration_ms` is planned in a dedicated pre-submit step via `@cf/zai-org/glm-5.3` anchored on live-measured SMOL empirical durations (falling back cleanly to the empirical baseline on any AI error), with automatic chunk splitting for ElevenLabs' `<= 30` lines/chunk and `<= 200` chars/line limits.
+  3. Streams known-length responses straight into `SMOL_BUCKET` via `FixedLengthStream` (and bounds unknown-length streams at 25 MiB), rejecting truncated/overflow/empty responses before committing.
   4. Always populates `songs[0].audio = "https://api.smol.xyz/song/el-<smolId>.mp3"` and `status: 4` so existing clients never stall.
 
 ### Completion & Retry Guarantees
