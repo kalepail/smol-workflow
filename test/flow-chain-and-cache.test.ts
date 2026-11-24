@@ -3,12 +3,15 @@ import { createHash, generateKeyPairSync, sign } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 import test, { after, before } from 'node:test'
-import { Account, Address, Keypair, Networks, Operation, StrKey, TransactionBuilder, nativeToScVal, xdr } from '@stellar/stellar-sdk/minimal'
+import { Account, Address, Networks, Operation, StrKey, TransactionBuilder, nativeToScVal, xdr } from '@stellar/stellar-sdk/minimal'
 import { balanceKey, contractDataKey, deriveMintPair, instanceKey, KALE_SAC, poolRecordsKey, storageKey, type LedgerPage } from '../src/utils/chain'
 import {
 	createAuthToken, createMockEdgeCache, createMockExecutionContext, createMockR2Bucket,
-	createSqliteD1, createWorkflowStep, installCloudflareStubs,
+	createMockUserQuotaNamespace, createSqliteD1, createWorkflowStep, installCloudflareStubs,
 } from './helpers/harness'
+import { MAINNET_MINT_IDENTITY } from '../src/chain/mint-authorization'
+import { buildFeCoinItCarrier, buildFeCoinThemCarrier, createPasskey, type FeIdentity } from './fixtures/mint-authz/fe-builder'
+import { testIdentity, testIssuerKeypair } from './fixtures/mint-authz/generate'
 
 const SECRET = 'test-secret-for-chain-and-cache-only'
 const LEDGER = 65_635_380
@@ -22,12 +25,13 @@ const COMET = Buffer.from('61e1fc5401a7b22418c2bd3bc5bd2c07241e4dae098c587c89f3f
 const SCHEMA = readFileSync(new URL('../schema.sql', import.meta.url), 'utf8')
 let app: typeof import('../src/index').app
 let TxWorkflow: typeof import('../src/index').TxWorkflow
+let UserQuotaDO: typeof import('../src/index').UserQuotaDO
 let cleanup: () => void
 
 before(async () => {
 	const stubs = installCloudflareStubs({ CF_API_TOKEN: 'fixture-purge-token', CF_ZONE_ID: 'fixture-zone' })
 	cleanup = stubs.cleanup
-	;({ app, TxWorkflow } = await import('../src/index'))
+	;({ app, TxWorkflow, UserQuotaDO } = await import('../src/index'))
 })
 
 after(() => cleanup())
@@ -61,6 +65,26 @@ function harness() {
 	}
 
 	return { db, env, stats, track, send }
+}
+
+/** Admission needs the production configuration, an open kill switch and the prefix-lock object. */
+function enableMinting(env: Env) {
+	Object.assign(env, {
+		SMOL_CONTRACT_ID: 'CBRNUVLGFM5OYWAGZVGU7CTMP2UJLKZCLFY2ANUCK5UGKND6BBAA5PLA',
+		NETWORK_PASSPHRASE: Networks.PUBLIC,
+		MINT_SIGNING_ENABLED: 'true',
+	})
+	createMockUserQuotaNamespace(UserQuotaDO, env)
+}
+
+/** A real smol-fe carrier (self-mint by WALLET; harness tracks are created by WALLET). */
+function feCarrier(kind: 'coin_it' | 'coin_them', ids: string[], identity: FeIdentity = MAINNET_MINT_IDENTITY) {
+	const options = {
+		identity, user: WALLET, passkey: createPasskey('chain-and-cache'), expiration: LEDGER + 1_000, nonces: [1n, 2n] as [bigint, bigint],
+	}
+	return kind === 'coin_it'
+		? buildFeCoinItCarrier({ ...options, track: { id: ids[0], creator: WALLET } })
+		: buildFeCoinThemCarrier({ ...options, tracks: ids.map((id) => ({ id, creator: WALLET })) })
 }
 
 function entry(key: xdr.LedgerKey, value: xdr.ScVal, archived = false): LedgerPage['entries'][number] {
@@ -304,13 +328,12 @@ test('mint status routes before /:id, scopes batches to the submitter and polls 
 
 test('mint status separates legacy replay, missing creation, and confirmed persistence errors', async () => {
 	const { env, db, send, track } = harness()
+	enableMinting(env)
 	track(TRACK)
 	track(SECOND)
 	const txHash = 'b'.repeat(64)
-	const source = Keypair.fromRawEd25519Seed(Buffer.alloc(32, 10)).publicKey()
-	const signedXdr = new TransactionBuilder(new Account(source, '1'),
-		{ fee: '100', networkPassphrase: Networks.PUBLIC })
-		.addOperation(Operation.bumpSequence({ bumpTo: '4' })).setTimeout(30).build().toXDR()
+	const batchXdr = await feCarrier('coin_them', [TRACK])
+	const singleXdr = await feCarrier('coin_it', [SECOND])
 	let lastId = ''
 	let create: (id: string) => void = () => { throw new Error('instance.already_exists') }
 	let lookup: () => InstanceStatus = () => ({ status: 'errored' })
@@ -328,7 +351,7 @@ test('mint status separates legacy replay, missing creation, and confirmed persi
 		return (await response.json() as any).batches[0]
 	}
 
-	const replay = await send('/mint', { ids: [TRACK], xdr: signedXdr }, WALLET)
+	const replay = await send('/mint', { ids: [TRACK], xdr: batchXdr }, WALLET)
 	assert.equal(replay.status, 202)
 	const { workflowId: legacyId } = await replay.json() as { workflowId: string }
 	assert.equal((await poll(legacyId)).phase, 'uncertain')
@@ -336,7 +359,7 @@ test('mint status separates legacy replay, missing creation, and confirmed persi
 	assert.equal((await poll(legacyId)).phase, 'uncertain', 'A known legacy workflow may have already submitted')
 
 	create = () => { throw new Error('Duplicate upstream proxy header') }
-	const single = () => send(`/mint/${SECOND}`, { xdr: signedXdr }, WALLET)
+	const single = () => send(`/mint/${SECOND}`, { xdr: singleXdr }, WALLET)
 	assert.equal((await single()).status, 503)
 	const newId = lastId
 	lookup = () => { throw new Error('HTTP 404 Not Found') }
@@ -373,32 +396,19 @@ test('a mainnet mint signs with a gateway tip, confirms the relay hash and purge
 		'indexed-mixtape', 'Mix', '', `${TRACK},${SECOND}`, WALLET,
 	)
 	db.prepare('INSERT INTO Playlists (Id, Title) VALUES (?, ?)').run(TRACK, 'arcade')
-	const signingKey = Keypair.fromRawEd25519Seed(Buffer.alloc(32, 8))
+	const signingKey = testIssuerKeypair()
 	const contract = 'CBRNUVLGFM5OYWAGZVGU7CTMP2UJLKZCLFY2ANUCK5UGKND6BBAA5PLA'
+	enableMinting(env)
 	env.SK = signingKey.secret()
-	env.SMOL_CONTRACT_ID = contract
-	env.NETWORK_PASSPHRASE = Networks.PUBLIC
 	env.RPC_URL = 'https://unused.invalid'
-	const invocation = new xdr.InvokeContractArgs({
-		contractAddress: new Address(contract).toScAddress(),
-		functionName: 'coin_it',
-		args: [],
-	})
-	const auth = new xdr.SorobanAuthorizationEntry({
-		credentials: xdr.SorobanCredentials.sorobanCredentialsAddress(new xdr.SorobanAddressCredentials({
-			address: new Address(signingKey.publicKey()).toScAddress(),
-			nonce: xdr.Int64.fromString('1'), signatureExpirationLedger: 0, signature: xdr.ScVal.scvVoid(),
-		})),
-		rootInvocation: new xdr.SorobanAuthorizedInvocation({
-			function: xdr.SorobanAuthorizedFunction.sorobanAuthorizedFunctionTypeContractFn(invocation),
-			subInvocations: [],
-		}),
-	})
-	const inputXdr = new TransactionBuilder(new Account(
-		Keypair.fromRawEd25519Seed(Buffer.alloc(32, 9)).publicKey(), '1',
-	), { fee: '100', networkPassphrase: Networks.PUBLIC })
-		.addOperation(Operation.invokeContractFunction({ contract, function: 'coin_it', args: [], auth: [auth] }))
-		.setTimeout(30).build().toXDR()
+	const inputXdr = await feCarrier('coin_it', [TRACK])
+	// Admission is pinned to mainnet; signing runs the same code under a throwaway issuer identity.
+	const testXdr = await feCarrier('coin_it', [TRACK], testIdentity())
+	const TestIdentityWorkflow = class extends TxWorkflow {
+		protected mintIdentity() {
+			return testIdentity()
+		}
+	}
 
 	const requests: string[] = []
 	const txHash = 'e'.repeat(64)
@@ -411,7 +421,10 @@ test('a mainnet mint signs with a gateway tip, confirms the relay hash and purge
 		submitTransaction: async ({ xdr: signed }) => {
 			requests.push('submit')
 			const op = xdr.TransactionEnvelope.fromXDR(signed, 'base64').v1().tx().operations()[0]
-			const credentials = op.body().invokeHostFunctionOp().auth()[0].credentials().address()
+			const admin = op.body().invokeHostFunctionOp().auth()
+				.find((entry) => entry.credentials().address().address().switch().name === 'scAddressTypeAccount')!
+			const credentials = admin.credentials().address()
+			assert.equal(Address.fromScAddress(credentials.address()).toString(), signingKey.publicKey())
 			assert.equal(credentials.signatureExpirationLedger(), LEDGER + 100)
 			return { hash: txHash }
 		},
@@ -438,8 +451,10 @@ test('a mainnet mint signs with a gateway tip, confirms the relay hash and purge
 			return { id }
 		} } as Env['TX_WORKFLOW']
 		assert.equal((await send(`/mint/${TRACK}`, { xdr: inputXdr }, WALLET)).status, 202)
-		const [instanceId, payload] = [...created.entries()][0]
-		const wf = new TxWorkflow({} as ExecutionContext, env)
+		const [instanceId, admitted] = [...created.entries()][0]
+		assert.equal(admitted.xdr, inputXdr)
+		const payload = { ...admitted, xdr: testXdr }
+		const wf = new TestIdentityWorkflow({} as ExecutionContext, env)
 		const epoch = db.prepare('SELECT Epoch FROM MixtapeState').get()!.Epoch as number
 		await wf.run({ instanceId, payload, timestamp: new Date() }, createWorkflowStep(new Map()).step as never)
 		assert.deepEqual(requests, ['tip', 'submit', 'receipt'])
@@ -452,9 +467,20 @@ test('a mainnet mint signs with a gateway tip, confirms the relay hash and purge
 		}])
 
 		tags.clear()
+		// The signer refuses a payload whose id differs from the carrier's salt...
 		await assert.rejects(
 			wf.run({ instanceId: 'wrong-track', payload: { ...payload, entropy: SECOND, trackStatus: false }, timestamp: new Date() },
 				createWorkflowStep(new Map()).step as never),
+			/ids_mismatch/,
+		)
+		// ...and persistence still refuses a receipt that is not the canonical pair for the id.
+		await assert.rejects(
+			wf.run({ instanceId: 'wrong-track', payload: { ...payload, entropy: SECOND, trackStatus: false }, timestamp: new Date() },
+				createWorkflowStep(new Map<string, unknown>([
+					['sign transaction#1', 'signed-elsewhere'],
+					['submit transaction#1', { hash: txHash }],
+					['confirm transaction#1', { returnValue: nativeToScVal([PAIR.sac, PAIR.pool]).toXDR('base64'), ledger: LEDGER }],
+				])).step as never),
 			/canonical token and pool/,
 		)
 		assert.equal(db.prepare('SELECT Mint_Token FROM Smols WHERE Id = ?').get(SECOND)?.Mint_Token, null)

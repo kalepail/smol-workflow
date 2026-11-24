@@ -1,4 +1,5 @@
 import { DurableObject } from 'cloudflare:workers'
+import { MINT_ADMISSION_LEASE_MS } from './utils/mint-eligibility'
 
 export type QuotaProvider = MusicProvider
 
@@ -172,6 +173,142 @@ export type PlayBeaconAdmitResult =
 	| { admitted: true }
 	| { admitted: false; deduped: true; rateLimited?: false }
 	| { admitted: false; deduped?: false; rateLimited: true; retryAfter: number }
+
+/**
+ * Lifecycle of one 12-hex asset-code prefix reservation (`mint_prefix_locks.status`).
+ *
+ * - `reserved`: provisional admission claim, tagged with the acquiring admission's `claim_token` and a
+ *   creation lease (`lease_until_ms`). The owning workflow has not signed. Only this state may be
+ *   released, only by its exact `claim_token`, and by another admission only after the lease expires.
+ *   An identical-carrier admission that joins the claim records `joined_at_ms` and renews the lease:
+ *   from then on the acquiring admission can no longer release it (the joiner may already have queued
+ *   the workflow), and only lease-expiry recovery after verifying the workflow absent or terminal can.
+ *   Every grant or renewal of the lease bumps `lease_version`; recovery releases only the exact lease
+ *   (deadline and generation) it observed before checking the workflow.
+ * - `signing`: the owning workflow claimed it immediately before issuer signing. Nothing has been
+ *   relayed yet. Never released.
+ * - `dispatched`: the owning workflow durably marked it inside the submit step, immediately BEFORE
+ *   calling the relay. From here on the transaction may be on its way to the network.
+ * - `ambiguous`: a dispatch may have happened and its outcome is unresolved (a replayed submit step,
+ *   a full restart that re-entered signing, or a lost relay response). Requires reconciliation.
+ * - `failed`: the owning workflow reached a definite non-landing outcome (refused after claiming for
+ *   signing but before dispatch, or an on-chain FAILED receipt for its own dispatch). Another
+ *   workflow for the SAME smol id may take it over.
+ * - `minted`: the owning workflow confirmed the mint on chain. Terminal.
+ *
+ * `reserved`, `signing`, `dispatched` and `ambiguous` are unresolved: no other workflow may claim the
+ * prefix or the smol id. `dispatched` and `ambiguous` are never released, never taken over, never
+ * re-signed (even by their owner) and never demoted by a pre-dispatch failure: only an on-chain
+ * receipt (`minted`, or FAILED from `dispatched`) or an operator resolves them.
+ * `signed_at_ms` is sticky: once any workflow has claimed a prefix for signing, the row (and so the
+ * prefix -> smol id binding) is never deleted. A never-signed provisional row is deleted, never
+ * marked `failed`, so it can never block a different smol sharing the prefix.
+ */
+export type MintPrefixLockStatus = 'reserved' | 'signing' | 'dispatched' | 'ambiguous' | 'failed' | 'minted'
+
+/** A dispatch may have started: retained through every replay, restart and pre-dispatch failure. */
+const DISPATCH_STARTED: ReadonlySet<string> = new Set(['dispatched', 'ambiguous'])
+
+/** `admission` (HTTP route) writes provisional claims; `signing` (TxWorkflow) is the authoritative claim. */
+export type MintPrefixClaimStage = 'admission' | 'signing'
+
+export interface MintPrefixConflict {
+	prefix: string
+	id: string
+	/** The smol id the prefix is bound to. */
+	heldBy: string
+	/** The workflow that owns the reservation. */
+	workflowId: string
+	status: MintPrefixLockStatus
+	/** The acquiring admission's token (provisional claims only). */
+	claimToken: string | null
+	/** Creation lease expiry of a provisional claim (ms since epoch), else null. */
+	leaseUntilMs: number | null
+	/**
+	 * Generation of a provisional claim's creation lease (bumped by every acquisition, takeover and
+	 * join), else null. Expiry recovery must present it unchanged, with `leaseUntilMs`, to release.
+	 */
+	leaseVersion: number | null
+	/** When the holder was first claimed for signing, else null (never signed: deletable on release). */
+	signedAtMs: number | null
+	/**
+	 * `prefix_reserved`: another smol id. `mint_in_progress`: same smol id, other workflow, unresolved.
+	 * `minted`: terminal. `dispatch_uncertain`: this workflow's own dispatch may have started, so it
+	 * may never sign (or be admitted) again until reconciled.
+	 */
+	reason: 'prefix_reserved' | 'mint_in_progress' | 'minted' | 'dispatch_uncertain'
+}
+
+export type MintPrefixReserveResult = { ok: true } | { ok: false; conflicts: MintPrefixConflict[] }
+
+/**
+ * Result of `markMintDispatched`. `uncertain`: this workflow's dispatch already started (a replay);
+ * the rows are now `ambiguous`. `not_owned`: this workflow does not hold every prefix in `signing`
+ * (nothing changed, nothing may be relayed).
+ */
+export type MintDispatchMarkResult = { ok: true } | { ok: false; state: 'uncertain' | 'not_owned' }
+
+/**
+ * Read-only view of this workflow's current signed attempt (see `UserQuotaDO.mintAttemptState`).
+ * `undispatched`: every prefix is held in `signing` (signed, never dispatched; the only state the
+ * dispatch marker accepts). `dispatch_started`: an owned row is `dispatched`/`ambiguous`. `other`: no
+ * v7 claim at all, only an admission reservation, another owner, or an already concluded attempt.
+ */
+export type MintAttemptState = 'undispatched' | 'dispatch_started' | 'other'
+
+/**
+ * `failed`: a definite pre-dispatch refusal. `failed_onchain`: a FAILED receipt for this workflow's
+ * own dispatch. `ambiguous`: the relay outcome is unknown. `minted`: confirmed on chain.
+ */
+export type MintPrefixOutcome = 'failed' | 'failed_onchain' | 'ambiguous' | 'minted'
+
+/**
+ * What the lock store concluded for the owner's rows. `failed`: definite (nothing was dispatched). For a
+ * pre-dispatch refusal it is returned only when an owned `signing` claim became `failed`, which proves
+ * THIS workflow's signed attempt never dispatched. `released`: a pre-dispatch refusal that found no
+ * `signing` claim (a never-signed `reserved` claim was deleted, a once-signed one became `failed`, or
+ * the rows were already `failed`). It proves nothing about an earlier dispatch: a post-upgrade duplicate
+ * admission can create a fresh reservation for a pre-v7 execution that already wrote `submitting` and
+ * relayed. `uncertain`: a dispatch may have started; the rows are retained as `ambiguous`. `minted`:
+ * already settled. `none`: this workflow owns none of the rows (it never dispatched under them).
+ */
+export type MintPrefixResolution = { resolved: number; state: 'failed' | 'released' | 'uncertain' | 'minted' | 'none' }
+
+interface MintPrefixLockRow extends Record<string, SqlStorageValue> {
+	prefix: string
+	smol_id: string
+	workflow_id: string
+	status: MintPrefixLockStatus
+	claim_token: string | null
+	lease_until_ms: number | null
+	lease_version: number
+	signed_at_ms: number | null
+	dispatched_at_ms: number | null
+	joined_at_ms: number | null
+}
+
+const MINT_LOCK_COLUMNS =
+	'prefix, smol_id, workflow_id, status, claim_token, lease_until_ms, lease_version, signed_at_ms, dispatched_at_ms, joined_at_ms'
+const MINT_CLAIM_TOKEN = /^[0-9A-Za-z_-]{16,64}$/
+
+const MINT_LOCK_ID = /^[0-9a-f]{64}$/
+
+function mintLockPrefixes(workflowId: unknown, rawIds: unknown): Map<string, string> {
+	if (typeof workflowId !== 'string' || !workflowId || !Array.isArray(rawIds)) {
+		throw new Error('Invalid mint prefix reservation')
+	}
+	const ids = [...new Set(rawIds)]
+	if (ids.length === 0 || ids.some((id) => typeof id !== 'string' || !MINT_LOCK_ID.test(id))) {
+		throw new Error('Invalid mint prefix reservation')
+	}
+	const prefixes = new Map<string, string>()
+	for (const id of ids as string[]) {
+		const prefix = id.slice(0, 12)
+		if (prefixes.has(prefix)) throw new Error('Invalid mint prefix reservation')
+		prefixes.set(prefix, id)
+	}
+	return prefixes
+}
 
 interface ReservationRow extends Record<string, SqlStorageValue> {
 	reservation_id: string
@@ -475,6 +612,45 @@ export class UserQuotaDO extends DurableObject<Env> {
 				this.sql.exec(`INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (6)`)
 			})
 			version = 6
+		}
+
+		if (version < 7) {
+			this.ctx.storage.transactionSync(() => {
+				// Mint asset-code prefix locks. Only the singleton `mint-prefix-locks` object writes rows;
+				// every other quota object just carries the empty table.
+				// One row per prefix; the prefix is the smol id's first 12 hex, so one row per smol id too.
+				// No deployed object has ever run v7 (WF-0 ships it), so its definition is final here. The
+				// CHECKs pin the lifecycle invariants: a provisional row carries its admission token; any
+				// row past `reserved` was claimed for signing; a dispatched or ambiguous row records when
+				// dispatch started; `failed` is only ever a once-signed row (a never-signed provisional
+				// row is deleted instead, so it can never block another smol sharing the prefix); and only
+				// a provisional row records that an identical-carrier admission joined it. `lease_version` is
+				// a per-row generation bumped whenever a creation lease is granted or renewed, so lease-expiry
+				// recovery can only release the exact lease it observed.
+				this.sql.exec(`
+					CREATE TABLE IF NOT EXISTS mint_prefix_locks (
+						prefix TEXT PRIMARY KEY CHECK(length(prefix) = 12),
+						smol_id TEXT NOT NULL UNIQUE CHECK(length(smol_id) = 64 AND substr(smol_id, 1, 12) = prefix),
+						workflow_id TEXT NOT NULL CHECK(length(workflow_id) > 0),
+						status TEXT NOT NULL
+							CHECK(status IN ('reserved', 'signing', 'dispatched', 'ambiguous', 'failed', 'minted')),
+						claim_token TEXT,
+						lease_until_ms INTEGER,
+						lease_version INTEGER NOT NULL DEFAULT 0 CHECK(lease_version >= 0),
+						reserved_at_ms INTEGER NOT NULL,
+						signed_at_ms INTEGER,
+						dispatched_at_ms INTEGER,
+						joined_at_ms INTEGER,
+						updated_at_ms INTEGER NOT NULL,
+						CHECK(status <> 'reserved' OR claim_token IS NOT NULL),
+						CHECK(status = 'reserved' OR joined_at_ms IS NULL),
+						CHECK(status = 'reserved' OR signed_at_ms IS NOT NULL),
+						CHECK(status NOT IN ('dispatched', 'ambiguous') OR dispatched_at_ms IS NOT NULL)
+					)
+				`)
+				this.sql.exec(`INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (7)`)
+			})
+			version = 7
 		}
 	}
 
@@ -2047,6 +2223,368 @@ export class UserQuotaDO extends DurableObject<Env> {
 		}
 
 		return result
+	}
+
+	/** All rows for these prefixes, in prefix order of the request. */
+	private mintLockRows(prefixes: Map<string, string>): Array<{ prefix: string; id: string; held?: MintPrefixLockRow }> {
+		return [...prefixes].map(([prefix, id]) => ({
+			prefix,
+			id,
+			held: this.sql
+				.exec<MintPrefixLockRow>(`SELECT ${MINT_LOCK_COLUMNS} FROM mint_prefix_locks WHERE prefix = ?`, prefix)
+				.toArray()[0],
+		}))
+	}
+
+	/**
+	 * Retain every row this workflow owns for these prefixes as `ambiguous` (never `failed`, never
+	 * released). Used whenever a dispatch may already have started. Returns how many rows changed,
+	 * counted from the rows read in the same transaction.
+	 */
+	private retainMintLocksAsAmbiguous(workflowId: string, prefixes: Map<string, string>, nowMs: number): number {
+		const owned = this.mintLockRows(prefixes).filter(({ id, held }) => held?.smol_id === id && held.workflow_id === workflowId)
+		let retained = 0
+		for (const { prefix, id, held } of owned) {
+			if (held!.status === 'minted' || held!.status === 'ambiguous') continue
+			this.sql.exec(
+				`UPDATE mint_prefix_locks SET status = 'ambiguous', signed_at_ms = coalesce(signed_at_ms, ?),
+				   dispatched_at_ms = coalesce(dispatched_at_ms, ?), claim_token = NULL, lease_until_ms = NULL, joined_at_ms = NULL,
+				   updated_at_ms = ?
+				 WHERE prefix = ? AND smol_id = ? AND workflow_id = ? AND status NOT IN ('minted', 'ambiguous')`,
+				nowMs, nowMs, nowMs, prefix, id, workflowId
+			)
+			retained += 1
+		}
+		return retained
+	}
+
+	/**
+	 * Atomically claim each smol id's 12-hex asset-code prefix (`substr(Id, 1, 12)`) for one workflow.
+	 *
+	 * The factory reuses an existing SAC for a repeated asset code and mints another 10M to the
+	 * caller, so two different ids sharing a prefix must never both receive an issuer signature. The
+	 * prefix -> smol id binding is permanent once anything could have been signed. On top of that, only
+	 * one workflow may own a smol id while its outcome is unresolved, so two carriers for the same
+	 * song can never both be signed and relayed before D1 records settlement:
+	 *
+	 * - free prefix: inserted for this workflow (`reserved` with the admission's `claimToken` and a
+	 *   creation lease at admission, `signing` at signing).
+	 * - another smol id holds it: `prefix_reserved`, always.
+	 * - same smol id, same workflow: identical-carrier admissions join the owner's claim (they never
+	 *   acquire it, so their token cannot release it). Joining a provisional claim records
+	 *   `joined_at_ms` and renews its creation lease, so neither the acquiring admission's cleanup nor
+	 *   a competing admission's recovery can drop a claim whose workflow the joiner may be queueing.
+	 *   The signing stage moves `reserved`
+	 *   or `failed` to `signing`. Once dispatch may have started (`dispatched`, `ambiguous`) the owner
+	 *   may never sign again (`dispatch_uncertain`; a `dispatched` row becomes `ambiguous`), and a new
+	 *   admission is refused for an `ambiguous` row.
+	 * - same smol id, other workflow: `failed` may be taken over; `minted` is terminal; every other
+	 *   status is unresolved and refused (`mint_in_progress`). The workflow id is never overwritten.
+	 *
+	 * All-or-nothing inside one SQLite transaction on a single object, so it is linearizable across
+	 * concurrent requests and isolates. No D1 migration is required.
+	 */
+	async reserveMintPrefixes(params: {
+		workflowId: string
+		ids: string[]
+		stage: MintPrefixClaimStage
+		/** Required at admission: identifies the acquiring admission for its own cleanup. */
+		claimToken?: string
+		nowMs?: number
+	}): Promise<MintPrefixReserveResult> {
+		const nowMs = params.nowMs ?? Date.now()
+		const { workflowId, stage } = params
+		if (stage !== 'admission' && stage !== 'signing') throw new Error('Invalid mint prefix reservation')
+		const claimToken = stage === 'admission' ? params.claimToken : null
+		if (stage === 'admission' && (typeof claimToken !== 'string' || !MINT_CLAIM_TOKEN.test(claimToken))) {
+			throw new Error('Invalid mint prefix reservation')
+		}
+		const prefixes = mintLockPrefixes(workflowId, params.ids)
+
+		return this.ctx.storage.transactionSync((): MintPrefixReserveResult => {
+			const conflicts: MintPrefixConflict[] = []
+			const writes: Array<{ prefix: string; id: string; held?: MintPrefixLockRow }> = []
+			for (const { prefix, id, held } of this.mintLockRows(prefixes)) {
+				if (!held) {
+					writes.push({ prefix, id })
+					continue
+				}
+				const conflict = (reason: MintPrefixConflict['reason']) => conflicts.push({
+					prefix, id, heldBy: held.smol_id, workflowId: held.workflow_id, status: held.status,
+					claimToken: held.claim_token, leaseUntilMs: held.lease_until_ms,
+					leaseVersion: held.status === 'reserved' ? held.lease_version : null, signedAtMs: held.signed_at_ms, reason,
+				})
+				if (held.smol_id !== id) conflict('prefix_reserved')
+				else if (held.status === 'minted') conflict('minted')
+				else if (held.workflow_id === workflowId) {
+					if (held.status === 'reserved' || held.status === 'signing' || held.status === 'failed') writes.push({ prefix, id, held })
+					else if (held.status === 'dispatched' && stage === 'admission') writes.push({ prefix, id, held })
+					else if (DISPATCH_STARTED.has(held.status)) conflict('dispatch_uncertain')
+					else conflict('mint_in_progress')
+				} else if (held.status === 'failed') writes.push({ prefix, id, held })
+				else conflict('mint_in_progress')
+			}
+			if (conflicts.length) {
+				// The owner's own dispatch may have started: it is retained as ambiguous, durably, by the
+				// same transaction that refuses the re-sign.
+				if (stage === 'signing' && conflicts.some(({ reason }) => reason === 'dispatch_uncertain')) {
+					this.retainMintLocksAsAmbiguous(workflowId, prefixes, nowMs)
+				}
+				return { ok: false, conflicts }
+			}
+			const claimed: MintPrefixLockStatus = stage === 'signing' ? 'signing' : 'reserved'
+			const signedAt = stage === 'signing' ? nowMs : null
+			const leaseUntil = stage === 'admission' ? nowMs + MINT_ADMISSION_LEASE_MS : null
+			const leaseVersion = stage === 'admission' ? 1 : 0
+			for (const { prefix, id, held } of writes) {
+				if (!held) {
+					this.sql.exec(
+						`INSERT INTO mint_prefix_locks (prefix, smol_id, workflow_id, status, claim_token, lease_until_ms, lease_version,
+						   reserved_at_ms, signed_at_ms, dispatched_at_ms, joined_at_ms, updated_at_ms)
+						 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)`,
+						prefix, id, workflowId, claimed, claimToken, leaseUntil, leaseVersion, nowMs, signedAt, nowMs
+					)
+				} else if (held.workflow_id !== workflowId) {
+					// Takeover of a definitely failed reservation for the same smol id.
+					this.sql.exec(
+						`UPDATE mint_prefix_locks SET workflow_id = ?, status = ?, claim_token = ?, lease_until_ms = ?,
+						   lease_version = lease_version + 1, reserved_at_ms = ?, signed_at_ms = coalesce(signed_at_ms, ?), dispatched_at_ms = NULL, joined_at_ms = NULL,
+						   updated_at_ms = ?
+						 WHERE prefix = ? AND smol_id = ? AND workflow_id = ? AND status = 'failed'`,
+						workflowId, claimed, claimToken, leaseUntil, nowMs, signedAt, nowMs, prefix, id, held.workflow_id
+					)
+				} else if (stage === 'signing' && held.status !== 'signing') {
+					// The owner's signing claim, from `reserved` or (after a definite failure) `failed`.
+					this.sql.exec(
+						`UPDATE mint_prefix_locks SET status = 'signing', signed_at_ms = coalesce(signed_at_ms, ?),
+						   claim_token = NULL, lease_until_ms = NULL, dispatched_at_ms = NULL, joined_at_ms = NULL, updated_at_ms = ?
+						 WHERE prefix = ? AND smol_id = ? AND workflow_id = ? AND status IN ('reserved', 'failed')`,
+						nowMs, nowMs, prefix, id, workflowId
+					)
+				} else if (stage === 'admission' && held.status === 'reserved' && held.claim_token !== claimToken) {
+					// An identical-carrier admission joins the provisional claim. It may queue the workflow
+					// itself, so the acquirer may no longer release it, and the creation lease is renewed
+					// so lease-expiry recovery cannot reclaim it while the joiner is still creating. The lease
+					// generation is bumped too: a recovery that observed the earlier lease (and checked the
+					// owner's workflow status before this join) can never release it, even after the renewed
+					// lease has also run out; it must observe the new lease and the workflow afresh.
+					this.sql.exec(
+						`UPDATE mint_prefix_locks SET joined_at_ms = coalesce(joined_at_ms, ?),
+						   lease_until_ms = max(coalesce(lease_until_ms, 0), ?), lease_version = lease_version + 1, updated_at_ms = ?
+						 WHERE prefix = ? AND smol_id = ? AND workflow_id = ? AND status = 'reserved'`,
+						nowMs, leaseUntil, nowMs, prefix, id, workflowId
+					)
+				}
+			}
+			return { ok: true }
+		})
+	}
+
+	/**
+	 * Drop the provisional (`reserved`) claims that ONE admission acquired, identified by its exact
+	 * `claimToken`. Call ONLY on a definite pre-sign failure: that admission proved its workflow absent
+	 * and no identical-carrier admission ever joined the claim (a joiner may have queued it), or
+	 * (`expiredLeaseOnly`) a competing admission found the owner absent or terminal before signing
+	 * after the creation lease ran out. A row in any other status, owned by another workflow, carrying
+	 * another token, joined (without `expiredLeaseOnly`), or (with `expiredLeaseOnly`) still inside its
+	 * creation lease is never touched.
+	 *
+	 * Expiry recovery (`expiredLeaseOnly`) must also present, for every id, the lease it observed
+	 * (`observedLeases`: `leaseUntilMs` and `leaseVersion` exactly as the conflict reported them). Its
+	 * workflow-status check is only evidence about THAT lease: if a join renewed the lease since (a new
+	 * generation), the row is not released, even once the renewed lease has expired too, and the
+	 * caller must observe the new lease and the workflow status again before it may reclaim.
+	 *
+	 * A prefix that was never claimed for signing is deleted; one that ever was (an earlier, failed
+	 * workflow) goes back to `failed`, so its smol id binding survives. Safe even if the workflow does
+	 * exist after all: its signing-stage claim re-checks ownership atomically.
+	 */
+	async releaseMintPrefixes(params: {
+		workflowId: string
+		ids: string[]
+		claimToken: string
+		expiredLeaseOnly?: boolean
+		/** Required with `expiredLeaseOnly`: the lease observed for each id (see `MintPrefixConflict`). */
+		observedLeases?: Array<{ id: string; leaseUntilMs: number | null; leaseVersion: number }>
+		nowMs?: number
+	}): Promise<{ released: number }> {
+		const nowMs = params.nowMs ?? Date.now()
+		const prefixes = mintLockPrefixes(params.workflowId, params.ids)
+		if (typeof params.claimToken !== 'string' || !MINT_CLAIM_TOKEN.test(params.claimToken)) {
+			throw new Error('Invalid mint prefix release')
+		}
+		const expired = params.expiredLeaseOnly === true
+		const observed = new Map<string, { leaseUntilMs: number | null; leaseVersion: number }>()
+		if (expired) {
+			for (const lease of Array.isArray(params.observedLeases) ? params.observedLeases : []) {
+				const { id, leaseUntilMs, leaseVersion } = lease ?? {}
+				if (typeof id !== 'string' || observed.has(id)
+					|| !(leaseUntilMs === null || Number.isSafeInteger(leaseUntilMs))
+					|| !Number.isSafeInteger(leaseVersion) || leaseVersion < 0) {
+					throw new Error('Invalid mint prefix release')
+				}
+				observed.set(id, { leaseUntilMs, leaseVersion })
+			}
+			if ([...prefixes.values()].some((id) => !observed.has(id))) throw new Error('Invalid mint prefix release')
+		}
+		return this.ctx.storage.transactionSync(() => {
+			let released = 0
+			for (const [prefix, id] of prefixes) {
+				const base = `prefix = ? AND smol_id = ? AND workflow_id = ? AND status = 'reserved' AND claim_token = ?`
+				const where = expired
+					? `${base} AND (lease_until_ms IS NULL OR lease_until_ms <= ?) AND lease_until_ms IS ? AND lease_version = ?`
+					: `${base} AND joined_at_ms IS NULL`
+				const lease = observed.get(id)
+				const args: SqlStorageValue[] = [prefix, id, params.workflowId, params.claimToken]
+				if (expired) args.push(nowMs, lease!.leaseUntilMs, lease!.leaseVersion)
+				const held = this.sql
+					.exec<{ signed_at_ms: number | null }>(`SELECT signed_at_ms FROM mint_prefix_locks WHERE ${where}`, ...args)
+					.toArray()[0]
+				if (!held) continue
+				if (held.signed_at_ms === null) {
+					this.sql.exec(`DELETE FROM mint_prefix_locks WHERE ${where}`, ...args)
+				} else {
+					this.sql.exec(
+						`UPDATE mint_prefix_locks SET status = 'failed', claim_token = NULL, lease_until_ms = NULL, joined_at_ms = NULL,
+						   updated_at_ms = ?
+						 WHERE ${where}`,
+						nowMs, ...args
+					)
+				}
+				released += 1
+			}
+			return { released }
+		})
+	}
+
+	/**
+	 * The durable, owner-checked dispatch marker. The submit step calls this immediately BEFORE the
+	 * relay, and only after the kill switch and the versioned signing checkpoint have passed. It moves
+	 * every prefix from this workflow's `signing` claim to `dispatched`, all or nothing:
+	 *
+	 * - all owned and `signing`: marked `dispatched`; the caller may relay exactly once.
+	 * - any owned row already `dispatched`/`ambiguous`: this is a replay of a submit whose dispatch may
+	 *   have started. Every owned row is retained as `ambiguous`; the caller must not relay.
+	 * - anything else (missing, another owner, `reserved`, `failed`, `minted`): `not_owned`, unchanged.
+	 */
+	async markMintDispatched(params: { workflowId: string; ids: string[]; nowMs?: number }): Promise<MintDispatchMarkResult> {
+		const nowMs = params.nowMs ?? Date.now()
+		const prefixes = mintLockPrefixes(params.workflowId, params.ids)
+		return this.ctx.storage.transactionSync((): MintDispatchMarkResult => {
+			const rows = this.mintLockRows(prefixes)
+			const owned = rows.filter(({ id, held }) => held?.smol_id === id && held.workflow_id === params.workflowId)
+			if (owned.some(({ held }) => DISPATCH_STARTED.has(held!.status))) {
+				this.retainMintLocksAsAmbiguous(params.workflowId, prefixes, nowMs)
+				return { ok: false, state: 'uncertain' }
+			}
+			if (owned.length !== rows.length || owned.some(({ held }) => held!.status !== 'signing')) {
+				return { ok: false, state: 'not_owned' }
+			}
+			for (const { prefix, id } of owned) {
+				this.sql.exec(
+					`UPDATE mint_prefix_locks SET status = 'dispatched', dispatched_at_ms = ?, updated_at_ms = ?
+					 WHERE prefix = ? AND smol_id = ? AND workflow_id = ? AND status = 'signing'`,
+					nowMs, nowMs, prefix, id, params.workflowId
+				)
+			}
+			return { ok: true }
+		})
+	}
+
+	/**
+	 * Read-only: `undispatched` only when this workflow holds EVERY prefix in `signing`, i.e. it has
+	 * signed an attempt that has not been dispatched. `signing` is entered only by the signing claim made
+	 * right before a fresh signature and left by the dispatch marker (or a settlement). `dispatch_started`
+	 * when any owned row is `dispatched`/`ambiguous`. Anything else (`failed`, `minted`, a `reserved`
+	 * admission claim, missing rows, another owner) is `other`: no attempt this workflow can still
+	 * dispatch, and no dispatch the lock store knows of.
+	 */
+	async mintAttemptState(params: { workflowId: string; ids: string[] }): Promise<MintAttemptState> {
+		const rows = this.mintLockRows(mintLockPrefixes(params.workflowId, params.ids))
+		const owned = rows.filter(({ id, held }) => held?.smol_id === id && held.workflow_id === params.workflowId)
+		if (owned.some(({ held }) => DISPATCH_STARTED.has(held!.status))) return 'dispatch_started'
+		return owned.length === rows.length && owned.every(({ held }) => held!.status === 'signing') ? 'undispatched' : 'other'
+	}
+
+	/**
+	 * Record the owning workflow's outcome on its rows. Owner-guarded; `minted` is never downgraded,
+	 * and a row whose dispatch may have started is never demoted by a pre-dispatch failure.
+	 *
+	 * - `failed` (a definite refusal before dispatch): if any owned row is `dispatched`/`ambiguous`,
+	 *   every owned row is retained as `ambiguous` and the state is `uncertain`. Otherwise a never-signed
+	 *   `reserved` row is deleted (freeing the prefix for any smol), and a once-signed `reserved` or
+	 *   `signing` row becomes `failed` (same-smol takeover allowed, binding kept). The state is `failed`
+	 *   only if an owned `signing` claim became `failed` (this workflow's signed attempt never
+	 *   dispatched); otherwise it is `released`, which proves nothing about an earlier attempt.
+	 * - `failed_onchain` (a FAILED receipt for this workflow's own dispatch): `signing`/`dispatched` ->
+	 *   `failed`. An `ambiguous` row is left for reconciliation.
+	 * - `ambiguous` (the relay outcome is unknown): `dispatched` -> `ambiguous`.
+	 * - `minted` (confirmed on chain): every owned row -> `minted`.
+	 */
+	async resolveMintPrefixes(params: {
+		workflowId: string
+		ids: string[]
+		outcome: MintPrefixOutcome
+		nowMs?: number
+	}): Promise<MintPrefixResolution> {
+		const nowMs = params.nowMs ?? Date.now()
+		const { workflowId, outcome } = params
+		if (!['failed', 'failed_onchain', 'ambiguous', 'minted'].includes(outcome)) throw new Error('Invalid mint prefix outcome')
+		const prefixes = mintLockPrefixes(workflowId, params.ids)
+		return this.ctx.storage.transactionSync((): MintPrefixResolution => {
+			const owned = this.mintLockRows(prefixes).filter(({ id, held }) => held?.smol_id === id && held.workflow_id === workflowId)
+			if (!owned.length) return { resolved: 0, state: 'none' }
+			// Counted from the rows read in this transaction (single writer, so they are current).
+			const update = (status: MintPrefixLockStatus, from: (row: MintPrefixLockRow) => boolean) => {
+				let resolved = 0
+				for (const { prefix, id, held } of owned) {
+					if (!from(held!)) continue
+					this.sql.exec(
+						`UPDATE mint_prefix_locks SET status = ?, signed_at_ms = coalesce(signed_at_ms, ?), claim_token = NULL,
+						   lease_until_ms = NULL, joined_at_ms = NULL, updated_at_ms = ?
+						 WHERE prefix = ? AND smol_id = ? AND workflow_id = ? AND status = ?`,
+						status, nowMs, nowMs, prefix, id, workflowId, held!.status
+					)
+					resolved += 1
+				}
+				return resolved
+			}
+			const statuses = owned.map(({ held }) => held!.status)
+			if (outcome === 'minted') {
+				return { resolved: update('minted', ({ status }) => status !== 'minted'), state: 'minted' }
+			}
+			if (outcome === 'ambiguous') {
+				const resolved = update('ambiguous', ({ status }) => status === 'dispatched')
+				return { resolved, state: statuses.every((status) => status === 'minted') ? 'minted' : 'uncertain' }
+			}
+			if (outcome === 'failed_onchain') {
+				const resolved = update('failed', ({ status }) => status === 'signing' || status === 'dispatched')
+				const state = statuses.some((status) => status === 'ambiguous') ? 'uncertain'
+					: statuses.every((status) => status === 'minted') ? 'minted' : 'failed'
+				return { resolved, state }
+			}
+			// A definite pre-dispatch refusal, unless this workflow's dispatch may have started.
+			if (statuses.some((status) => DISPATCH_STARTED.has(status))) {
+				return { resolved: this.retainMintLocksAsAmbiguous(workflowId, prefixes, nowMs), state: 'uncertain' }
+			}
+			if (statuses.some((status) => status === 'minted')) return { resolved: 0, state: 'minted' }
+			// Only an owned `signing` claim ties this refusal to a signed, never-dispatched attempt. A
+			// `reserved` claim (even one re-reserved after an earlier signing) belongs to an admission.
+			const signedAttempt = statuses.some((status) => status === 'signing')
+			let resolved = 0
+			for (const { prefix, id, held } of owned) {
+				if (held!.status !== 'reserved' || held!.signed_at_ms !== null) continue
+				// Never signed, never dispatched: release it outright, so it never blocks another smol.
+				this.sql.exec(
+					`DELETE FROM mint_prefix_locks
+					 WHERE prefix = ? AND smol_id = ? AND workflow_id = ? AND status = 'reserved' AND signed_at_ms IS NULL`,
+					prefix, id, workflowId
+				)
+				resolved += 1
+			}
+			resolved += update('failed', ({ status, signed_at_ms }) => status === 'signing' || (status === 'reserved' && signed_at_ms !== null))
+			return { resolved, state: signedAttempt ? 'failed' : 'released' }
+		})
 	}
 
 	/**

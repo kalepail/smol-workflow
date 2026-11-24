@@ -30,6 +30,11 @@ declare namespace Cloudflare {
 		ADMIN_SECRET?: string
 		ALLOW_LOCALHOST_ORIGINS?: string
 		SK: string
+		/**
+		 * Mint kill switch, closed by default. Anything other than exactly 'true' makes POST /mint and
+		 * POST /mint/:id answer 503 mint_paused and makes TxWorkflow refuse to sign or relay.
+		 */
+		MINT_SIGNING_ENABLED?: string
 		PIXELLAB_KEY: string
 		CF_API_TOKEN: string
 		CF_ZONE_ID: string

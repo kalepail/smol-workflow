@@ -2532,7 +2532,8 @@ test('Pass-3 regression 3 (P2): internal SQLite schema upgrades cleanly from per
 	const migratedDo = new appModule.UserQuotaDO(ctx, {} as Env)
 
 	const versionRow = db.prepare(`SELECT MAX(id) AS v FROM _sql_schema_migrations`).get() as { v: number }
-	assert.equal(versionRow.v, 6, 'Internal schema version must advance from 2 to 6')
+	assert.equal(versionRow.v, 7, 'Internal schema version must advance from 2 to 7')
+	assert.ok(db.prepare(`SELECT name FROM sqlite_master WHERE name = 'mint_prefix_locks'`).get(), 'v7 adds the mint prefix lock table')
 
 	const committedRow = await migratedDo.getReservation('legacy-v2-committed')
 	assert.equal(committedRow?.status, 'committed')

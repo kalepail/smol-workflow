@@ -73,3 +73,44 @@ export async function readBoundedStream(
 	}
 	return combined;
 }
+
+export type BoundedJsonResult =
+	| { ok: true; value: Record<string, unknown> }
+	| { ok: false; reason: 'too_large' | 'invalid_json' };
+
+/**
+ * Reads a request body as a JSON object without ever buffering more than `maxBytes`:
+ * a declared Content-Length over the cap is refused before reading, and the stream is cut off
+ * as soon as it passes the cap. Malformed, empty, non-UTF-8 or non-object bodies are `invalid_json`.
+ */
+export async function readBoundedJsonObject(request: Request, maxBytes: number): Promise<BoundedJsonResult> {
+	const header = request.headers.get('content-length');
+	let declaredLength: number | null = null;
+	if (header !== null) {
+		if (!/^[0-9]{1,15}$/.test(header.trim())) return { ok: false, reason: 'invalid_json' };
+		declaredLength = Number(header.trim());
+		if (declaredLength > maxBytes) {
+			await request.body?.cancel('Body exceeds maximum allowed size').catch(() => {});
+			return { ok: false, reason: 'too_large' };
+		}
+	}
+
+	let bytes: Uint8Array;
+	try {
+		bytes = await readBoundedStream(request.body, maxBytes, declaredLength);
+	} catch (error) {
+		if (error instanceof BoundedReadError) {
+			return { ok: false, reason: error.reason === 'too_large' ? 'too_large' : 'invalid_json' };
+		}
+		return { ok: false, reason: 'invalid_json' };
+	}
+
+	let value: unknown;
+	try {
+		value = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(bytes));
+	} catch {
+		return { ok: false, reason: 'invalid_json' };
+	}
+	if (!value || typeof value !== 'object' || Array.isArray(value)) return { ok: false, reason: 'invalid_json' };
+	return { ok: true, value: value as Record<string, unknown> };
+}

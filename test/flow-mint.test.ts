@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import test, { after, before } from 'node:test'
-import { nativeToScVal, xdr } from '@stellar/stellar-sdk/minimal'
+import { nativeToScVal, Networks, xdr } from '@stellar/stellar-sdk/minimal'
 import { deriveMintPair } from '../src/utils/chain'
+import { reserveMintPrefixes } from '../src/utils/mint-eligibility'
 import {
 	createAuthToken,
 	createMockExecutionContext,
+	createMockUserQuotaNamespace,
 	createWorkflowStep,
 	installCloudflareStubs,
 	type CloudflareStubHandle,
@@ -75,6 +79,29 @@ function buildReturnValueMetaB64(nativeVal: unknown): string {
 	return meta.toXDR('base64')
 }
 
+/**
+ * Replaces the issuer signer with a stub that behaves like production at its boundary: it takes the
+ * authoritative `signing` claim first (the submit step's durable dispatch marker requires it), then
+ * returns the stub output. The lock store is reset so independent sub-cases never share claims.
+ */
+function stubClaimingSigner(
+	wf: InstanceType<typeof import('../src/tx-workflow').TxWorkflow>,
+	env: Env,
+	output: (event: { payload: WorkflowTxParams }) => string,
+) {
+	resetMintLocks(env)
+	wf.signTransaction = async (event) => {
+		const ids = event.payload.type === 'mint' ? [event.payload.entropy!] : event.payload.mintableIds ?? event.payload.ids ?? []
+		await reserveMintPrefixes(env, event.instanceId, ids, 'signing')
+		return output(event)
+	}
+}
+
+function resetMintLocks(env: Env) {
+	delete (env as unknown as { USER_QUOTA?: unknown }).USER_QUOTA
+	createMockUserQuotaNamespace(appModule.UserQuotaDO, env)
+}
+
 function createMintEnv(initialRows: Record<string, { Address: string; Mint_Token: string | null; Mint_Amm: string | null }>) {
 	const rows = new Map(Object.entries(initialRows).map(([k, v]) => [k, { Id: k, Title: `Smol ${k}`, ...v }]))
 	let batchCalls = 0
@@ -140,6 +167,7 @@ function createMintEnv(initialRows: Record<string, { Address: string; Mint_Token
 		SECRET: TEST_SECRET,
 		RPC_URL: 'https://rpc.test.local/',
 		NETWORK_PASSPHRASE: 'Test SDF Network ; September 2015',
+		MINT_SIGNING_ENABLED: 'true',
 		SMOL_CONTRACT_ID: 'CBRNUVLGFM5OYWAGZVGU7CTMP2UJLKZCLFY2ANUCK5UGKND6BBAA5PLA',
 		SK: 'SB7ZMPZB3Y23V4M7D6R5W3Q4A2V4X5J7H7Y5A2K6R3M5W7Q4P2Z5X6A7',
 		SMOL_D1: d1,
@@ -216,7 +244,7 @@ test('Gate 3a: TxWorkflow splits submit vs confirm so confirmation retry never d
 
 	try {
 		const wf = new txWorkflowModule.TxWorkflow({} as ExecutionContext, harness.env)
-		wf.signTransaction = async (x) => `signed:${x}`
+		stubClaimingSigner(wf, harness.env, (event) => `signed:${event.payload.xdr}`)
 
 		const cache = new Map<string, unknown>()
 		const event = {
@@ -342,7 +370,7 @@ test('Gate 3b: batch mint maps reversed contract push_front tuples to signed coi
 
 	try {
 		const wf = new txWorkflowModule.TxWorkflow({} as ExecutionContext, harness.env)
-		wf.signTransaction = async (x) => x
+		stubClaimingSigner(wf, harness.env, (event) => event.payload.xdr)
 
 		const event = {
 			payload: {
@@ -411,6 +439,7 @@ test('Gate 3b: batch mint maps reversed contract push_front tuples to signed coi
 
 		// Terminal on-chain FAILED throws NonRetryableError
 		rpcStatus = 'FAILED'
+		resetMintLocks(harness.env)
 		await assert.rejects(
 			() => wf.run(event as never, createWorkflowStep(new Map()).step as never),
 			(err: unknown) => err instanceof Error && err.name === 'NonRetryableError' && /failed on-chain/i.test(err.message)
@@ -432,87 +461,67 @@ test('Gate 3b: batch mint maps reversed contract push_front tuples to signed coi
 })
 
 test('Gate 3c: POST /mint/:id and POST /mint deduplicate identical submissions and keep 202 response formats', async () => {
+	const fixtures = JSON.parse(readFileSync(join(__dirname, 'fixtures', 'mint-authz', 'fe-carriers.json'), 'utf8')) as {
+		carriers: Array<{ name: string; sub: string; xdr: string; tracks: Array<{ id: string; creator: string }> }>
+	}
+	const single = fixtures.carriers.find((c) => c.name === 'mainnet/coin_it-split')!
+	const batch = fixtures.carriers.find((c) => c.name === 'mainnet/coin_them-2')!
+	const singleId = single.tracks[0].id
+	const batchIds = batch.tracks.map(({ id }) => id)
 	const harness = createMintEnv({
-		[SINGLE_ID]: { Address: OWNER_SUB, Mint_Token: null, Mint_Amm: null },
-		'm2': { Address: OWNER_SUB, Mint_Token: 'CEXIST', Mint_Amm: 'CAMMEXIST' },
-	})
-	const token = await createAuthToken(MINTER_SUB, TEST_SECRET)
+		[singleId]: { Address: single.tracks[0].creator, Public: 1, Mint_Token: null, Mint_Amm: null },
+		...Object.fromEntries(batch.tracks.map(({ id, creator }) => [id, { Address: creator, Public: 1, Mint_Token: null, Mint_Amm: null }])),
+	} as never)
+	// Admission validates real mainnet carriers, so the route runs with the production identity.
+	const env = harness.env as unknown as Record<string, unknown>
+	env.NETWORK_PASSPHRASE = Networks.PUBLIC
+	createMockUserQuotaNamespace(appModule.UserQuotaDO, harness.env)
+	const token = await createAuthToken(single.sub, TEST_SECRET)
 	const ctx = createMockExecutionContext()
-
-	// Build a minimal syntactically valid Stellar TransactionEnvelope XDR
-	const emptyEnvelope = new xdr.TransactionEnvelope.envelopeTypeTx(
-		new xdr.TransactionV1Envelope({
-			tx: new xdr.Transaction({
-				sourceAccount: xdr.MuxedAccount.keyTypeEd25519(Buffer.alloc(32, 1)),
-				fee: 100,
-				seqNum: xdr.Int64.fromString('1'),
-				cond: xdr.Preconditions.precondNone(),
-				memo: xdr.Memo.memoNone(),
-				operations: [],
-				ext: new xdr.TransactionExt(0),
-			}),
-			signatures: [],
-		})
-	).toXDR('base64')
+	const post = (path: string, body: unknown) => appModule.app.fetch(
+		new Request(`https://api.smol.xyz${path}`, {
+			method: 'POST',
+			headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+			body: JSON.stringify(body),
+		}),
+		harness.env,
+		ctx.ctx
+	)
 
 	// Duplicate single mint requests return the same workflow ID and create one instance
-	const s1 = await appModule.app.fetch(
-		new Request(`https://api.smol.xyz/mint/${SINGLE_ID}`, {
-			method: 'POST',
-			headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-			body: JSON.stringify({ xdr: emptyEnvelope }),
-		}),
-		harness.env,
-		ctx.ctx
-	)
-	const s2 = await appModule.app.fetch(
-		new Request(`https://api.smol.xyz/mint/${SINGLE_ID}`, {
-			method: 'POST',
-			headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-			body: JSON.stringify({ xdr: emptyEnvelope }),
-		}),
-		harness.env,
-		ctx.ctx
-	)
+	const s1 = await post(`/mint/${singleId}`, { xdr: single.xdr })
+	const s2 = await post(`/mint/${singleId}`, { xdr: single.xdr })
 	assert.equal(s1.status, 202)
 	assert.equal(s2.status, 202)
-	const single = await s1.json() as { workflowId: string }
-	assert.match(single.workflowId, /^mint-[0-9a-f]{48}$/)
-	assert.deepEqual(await s2.json(), single)
+	const first = await s1.json() as { workflowId: string }
+	assert.match(first.workflowId, /^mint-[0-9a-f]{48}$/)
+	assert.deepEqual(await s2.json(), first)
 	assert.equal(harness.txWorkflowCreates.length, 1, 'Duplicate identical mint request must deduplicate')
 
-	// Batch mint skips already-minted m2, returns 202 JSON, and deduplicates repeat calls
-	const b1 = await appModule.app.fetch(
-		new Request('https://api.smol.xyz/mint', {
-			method: 'POST',
-			headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-			body: JSON.stringify({ xdr: emptyEnvelope, ids: [SINGLE_ID, 'm2'] }),
-		}),
-		harness.env,
-		ctx.ctx
-	)
+	// Batch mint returns 202 JSON and deduplicates repeat calls
+	const b1 = await post('/mint', { xdr: batch.xdr, ids: batchIds })
 	assert.equal(b1.status, 202)
 	const firstBatch = await b1.json() as { workflowId: string }
 	assert.match(firstBatch.workflowId, /^batch-mint-[0-9a-f]{48}$/)
 	assert.deepEqual(firstBatch, {
 		workflowId: firstBatch.workflowId,
-		acceptedIds: [SINGLE_ID],
-		skipped: { alreadyMinted: ['m2'] },
+		acceptedIds: batchIds,
+		skipped: { alreadyMinted: [] },
 	})
 	assert.equal(harness.txWorkflowCreates.length, 2)
 
-	const b2 = await appModule.app.fetch(
-		new Request('https://api.smol.xyz/mint', {
-			method: 'POST',
-			headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-			body: JSON.stringify({ xdr: emptyEnvelope, ids: [SINGLE_ID, 'm2'] }),
-		}),
-		harness.env,
-		ctx.ctx
-	)
+	const b2 = await post('/mint', { xdr: batch.xdr, ids: batchIds })
 	assert.equal(b2.status, 202)
 	assert.deepEqual(await b2.json(), firstBatch)
 	assert.equal(harness.txWorkflowCreates.length, 2, 'Duplicate batch mint request must deduplicate')
+
+	// A signed batch that still contains an already-minted song can never land: 409, no workflow.
+	harness.rows.get(batchIds[1])!.Mint_Token = 'CEXIST'
+	harness.rows.get(batchIds[1])!.Mint_Amm = 'CAMMEXIST'
+	const stale = await post('/mint', { xdr: batch.xdr, ids: batchIds })
+	assert.equal(stale.status, 409)
+	assert.deepEqual(await stale.json(), { error: 'stale_batch', alreadyMinted: [batchIds[1]] })
+	assert.equal(harness.txWorkflowCreates.length, 2)
 })
 
 test('A2: a relay error that still carries a valid 64-hex hash is checkpointed and confirmed, never dropped', async () => {
@@ -552,7 +561,7 @@ test('A2: a relay error that still carries a valid 64-hex hash is checkpointed a
 
 	try {
 		const wf = new txWorkflowModule.TxWorkflow({} as ExecutionContext, harness.env)
-		wf.signTransaction = async (x) => `signed:${x}`
+		stubClaimingSigner(wf, harness.env, (event) => `signed:${event.payload.xdr}`)
 		const event = {
 			payload: { type: 'mint' as const, entropy: SINGLE_ID, xdr: 'unsigned-xdr', sub: MINTER_SUB, ownerSub: OWNER_SUB },
 			instanceId: 'mint-a2-hash',
@@ -569,6 +578,7 @@ test('A2: a relay error that still carries a valid 64-hex hash is checkpointed a
 		// An error with no usable hash is still a hard stop (no confirm, no duplicate submit).
 		for (const response of [{ error: 'WAIT_TIMEOUT' }, { hash: 'not-a-hash', error: 'ONCHAIN_FAILED' }]) {
 			harness.setRelayResponder(async () => response)
+			resetMintLocks(harness.env)
 			polledHashes.length = 0
 			await assert.rejects(
 				() => wf.run({ ...event, instanceId: `mint-a2-${response.error}` } as never, createWorkflowStep(new Map()).step as never),
