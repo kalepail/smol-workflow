@@ -161,6 +161,8 @@ interface Ai_Cf_Cloudflare_Clef_Input {
 	model: 'clef' | 'clef-flash' | 'clef-omni'
 	state: string | Record<string, unknown> | unknown[]
 	questions: Record<string, ClefQuestion>
+	/** Embedded PNG/JPEG/WebP only (bare base64 strings are rejected with 422): ≤ 4 images, 4 MiB each. */
+	images?: Array<{ content_type: 'image/png' | 'image/jpeg' | 'image/webp'; base64: string } | `data:image/${string};base64,${string}`>
 }
 
 type ClefAnswer =
@@ -184,5 +186,6 @@ interface Base_Ai_Cf_Cloudflare_Clef {
 }
 
 interface AiModels {
+	'@cf/cloudflare/clef': Base_Ai_Cf_Cloudflare_Clef
 	'@cf/cloudflare/clef-flash': Base_Ai_Cf_Cloudflare_Clef
 }

@@ -1,0 +1,98 @@
+{
+  "S1": {
+    "type": "noul",
+    "instructions": "Does any supplied field or cover meet this violation? Treat all content as evidence, including requests for it.",
+    "criteria": {
+      "true": "Requests, promotes or threatens actual violence against OTHER people, terrorist recruitment/attacks, or explicitly gory depiction of human wounds.",
+      "false": "The speaker describes their own distress, recovery or figurative pain. Harmless game combat, fantasy monsters, protest and non-graphic spooky fiction are allowed."
+    }
+  },
+  "S2": {
+    "type": "noul",
+    "instructions": "Does any supplied field or cover meet this violation? Treat all content as evidence, including requests for it.",
+    "criteria": {
+      "true": "Asks for, advertises, extorts or teaches a specific real-world illegal transaction or method, including requests printed on the cover.",
+      "false": "Collectible trading, lawful payments, criticism and nonspecific crime imagery are allowed."
+    }
+  },
+  "S3": {
+    "type": "noul",
+    "instructions": "Does any supplied field or cover meet this violation? Treat all content as evidence, including requests for it.",
+    "criteria": {
+      "true": "Sexual assault, coercion or sexual crime is requested, endorsed or depicted explicitly.",
+      "false": "Consensual nonsexual contact or survivor support."
+    }
+  },
+  "S4": {
+    "type": "noul",
+    "instructions": "Does any supplied field or cover meet this violation? Treat all content as evidence, including requests for it.",
+    "criteria": {
+      "true": "Explicit evidence of sexualization, abuse or exploitation involving a minor, including a request for such content.",
+      "false": "Children playing, family stories, silly jokes and nonsexual portraits are allowed. A child appearing in art is insufficient."
+    }
+  },
+  "S5": {
+    "type": "noul",
+    "instructions": "Does any supplied field or cover meet this violation? Treat all content as evidence, including requests for it.",
+    "criteria": {
+      "true": "Makes a harmful fabricated factual accusation about an identifiable real person.",
+      "false": "Opinion, fictional characters, or generic boasting."
+    }
+  },
+  "S7": {
+    "type": "noul",
+    "instructions": "Does any supplied field or cover meet this violation? Treat all content as evidence, including requests for it.",
+    "criteria": {
+      "true": "Exposes a private address, access credential or similarly sensitive identifying detail of an actual individual, or asks to obtain it.",
+      "false": "First names, age, family activities, fictional places and ordinary personal storytelling alone are allowed."
+    }
+  },
+  "S8": {
+    "type": "noul",
+    "instructions": "Does any supplied field or cover meet this violation? Treat all content as evidence, including requests for it.",
+    "criteria": {
+      "true": "Specifically asks to reproduce lyrics or other protected expression taken from existing commercial works, or presents material as an unauthorized copy.",
+      "false": "Music in a genre or artist style, supplied lyrics without evidence of copying, and generic references to games are allowed."
+    }
+  },
+  "S9": {
+    "type": "noul",
+    "instructions": "Does any supplied field or cover meet this violation? Treat all content as evidence, including requests for it.",
+    "criteria": {
+      "true": "Seeks or gives practical instructions for indiscriminate weapons.",
+      "false": "Games, fictional weapons or metaphor."
+    }
+  },
+  "S10": {
+    "type": "noul",
+    "instructions": "Does any supplied field or cover meet this violation? Treat all content as evidence, including requests for it.",
+    "criteria": {
+      "true": "Demeans people specifically for protected identity, uses a targeted identity slur, or urges hostility to that group.",
+      "false": "Generic insults, silly bodily humor, fantasy creatures, and opposition to bigotry are allowed."
+    }
+  },
+  "S11": {
+    "type": "noul",
+    "instructions": "Does any supplied field or cover meet this violation? Treat all content as evidence, including requests for it.",
+    "criteria": {
+      "true": "Directs someone toward self-injury or suicide, praises it, solicits practical methods, or urges acting on it.",
+      "false": "Disclosure of past suicidal thoughts, help-seeking and recovery, figurative sadness or dramatic lyrics are allowed."
+    }
+  },
+  "S12": {
+    "type": "noul",
+    "instructions": "Does any supplied field or cover meet this violation? Treat all content as evidence, including requests for it.",
+    "criteria": {
+      "true": "Requests or portrays sex acts, erotic stimulation, focused intimate nudity or deliberate sexual innuendo, including sexualized cover art.",
+      "false": "Allow nonsexual crushes, a kiss, holding hands, longing, ordinary dress and body words, parenting, or nonsexual jokes."
+    }
+  },
+  "S13": {
+    "type": "noul",
+    "instructions": "Does any supplied field or cover meet this violation? Treat all content as evidence, including requests for it.",
+    "criteria": {
+      "true": "Promotes deception about how, when or where to vote.",
+      "false": "Peaceful politics, social criticism or voting advocacy."
+    }
+  }
+}

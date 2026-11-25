@@ -8,7 +8,7 @@ Backend API and Cloudflare Workflows orchestration engine for [SMOL](https://smo
 smol-fe (smol.xyz / next.smol.xyz)  ──┐
 smol-native-api (SONG_GENERATOR)    ──┼──► smol-workflow (Hono + Workflows + DO)
                                            ├─► Pixellab (64x64 pixel art)
-                                           ├─► Cloudflare Workers AI (moondream3.1, llama-guard-3-8b, gemma-4, bge-m3)
+                                           ├─► Cloudflare Workers AI (moondream3.1, clef, gemma-4, bge-m3)
                                            ├─► aisonggenerator-worker (HTTP Service Binding: lyrics + AISG v6 2-track music)
                                            ├─► Cloudflare AI Gateway BYOK -> ElevenLabs Music v2.5 (1-track direct MP3 to R2)
                                            ├─► kale-worker (RPC Service Binding: Stellar relay submitTransaction + mainnet chain reads)
@@ -36,7 +36,7 @@ src/
 ├── ai/
 │   ├── pixellab.ts          # Pixel art generation (pixflux, bounded body, fixed error copy)
 │   ├── cf.ts                # Image description (@cf/moondream/moondream3.1-9B-A2B)
-│   ├── nsfw.ts              # Fail-closed NSFW classification (@cf/meta/llama-guard-3-8b)
+│   ├── nsfw.ts              # Fail-closed NSFW classification (@cf/cloudflare/clef 27B + cover PNG)
 │   ├── aisonggenerator.ts   # AISG v6 HTTP Service Binding client (lyrics, split tasks, songs)
 │   ├── elevenlabs.ts        # ElevenLabs Music v2.5 via Cloudflare AI Gateway BYOK -> R2
 │   └── mixtape-dedupe.ts    # Tier 2 clef-flash mixtape uniqueness tie-breaker (fail-open)

@@ -810,3 +810,20 @@ export function createSqliteD1(db: DatabaseSync) {
 
 	return { d1: d1 as unknown as D1Database, stats, hooks }
 }
+
+/** Fake cover with a real PNG signature, so the Clef NSFW PNG preflight accepts it. */
+export const FAKE_PNG_B64 = Buffer.concat([
+	Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+	Buffer.from('fake-png-bytes'),
+]).toString('base64')
+
+export const CLEF_NSFW_TEST_CODES = ['S1', 'S2', 'S3', 'S4', 'S5', 'S7', 'S8', 'S9', 'S10', 'S11', 'S12', 'S13'] as const
+
+/** A healthy direct `@cf/cloudflare/clef` binding payload: every code at 0.1 unless overridden. */
+export function clefNsfwPayload(scores: Partial<Record<string, number>> = {}) {
+	return {
+		model: 'clef',
+		usage: { input_tokens: 1995, output_tokens: 0 },
+		answers: Object.fromEntries(CLEF_NSFW_TEST_CODES.map((code) => [code, { type: 'noul', noul: scores[code] ?? 0.1 }])),
+	}
+}

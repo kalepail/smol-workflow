@@ -6,7 +6,9 @@ import {
 	createMockExecutionContext,
 	createMockR2Bucket,
 	createMockUserQuotaNamespace,
+	clefNsfwPayload,
 	createWorkflowStep,
+	FAKE_PNG_B64,
 	installCloudflareStubs,
 	SuspendSignal,
 	type CloudflareStubHandle,
@@ -20,7 +22,7 @@ let nsfwModule: typeof import('../src/ai/nsfw')
 
 const TEST_SECRET = 'test-jwt-secret-32-chars-minimum!'
 const TEST_USER = 'GCREATORADDRESS1234567890'
-const FAKE_IMAGE_B64 = Buffer.from('fake-png-bytes').toString('base64')
+const FAKE_IMAGE_B64 = FAKE_PNG_B64
 
 before(async () => {
 	stubs = installCloudflareStubs()
@@ -37,6 +39,8 @@ after(() => {
 function buildMockEnv(options: {
 	aisgFetch?: (url: string, init?: RequestInit) => Promise<Response>
 	nsfwRaw?: unknown
+	clefRaw?: unknown
+	nsfwProvider?: string
 	preMigrationD1?: boolean
 	cfGatewayId?: string
 	cfAigToken?: string
@@ -50,6 +54,7 @@ function buildMockEnv(options: {
 	const d1Playlists: Array<{ Id: string; Title: string }> = []
 	const queueMessages: unknown[] = []
 	const createdWorkflows: Array<{ id: string; params: WorkflowParams }> = []
+	const aiCalls: Array<{ model: string; input: any }> = []
 
 	const d1 = {
 		prepare(sql: string) {
@@ -153,6 +158,7 @@ function buildMockEnv(options: {
 		ELEVENLABS_FALLBACK_ENABLED: options.fallbackEnabled ?? 'true',
 		DAILY_LIMIT_CLASSIC: '20',
 		DAILY_LIMIT_ELEVENLABS: '10',
+		...(options.nsfwProvider ? { NSFW_PROVIDER: options.nsfwProvider } : {}),
 		DURABLE_OBJECT: doNs.namespace,
 		USER_QUOTA: quotaNs.namespace,
 		SMOL_BUCKET: r2.bucket,
@@ -186,12 +192,16 @@ function buildMockEnv(options: {
 			gateway: (gatewayId: string) => ({
 				getUrl: async (provider: string) => `https://gateway.ai.cloudflare.com/v1/acct-1/${gatewayId}/${provider}`,
 			}),
-			run: async (model: string) => {
+			run: async (model: string, input: unknown) => {
+				aiCalls.push({ model, input })
 				if (model === '@cf/moondream/moondream3.1-9B-A2B') {
 					return { result: { answer: 'Warm sunset skyline over calm ocean water.', finish_reason: 'stop' } }
 				}
 				if (model === '@cf/meta/llama-guard-3-8b') {
 					return { response: options.nsfwRaw ?? { safe: true, categories: [] } }
+				}
+				if (model === '@cf/cloudflare/clef') {
+					return options.clefRaw ?? clefNsfwPayload()
 				}
 				if (model === '@cf/zai-org/glm-5.3') {
 					return {
@@ -223,7 +233,7 @@ function buildMockEnv(options: {
 		},
 	} as unknown as Env
 
-	return { env, r2, doNs, kv, d1Smols, d1Playlists, queueMessages, createdWorkflows }
+	return { env, r2, doNs, kv, d1Smols, d1Playlists, queueMessages, createdWorkflows, aiCalls }
 }
 
 function makeAudioBytes(seed: number, size = 40_000): Uint8Array {
@@ -1083,6 +1093,72 @@ test('P2 pacing: vocal ElevenLabs reuses the pre-claim R2 check (no second HEAD 
 		const quota = (harness.env as any).USER_QUOTA.get((harness.env as any).USER_QUOTA.idFromName(`user:${TEST_USER}`))
 		assert.equal((await quota.getReservation(smolId))?.status, 'committed', 'fresh reservation is committed, never stranded')
 		assert.equal(harness.d1Smols.get(smolId)?.Song_1, `el-${smolId}`)
+	} finally {
+		globalThis.fetch = originalFetch
+	}
+})
+
+test('Step 5 NSFW: Clef 27B gets raw lyrics + cover PNG and gates listing; NSFW_PROVIDER="llama-guard" restores the legacy call', async () => {
+	const fakeMp3 = makeAudioBytes(63, 8192)
+	const originalFetch = globalThis.fetch
+	globalThis.fetch = (async (input: string | URL | Request) => {
+		const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+		if (url.includes('api.pixellab.ai')) {
+			return new Response(JSON.stringify({ image: { base64: FAKE_IMAGE_B64 } }), { status: 200 })
+		}
+		if (url.includes('/elevenlabs/v1/music')) {
+			return new Response(fakeMp3, { status: 200, headers: { 'Content-Type': 'audio/mpeg', 'Content-Length': String(fakeMp3.byteLength) } })
+		}
+		throw new Error(`Unexpected fetch: ${url}`)
+	}) as typeof fetch
+
+	const runSong = async (harness: ReturnType<typeof buildMockEnv>, instanceId: string) => {
+		const wf = new workflowModule.Workflow({} as ExecutionContext, harness.env)
+		await wf.run(
+			{ payload: { address: TEST_USER, prompt: 'harbor love song', public: true, provider: 'elevenlabs' }, instanceId, timestamp: new Date() } as never,
+			createWorkflowStep(new Map()).step as never,
+		)
+		return JSON.parse(harness.kv.get(instanceId)!) as { nsfw: unknown; lyrics: { lyrics: string } }
+	}
+
+	try {
+		// Default provider (unset → clef): exact evaluated payload shape, safe → publicly listed
+		const safe = buildMockEnv()
+		const safeKv = await runSong(safe, 'c1'.repeat(32))
+		const clefCalls = safe.aiCalls.filter((c) => c.model === '@cf/cloudflare/clef')
+		assert.equal(clefCalls.length, 1)
+		assert.equal(safe.aiCalls.some((c) => c.model === '@cf/meta/llama-guard-3-8b'), false)
+		const input = clefCalls[0].input
+		assert.deepEqual(Object.keys(input), ['model', 'state', 'questions', 'images'])
+		assert.equal(input.model, 'clef')
+		assert.deepEqual(input.state, { prompt: 'harbor love song', description: 'Warm sunset skyline over calm ocean water.', lyrics: safeKv.lyrics.lyrics })
+		assert.ok(input.state.lyrics.startsWith('[Verse 1]\nGolden'), 'raw lyrics, never JSON-stringified')
+		assert.equal(input.questions, nsfwModule.CLEF_NSFW_QUESTIONS)
+		assert.deepEqual(input.images, [{ content_type: 'image/png', base64: FAKE_IMAGE_B64 }])
+		assert.deepEqual(safeKv.nsfw, { safe: true, categories: [] })
+		assert.equal(safe.d1Smols.get('c1'.repeat(32))?.Public, 1)
+		assert.equal(safe.queueMessages.length, 1)
+
+		// Definite S12 block → stored code, kept unlisted, never queued for search
+		const blocked = buildMockEnv({ clefRaw: clefNsfwPayload({ S12: 0.45 }) })
+		const blockedKv = await runSong(blocked, 'c2'.repeat(32))
+		assert.deepEqual(blockedKv.nsfw, { safe: false, categories: ['S12'] })
+		assert.equal(blocked.d1Smols.get('c2'.repeat(32))?.Public, 0)
+		assert.equal(blocked.queueMessages.length, 0)
+
+		// Clef outage fails closed WITHOUT failing the song (no step retry, no refund)
+		const broken = buildMockEnv({ clefRaw: { success: false, errors: [{ code: 5000 }] } })
+		const brokenKv = await runSong(broken, 'c3'.repeat(32))
+		assert.deepEqual(brokenKv.nsfw, { safe: false, categories: [], unknown: true })
+		assert.equal(broken.d1Smols.get('c3'.repeat(32))?.Public, 0)
+
+		// Rollback: legacy Guard call with JSON-stringified lyrics, no Clef call
+		const legacy = buildMockEnv({ nsfwProvider: 'llama-guard', nsfwRaw: 'safe' })
+		const legacyKv = await runSong(legacy, 'c4'.repeat(32))
+		assert.equal(legacy.aiCalls.some((c) => c.model === '@cf/cloudflare/clef'), false)
+		const guardCall = legacy.aiCalls.find((c) => c.model === '@cf/meta/llama-guard-3-8b')
+		assert.ok(guardCall?.input.messages[0].content.includes(JSON.stringify(legacyKv.lyrics.lyrics)))
+		assert.deepEqual(legacyKv.nsfw, { safe: true, categories: [] })
 	} finally {
 		globalThis.fetch = originalFetch
 	}

@@ -11,6 +11,7 @@
  *  - Questions/criteria are server constants; editorial text only travels as `state` data.
  */
 import { dedupeOrdered, pairMetrics, type MixtapeCandidate } from '../utils/mixtape-visibility'
+import { isRecord, readNoul, unwrapClefPayload } from './clef'
 
 export const MIXTAPE_DEDUPE_MODEL = '@cf/cloudflare/clef-flash'
 export const MIXTAPE_DEDUPE_MODEL_SELECTOR = 'clef-flash'
@@ -124,48 +125,16 @@ export function buildMixtapeDedupeInput(
 	}
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
-}
-
-function isTokenCount(value: unknown): value is number {
-	return typeof value === 'number' && Number.isInteger(value) && value >= 0
-}
-
-/** Cloudflare REST/gateway envelopes we accept around the binding payload (raw → result → result). */
-const MAX_ENVELOPES = 2
-
-/** Envelope status checks applied at EVERY level, including the terminal payload. */
-function envelopeOk(node: Record<string, unknown>): boolean {
-	if ('success' in node && node.success !== true) return false // must be the boolean true when present
-	if ('errors' in node && (!Array.isArray(node.errors) || node.errors.length > 0)) return false
-	if ('state' in node && node.state !== 'Completed') return false
-	return true
-}
-
 /**
- * Strict validation of a clef-flash payload. Accepts the direct binding shape
- * `{ model, answers, usage }` or at most two Cloudflare envelopes (`{ success, errors, result }`
- * / `{ state, result }`). Any reported failure at any level (including `success: "false"`),
- * deeper nesting, missing model, malformed answers or usage rejects the WHOLE response before
- * a probability is used (fail open to Tier 1).
+ * Strict validation of a clef-flash payload (envelopes/model/usage via `unwrapClefPayload`).
+ * Malformed answers reject the WHOLE response before a probability is used (fail open to Tier 1).
  */
 export function parseMixtapeDedupeResponse(raw: unknown): Omit<SemanticVerdict, 'latencyMs'> | null {
-	let payload: unknown = raw
-	for (let unwrapped = 0; ; unwrapped += 1) {
-		if (!isRecord(payload) || !envelopeOk(payload)) return null
-		if ('answers' in payload) break
-		if (!('result' in payload) || unwrapped >= MAX_ENVELOPES) return null
-		payload = payload.result
-	}
-	if (!isRecord(payload) || !isRecord(payload.answers)) return null
-	if (typeof payload.model !== 'string' || !payload.model.trim()) return null
-	if (!isRecord(payload.usage) || !isTokenCount(payload.usage.input_tokens) || !isTokenCount(payload.usage.output_tokens)) return null
+	const payload = unwrapClefPayload(raw)
+	if (!payload) return null
 
-	const isDuplicate = payload.answers.is_duplicate
-	if (!isRecord(isDuplicate) || isDuplicate.type !== 'noul') return null
-	const p = isDuplicate.noul
-	if (typeof p !== 'number' || !Number.isFinite(p) || p < 0 || p > 1) return null
+	const p = readNoul(payload.answers.is_duplicate)
+	if (p === null) return null
 
 	let relation: MixtapeRelation | null = null
 	const rel = payload.answers.relation

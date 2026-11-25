@@ -4,33 +4,20 @@ Durable research notes and upcoming work for `smol-workflow` and the `next.smol.
 
 ---
 
-## 1. Upgrade NSFW / Content Safety Classifier (`llama-guard-3-8b` → `@cf/cloudflare/clef`)
+## 1. NSFW / Content Safety Classifier: `llama-guard-3-8b` → tuned `@cf/cloudflare/clef` (Implemented)
 
-**Status:** Research complete, not urgent (current model is still active and supported).
+**Status:** Implemented in `src/ai/nsfw.ts` (branch `feat/wf-nsfw-clef`); `NSFW_PROVIDER="clef"` in `wrangler.jsonc`. Rollback is one var: `NSFW_PROVIDER="llama-guard"` restores the legacy Guard call exactly (text-only, JSON-stringified lyrics).
 
-### Current State (`src/ai/nsfw.ts`)
-- Model: `@cf/meta/llama-guard-3-8b` (Llama 3.1 8B base, `$0.484/M` input, `$0.03/M` output, ZDR).
-- **Not deprecated:** Survived Cloudflare's May 30, 2026 and November 20, 2026 Workers AI deprecation sweeps and still backs Cloudflare's own AI Gateway Guardrails (`S1`–`S14`).
-- **Why it is a weak fit for SMOL's actual check:**
-  1. **Custom rubric mismatch:** Llama Guard 3 is fine-tuned on Meta's fixed MLCommons `S1`–`S14` definitions and plain-text `safe` / `unsafe\nS12` output. `src/ai/nsfw.ts` rewrites `S12` into a strict G-rated / no-romance policy and requests `response_format: { type: 'json_object' }`, which fights its fine-tune.
-  2. **Narrow language support:** Documented for 8 languages (`EN, FR, DE, HI, IT, PT, ES, TH`), while SMOL now enforces matching any prompt language.
-  3. **Text-only:** Evaluates only the text `description`, never the actual generated pixel-art cover image.
+### What runs in Step 5
+- `@cf/cloudflare/clef` (27B, `model: "clef"`) with `state: { prompt, description, lyrics }` (raw lyrics; empty for instrumentals), the frozen 12-question `noul` rubric (`S1`–`S5`, `S7`–`S13`; pinned by `test/fixtures/nsfw-clef-questions.json`), and the cover as `images: [{ content_type: "image/png", base64 }]`.
+- Policy: nonsexual affection, heartbreak, family and children's songs are allowed; sex acts, focused intimate nudity, deliberate sexual innuendo (text or cover) and all S1–S13 harms are blocked. This intentionally replaces the old "no romance at all" S12 wording.
+- Decision: review cutoffs `S8 .45`, `S12 .40`, others `.50`; definite block = review + `.05`, inclusive. Any definite → `{ safe: false, categories: [highest definite code] }` (exact tie → no code). Review-only → `{ safe: false, categories: [], unknown: true }`. Else safe.
+- Fail-closed to `unknown` (kept unlisted, song still completes, no refund) on: missing/invalid/non-PNG/> 4 MiB cover, combined text > 48,000 chars, 5 s timeout, AI throw, or any envelope/model/usage/answer defect. Stored legacy KV shapes still normalize unchanged.
 
-### Recommended Replacement: `@cf/cloudflare/clef` (or `@cf/cloudflare/clef-flash`)
-- Cloudflare's open-source multimodal decision models (launched Oct 2026):
-  - `@cf/cloudflare/clef` (27B, `$0.24/M` input, `$0` output, 64K context, Vision, ZDR) — highest precision.
-  - `@cf/cloudflare/clef-flash` (9B) — lower latency hot-path option.
-- **Why it fits SMOL much better:**
-  - Designed specifically for custom **trust-and-safety policy rubrics**: accepts structured `state` + typed `questions` schema and returns calibrated probabilities per option (no free-form text/JSON parsing or reasoning-token latency).
-  - **~Half the input cost** of `llama-guard-3-8b` (`$0.24/M` vs `$0.484/M`) and `$0` output tokens.
-  - **Multimodal:** Can pass the actual generated pixel-art image (`images[]`) alongside `prompt`, `description`, and `lyrics`.
-- **Alternative if staying on a standard chat/JSON model:** `@cf/google/gemma-4-26b-a4b-it` (already used for search tag extraction in `src/utils/search.ts`; multimodal + multilingual).
-
-### Migration Checklist
-- [ ] Define typed Clef `questions` rubric matching SMOL's G-rated public-listing policy (harm categories + sexual/romantic/NSFW checks).
-- [ ] Preserve `NormalizedNsfwResult` (`{ safe: boolean, categories: string[], unknown?: boolean }`) and fail-closed semantics on errors or ambiguous probabilities.
-- [ ] Pass `image_base64` alongside `prompt`, `description`, and `lyrics`.
-- [ ] Shadow-test / calibrate probability thresholds against a sample of historical safe + unsafe Smols before switching production traffic.
+### Eval summary (`orchestration/modernization/nsfw-clef-eval.md`, 2026-11-25)
+- Holdout 22 songs: tuned 27B + PNG **6 TP / 0 FP / 0 FN / 16 TN** (Guard: 4/2/2/14); full 66 cases: 0 FP / 0 FN. Only the PNG arm caught an image-only solicitation.
+- 27B + PNG latency p50 350 ms / p95 573 ms / max 923 ms (REST client wall-clock); ~$0.0005 per song, $0 output tokens.
+- Caveat: 6 unsafe holdout cases bound the miss rate at ≤ 39% (one-sided 95%); watch `nsfw_clef_unknown` logs and the unknown/blocked rate after deploy.
 
 ---
 

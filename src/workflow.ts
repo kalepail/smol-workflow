@@ -20,7 +20,7 @@ import { refundGenerationQuota } from './utils/quota';
  * - AI-generated pixel art (via Pixellab)
  * - Image description (via Cloudflare Workers AI)
  * - Lyrics, title, and style tags (via AISG lyrics route / Workers AI fallback)
- * - NSFW classification (via Cloudflare Workers AI Llama Guard, fail-closed)
+ * - NSFW classification (Workers AI Clef 27B + cover PNG, fail-closed; NSFW_PROVIDER rollback)
  * - Music generation:
  *   - Primary: AISG v6 (2 tracks, split submit + paginated discovery + bounded poll + swap validation)
  *   - Explicit or Automatic Fallback: ElevenLabs Music v2.5 via Cloudflare AI Gateway BYOK (1 track, direct to R2)
@@ -352,7 +352,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 			nsfw = retry_steps?.nsfw !== undefined
 				? normalizeNsfwResult(retry_steps.nsfw)
 				: await step.do('check nsfw', config, async () => {
-					return await checkNSFW(this.env, prompt, description, JSON.stringify(lyrics.lyrics ?? ''));
+					return await checkNSFW(this.env, prompt, description, lyrics.lyrics ?? '', image_base64);
 				});
 
 			await step.do('save nsfw check', config, () => stub.saveStep('nsfw', nsfw));

@@ -124,6 +124,8 @@
         "GLOBAL_DAILY_LIMIT_ELEVENLABS": "20",
         "PLAY_COUNT_MODE": "beacon",
         "MIXTAPE_DEDUPE_AI_ENABLED": "true",
+        // Step 5 NSFW classifier: tuned "clef" (27B + cover PNG). "llama-guard" is the instant rollback.
+        "NSFW_PROVIDER": "clef",
         "SEARCH_BACKFILL_CRON_ENABLED": "true",
         "SEARCH_BACKFILL_CRON_PAGE_LIMIT": "20",
         "SEARCH_BACKFILL_CRON_STALL_RUNS": "6",

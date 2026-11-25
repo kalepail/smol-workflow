@@ -9,7 +9,9 @@ import {
 	createMockR2Bucket,
 	createMockUserQuotaNamespace,
 	createSqliteBackedStorage,
+	clefNsfwPayload,
 	createWorkflowStep,
+	FAKE_PNG_B64,
 	installCloudflareStubs,
 	type CloudflareStubHandle,
 } from './helpers/harness'
@@ -23,7 +25,7 @@ let smolsApiModule: typeof import('../src/api/smols')
 const TEST_SECRET = 'test-jwt-secret-32-chars-minimum!'
 const USER_A = 'GUSERAADDRESS00000000000000'
 const USER_B = 'GUSERBADDRESS00000000000000'
-const FAKE_IMAGE_B64 = Buffer.from('fake-png-bytes').toString('base64')
+const FAKE_IMAGE_B64 = FAKE_PNG_B64
 
 before(async () => {
 	stubs = installCloudflareStubs()
@@ -203,6 +205,9 @@ function buildQuotaFlowHarness(options: {
 				}
 				if (model === '@cf/meta/llama-guard-3-8b') {
 					return { response: { safe: true, categories: [] } }
+				}
+				if (model === '@cf/cloudflare/clef') {
+					return clefNsfwPayload()
 				}
 				throw new Error(`Unexpected AI model: ${model}`)
 			},
