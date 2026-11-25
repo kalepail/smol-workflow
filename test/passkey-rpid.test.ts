@@ -129,15 +129,11 @@ function buildMockAuthenticationResponse(params: {
 }
 
 test('resolvePasskeyVerificationTarget maps approved smol.xyz hosts and local dev origins accurately', () => {
-	assert.deepEqual(APPROVED_SMOL_RP_HOSTS, ['smol.xyz', 'next.smol.xyz', 'noot.smol.xyz'])
+	assert.deepEqual(APPROVED_SMOL_RP_HOSTS, ['smol.xyz', 'noot.smol.xyz'])
 
 	assert.deepEqual(resolvePasskeyVerificationTarget('https://smol.xyz'), {
 		expectedOrigin: 'https://smol.xyz',
 		expectedRPID: ['smol.xyz'],
-	})
-	assert.deepEqual(resolvePasskeyVerificationTarget('https://next.smol.xyz'), {
-		expectedOrigin: 'https://next.smol.xyz',
-		expectedRPID: ['smol.xyz', 'next.smol.xyz'],
 	})
 	assert.deepEqual(resolvePasskeyVerificationTarget('https://noot.smol.xyz/login'), {
 		expectedOrigin: 'https://noot.smol.xyz',
@@ -169,6 +165,7 @@ test('resolvePasskeyVerificationTarget rejects disallowed origins, non-HTTPS pro
 		'https://evil.com',
 		'https://evil.smol.xyz',
 		'https://app.smol.xyz',
+		'https://next.smol.xyz',
 		'https://sub.next.smol.xyz',
 		'http://smol.xyz',
 		'http://next.smol.xyz',
@@ -186,32 +183,32 @@ test('resolvePasskeyVerificationTarget rejects disallowed origins, non-HTTPS pro
 	}
 })
 
-test('verifyRegistration and WebAuthn authentication accept smol.xyz RP ID on next.smol.xyz, root smol.xyz, and reject mismatches', async () => {
+test('verifyRegistration and WebAuthn authentication accept smol.xyz RP ID on noot.smol.xyz, root smol.xyz, and reject mismatches', async () => {
 	const { publicKey, privateKey } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' })
 	const spkiDer = publicKey.export({ type: 'spki', format: 'der' }) as Buffer
 	const cosePublicKey = buildCosePublicKeyFromSpki(spkiDer)
 	const credentialId = Buffer.from('0123456789abcdef0123456789abcdef', 'hex')
 	const challenge = base64url.encode(Buffer.from('challenge-at-least-16-bytes-long'))
 
-	// 1. Fresh registration on https://next.smol.xyz with shared RP ID 'smol.xyz' succeeds
-	const nextReg = buildMockRegistrationResponse({
-		origin: 'https://next.smol.xyz',
+	// 1. Fresh registration on https://noot.smol.xyz with shared RP ID 'smol.xyz' succeeds
+	const nootReg = buildMockRegistrationResponse({
+		origin: 'https://noot.smol.xyz',
 		rpId: 'smol.xyz',
 		challenge,
 		credentialId,
 		cosePublicKey,
 	})
-	await verifyRegistration('https://next.smol.xyz', nextReg)
+	await verifyRegistration('https://noot.smol.xyz', nootReg)
 
-	// 2. Host-scoped registration on https://next.smol.xyz with RP ID 'next.smol.xyz' succeeds
-	const nextHostReg = buildMockRegistrationResponse({
-		origin: 'https://next.smol.xyz',
-		rpId: 'next.smol.xyz',
+	// 2. Host-scoped registration on https://noot.smol.xyz with RP ID 'noot.smol.xyz' succeeds
+	const nootHostReg = buildMockRegistrationResponse({
+		origin: 'https://noot.smol.xyz',
+		rpId: 'noot.smol.xyz',
 		challenge,
 		credentialId,
 		cosePublicKey,
 	})
-	await verifyRegistration('https://next.smol.xyz', nextHostReg)
+	await verifyRegistration('https://noot.smol.xyz', nootHostReg)
 
 	// 3. Root / native registration on https://smol.xyz with RP ID 'smol.xyz' succeeds
 	const rootReg = buildMockRegistrationResponse({
@@ -223,17 +220,17 @@ test('verifyRegistration and WebAuthn authentication accept smol.xyz RP ID on ne
 	})
 	await verifyRegistration('https://smol.xyz', rootReg)
 
-	// 4. Root-registered credential (RP ID 'smol.xyz') authenticates cleanly on https://next.smol.xyz
-	const nextAuth = buildMockAuthenticationResponse({
-		origin: 'https://next.smol.xyz',
+	// 4. Root-registered credential (RP ID 'smol.xyz') authenticates cleanly on https://noot.smol.xyz
+	const nootAuth = buildMockAuthenticationResponse({
+		origin: 'https://noot.smol.xyz',
 		rpId: 'smol.xyz',
 		challenge,
 		credentialId,
 		privateKey,
 	})
-	const target = resolvePasskeyVerificationTarget('https://next.smol.xyz')
+	const target = resolvePasskeyVerificationTarget('https://noot.smol.xyz')
 	const verified = await verifyAuthenticationResponse({
-		response: nextAuth,
+		response: nootAuth,
 		expectedChallenge: challenge,
 		expectedOrigin: target.expectedOrigin,
 		expectedRPID: target.expectedRPID,
@@ -246,16 +243,16 @@ test('verifyRegistration and WebAuthn authentication accept smol.xyz RP ID on ne
 	})
 	assert.equal(verified.verified, true)
 
-	// 5. Wrong RP ID ('noot.smol.xyz') presented on https://next.smol.xyz is rejected with 400
+	// 5. Wrong RP ID ('next.smol.xyz') presented on https://noot.smol.xyz is rejected with 400
 	const wrongRpReg = buildMockRegistrationResponse({
-		origin: 'https://next.smol.xyz',
-		rpId: 'noot.smol.xyz',
+		origin: 'https://noot.smol.xyz',
+		rpId: 'next.smol.xyz',
 		challenge,
 		credentialId,
 		cosePublicKey,
 	})
 	await assert.rejects(
-		() => verifyRegistration('https://next.smol.xyz', wrongRpReg),
+		() => verifyRegistration('https://noot.smol.xyz', wrongRpReg),
 		(err: unknown) => err instanceof Error && 'status' in err && (err as { status: number }).status === 400
 	)
 

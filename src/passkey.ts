@@ -19,7 +19,6 @@ const MAINNET_NETWORK_ID = hash(Buffer.from(Networks.PUBLIC));
 
 export const APPROVED_SMOL_RP_HOSTS = [
     'smol.xyz',
-    'next.smol.xyz',
     'noot.smol.xyz',
 ] as const;
 

@@ -1,6 +1,5 @@
 export const ALLOWED_CORS_ORIGINS = new Set([
 	'https://smol.xyz',
-	'https://next.smol.xyz',
 	'https://noot.smol.xyz',
 ])
 

@@ -32,7 +32,7 @@ type Carrier = { name: string; identity: string; kind: MintKind; sub: string; tr
 const carriers = (JSON.parse(readFileSync(join(ROOT, 'test/fixtures/mint-authz/fe-carriers.json'), 'utf8')) as { carriers: Carrier[] }).carriers
 const config = JSON.parse(readFileSync(join(ROOT, 'wrangler.jsonc'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, ''))
 assert.equal(config.vars.MINT_SIGNING_ENABLED, 'false')
-assert.equal(config.vars.PLAY_COUNT_MODE, 'server')
+assert.equal(config.vars.PLAY_COUNT_MODE, 'beacon')
 
 writeFileSync(join(BUNDLE, 'smoke-entry.js'), `
 import worker, { TxWorkflow } from './index.js'
@@ -201,9 +201,9 @@ async function pausedAndCache() {
 		assert.equal(cold.response.headers.get('Cache-Control'), 'public, max-age=30, s-maxage=30, stale-while-revalidate=60')
 		await until(async () => (JSON.parse((await call(mf, '/__smoke/cache-puts')).text) as string[]).includes('/') || undefined, 'public cache put')
 		await db.prepare(`INSERT INTO Smols (Id, Title, Song_1, "Address", Public) VALUES (?1, 'New', ?1, ?2, 1)`).bind('c'.repeat(64), owner).run()
-		const warm = await list('https://next.smol.xyz')
+		const warm = await list('https://noot.smol.xyz')
 		assert.equal(warm.text, cold.text, 'second request is a cache HIT (new row not visible)')
-		assert.equal(warm.response.headers.get('Access-Control-Allow-Origin'), 'https://next.smol.xyz')
+		assert.equal(warm.response.headers.get('Access-Control-Allow-Origin'), 'https://noot.smol.xyz')
 		const anonymous = await list()
 		assert.equal(anonymous.text, cold.text)
 		assert.equal(anonymous.response.headers.get('Access-Control-Allow-Origin'), null)

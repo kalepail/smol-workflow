@@ -1653,9 +1653,9 @@ test('Pass 9 P2: an owner DELETE or PATCH while an active recovery awaits Clef r
 test('47b B1: the shared GET /mixtapes edge copy never replays one origin\'s CORS headers to another', async () => {
 	const h = buildHarness()
 
-	const first = await h.send('/mixtapes', { origin: 'https://next.smol.xyz' })
+	const first = await h.send('/mixtapes', { origin: 'https://noot.smol.xyz' })
 	assert.equal(first.status, 200)
-	assert.equal(first.headers.get('Access-Control-Allow-Origin'), 'https://next.smol.xyz')
+	assert.equal(first.headers.get('Access-Control-Allow-Origin'), 'https://noot.smol.xyz')
 	await first.text()
 
 	const stored = h.cache.entries()
@@ -1679,7 +1679,7 @@ test('47b B1: the shared GET /mixtapes edge copy never replays one origin\'s COR
 test('48b: a warm pre-deploy edge entry that still carries CORS/Vary headers is stripped on the HIT path', async () => {
 	const h = buildHarness()
 
-	const first = await h.send('/mixtapes', { origin: 'https://next.smol.xyz' })
+	const first = await h.send('/mixtapes', { origin: 'https://noot.smol.xyz' })
 	assert.equal(first.status, 200)
 	await first.text()
 
@@ -1687,7 +1687,7 @@ test('48b: a warm pre-deploy edge entry that still carries CORS/Vary headers is 
 	const stored = h.cache.entries()
 	assert.equal(stored.length, 1)
 	stored[0][1].headers.push(
-		['access-control-allow-origin', 'https://next.smol.xyz'],
+		['access-control-allow-origin', 'https://noot.smol.xyz'],
 		['access-control-allow-credentials', 'true'],
 		['access-control-expose-headers', 'X-Stale'],
 		['vary', 'Origin, X-Stale-Vary'],

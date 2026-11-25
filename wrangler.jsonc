@@ -122,7 +122,7 @@
         "BURST_LIMIT_PER_MINUTE": "5",
         "GLOBAL_DAILY_LIMIT_CLASSIC": "500",
         "GLOBAL_DAILY_LIMIT_ELEVENLABS": "20",
-        "PLAY_COUNT_MODE": "server",
+        "PLAY_COUNT_MODE": "beacon",
         "MIXTAPE_DEDUPE_AI_ENABLED": "true",
         "SEARCH_BACKFILL_CRON_ENABLED": "true",
         "SEARCH_BACKFILL_CRON_PAGE_LIMIT": "20",

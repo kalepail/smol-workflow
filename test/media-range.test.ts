@@ -140,7 +140,7 @@ test('HEAD, iOS bytes=0-1 probe, full matrix (cold + warm), 416 headers, If-Rang
 	// 1. Cold HEAD ignores Range, returns Content-Length + ETag, 0 R2 GETs, 0 plays, 0 D1 reads
 	const coldHead = await send('/song/track-abc.mp3', {
 		method: 'HEAD',
-		headers: { Range: 'bytes=0-10', Origin: 'https://next.smol.xyz' },
+		headers: { Range: 'bytes=0-10', Origin: 'https://noot.smol.xyz' },
 	})
 	assert.equal(coldHead.status, 200)
 	assert.equal(coldHead.headers.get('Content-Type'), 'audio/mpeg')
@@ -152,7 +152,7 @@ test('HEAD, iOS bytes=0-1 probe, full matrix (cold + warm), 416 headers, If-Rang
 	assert.equal(r2.stats.getCalls, 0, 'HEAD must not read R2 body')
 	assert.equal(harness.getPlayIncrements(), 0, 'HEAD must not increment Plays')
 	assert.equal(harness.getD1ReadCalls(), 0, 'Media requests must not perform D1 reads')
-	assert.equal(coldHead.headers.get('Access-Control-Allow-Origin'), 'https://next.smol.xyz')
+	assert.equal(coldHead.headers.get('Access-Control-Allow-Origin'), 'https://noot.smol.xyz')
 	const exposed = coldHead.headers.get('Access-Control-Expose-Headers') ?? ''
 	for (const hdr of ['Content-Range', 'Accept-Ranges', 'Content-Length', 'ETag']) {
 		assert.ok(exposed.includes(hdr), `Expected ${hdr} in Access-Control-Expose-Headers: ${exposed}`)
@@ -211,11 +211,11 @@ test('HEAD, iOS bytes=0-1 probe, full matrix (cold + warm), 416 headers, If-Rang
 	// 5. Warm path tests (ZERO new R2 ops, exact bytes, per-origin CORS applied after cache lookup)
 	const warmHead = await send('/song/track-abc.mp3', {
 		method: 'HEAD',
-		headers: { Origin: 'https://next.smol.xyz' },
+		headers: { Origin: 'https://noot.smol.xyz' },
 	})
 	assert.equal(warmHead.status, 200)
 	assert.equal(warmHead.headers.get('Content-Length'), '1024')
-	assert.equal(warmHead.headers.get('Access-Control-Allow-Origin'), 'https://next.smol.xyz')
+	assert.equal(warmHead.headers.get('Access-Control-Allow-Origin'), 'https://noot.smol.xyz')
 	assert.equal(harness.getPlayIncrements(), 1)
 
 	const warmProbe = await send('/song/track-abc.mp3', {

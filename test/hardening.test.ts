@@ -536,13 +536,14 @@ test('Item 4: exact-match CORS allowlist and gated localhost in CORS + passkey o
 	{
 		const { db, request } = createHarness()
 		try {
-			for (const allowed of ['https://smol.xyz', 'https://next.smol.xyz', 'https://noot.smol.xyz']) {
+			for (const allowed of ['https://smol.xyz', 'https://noot.smol.xyz']) {
 				const res = await request('/logout', { method: 'OPTIONS', headers: { Origin: allowed } })
 				assert.equal(res.headers.get('Access-Control-Allow-Origin'), allowed)
 				assert.equal(res.headers.get('Access-Control-Allow-Credentials'), 'true')
 			}
 
 			for (const blocked of [
+				'https://next.smol.xyz',
 				'https://evil.smol.xyz',
 				'https://app.smol.xyz',
 				'https://api.smol.xyz',
