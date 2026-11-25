@@ -121,7 +121,7 @@
         "DAILY_LIMIT_ELEVENLABS": "5",
         "BURST_LIMIT_PER_MINUTE": "5",
         "GLOBAL_DAILY_LIMIT_CLASSIC": "100",
-        "GLOBAL_DAILY_LIMIT_ELEVENLABS": "20",
+        "GLOBAL_DAILY_LIMIT_ELEVENLABS": "50",
         "PLAY_COUNT_MODE": "beacon",
         "MIXTAPE_DEDUPE_AI_ENABLED": "true",
         // Step 5 NSFW classifier: tuned "clef" (27B + cover PNG). "llama-guard" is the instant rollback.
@@ -135,7 +135,7 @@
    * Note: Use secrets to store sensitive data.
    * https://developers.cloudflare.com/workers/configuration/secrets/
    */
-    // Required Worker secrets: SECRET, SK, PIXELLAB_KEY, CF_API_TOKEN, CF_ZONE_ID, CF_AIG_TOKEN (optional: ADMIN_SECRET for admin routes, USER_QUOTA_OVERRIDES JSON map of address -> {classic?, elevenlabs?, burstPerMinute?}). CF_AI_GATEWAY_ID ("smol") is ElevenLabs-only (25 req/day); never route Workers AI through it.
+    // Required Worker secrets: SECRET, SK, PIXELLAB_KEY, CF_API_TOKEN, CF_ZONE_ID, CF_AIG_TOKEN (optional: ADMIN_SECRET for admin routes, USER_QUOTA_OVERRIDES JSON map of address -> {classic?, elevenlabs?, burstPerMinute?}). CF_AI_GATEWAY_ID ("smol") is ElevenLabs-only (60 req/day); never route Workers AI through it.
     /**
    * Static Assets
    * https://developers.cloudflare.com/workers/static-assets/binding/

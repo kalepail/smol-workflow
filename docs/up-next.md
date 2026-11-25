@@ -36,7 +36,7 @@ Durable implementation notes and remaining follow-ups for `smol-workflow`.
   - Pre-submit workflow step (`plan elevenlabs vocal pacing`) runs `@cf/zai-org/glm-5.3` (`reasoning_effort: "low"`) anchored on an L1-fitted empirical baseline (`12s/chunk + 2.5s/sungLine`), sizing each chunk strictly to perform its lyrics/style while ignoring arbitrary prompt runtime claims (e.g., `"9-minute suite"`).
   - Gracefully falls back to the pure empirical baseline on any AI error or malformed output; explicit `ELEVENLABS_MUSIC_LENGTH_MS` still works as an optional env override.
   - Also splits unheaded multi-stanza and `> 30`-line chunks (caught in 5/117 live Smols) so ElevenLabs never rejects valid songs with `422`.
-- Spend ceilings are live (closes 47a H3): `GLOBAL_DAILY_LIMIT_ELEVENLABS = 20` (~$30/day worst case), dedicated `SMOL` ElevenLabs key (`••••••087e`, 100k credits/refresh period, Auto Top Up Off), and Cloudflare AI Gateway `smol` at `25 req / 86400 s` sliding (ElevenLabs-only). See `docs/music-provider-economics.md` §1.
+- Spend ceilings are live (closes 47a H3): `GLOBAL_DAILY_LIMIT_ELEVENLABS = 50` (~$75/day worst case), dedicated `SMOL` ElevenLabs key (`••••••087e`, 100k credits/refresh period, Auto Top Up Off), and Cloudflare AI Gateway `smol` at `60 req / 86400 s` sliding (ElevenLabs-only). See `docs/music-provider-economics.md` §1.
 
 ---
 

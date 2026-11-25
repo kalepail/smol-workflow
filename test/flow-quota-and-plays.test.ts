@@ -154,7 +154,7 @@ function buildQuotaFlowHarness(options: {
 		BURST_LIMIT_PER_MINUTE: options.burstPerMinute ?? '0',
 		USER_QUOTA_OVERRIDES: options.userQuotaOverrides,
 		GLOBAL_DAILY_LIMIT_CLASSIC: options.globalClassic ?? '100',
-		GLOBAL_DAILY_LIMIT_ELEVENLABS: options.globalElevenLabs ?? '20',
+		GLOBAL_DAILY_LIMIT_ELEVENLABS: options.globalElevenLabs ?? '50',
 		PLAY_COUNT_MODE: options.playCountMode ?? 'server',
 		PLAY_BEACON_RATE_LIMIT_PER_MINUTE: options.playRateLimitPerMinute ?? '30',
 		PLAY_BEACON_COOLDOWN_SECONDS: options.playCooldownSeconds ?? '30',
@@ -261,7 +261,7 @@ function buildQuotaFlowHarness(options: {
 test('User quota overrides merge with defaults for the matching address', () => {
 	const { getGlobalQuotaLimits, getUserQuotaLimits } = quotaUtilsModule
 	assert.deepEqual(getUserQuotaLimits({} as Env, USER_A), { classic: 10, elevenlabs: 5 })
-	assert.deepEqual(getGlobalQuotaLimits({} as Env), { classic: 100, elevenlabs: 20 })
+	assert.deepEqual(getGlobalQuotaLimits({} as Env), { classic: 100, elevenlabs: 50 })
 
 	const env = {
 		DAILY_LIMIT_CLASSIC: '8',
