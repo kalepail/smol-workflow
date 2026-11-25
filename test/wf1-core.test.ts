@@ -451,7 +451,7 @@ test('platform: smol-sdk and dead helpers removed, Wrangler/compat bumped, kill 
 	assert.equal(pkg.dependencies.hono, '^4.13.21')
 	assert.equal(pkg.devDependencies.wrangler, '^4.167.0')
 	assert.equal(wrangler.compatibility_date, '2026-11-16')
-	assert.equal(wrangler.vars.MINT_SIGNING_ENABLED, 'false')
+	assert.equal(wrangler.vars.MINT_SIGNING_ENABLED, 'true')
 	assert.equal(wrangler.vars.PLAY_COUNT_MODE, 'beacon')
 	assert.equal(wrangler.r2_buckets[0].preview_bucket_name ?? wrangler.kv_namespaces[0].preview_id, undefined)
 	assert.equal(wrangler.queues.consumers.find((c: { queue: string }) => c.queue === 'smol-search-queue-dlq').max_retries, 3)

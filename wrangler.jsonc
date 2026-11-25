@@ -112,7 +112,7 @@
         "SMOL_CONTRACT_ID": "CBRNUVLGFM5OYWAGZVGU7CTMP2UJLKZCLFY2ANUCK5UGKND6BBAA5PLA",
         // Mint kill switch (closed by default). Only the exact string "true" admits mints and lets
         // TxWorkflow sign; "false" keeps POST /mint/status and receipt reconciliation running.
-        "MINT_SIGNING_ENABLED": "false",
+        "MINT_SIGNING_ENABLED": "true",
         "CF_AI_GATEWAY_ID": "smol",
         "CF_AIG_BYOK_ALIAS": "default",
         "ELEVENLABS_OUTPUT_FORMAT": "mp3_44100_128",
