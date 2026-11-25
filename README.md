@@ -5,12 +5,12 @@ Backend API and Cloudflare Workflows orchestration engine for [SMOL](https://smo
 ## Architecture
 
 ```
-smol-fe (smol.xyz / next.smol.xyz)  ──┐
+smol-fe (smol.xyz)                  ──┐
 smol-native-api (SONG_GENERATOR)    ──┼──► smol-workflow (Hono + Workflows + DO)
                                            ├─► Pixellab (64x64 pixel art)
-                                           ├─► Cloudflare Workers AI (moondream3.1, clef, gemma-4, bge-m3)
+                                           ├─► Cloudflare Workers AI (moondream3.1, deepseek-v4.1-flash, glm-5.3, clef, bge-m3)
                                            ├─► aisonggenerator-worker (HTTP Service Binding: lyrics + AISG v6 2-track music)
-                                           ├─► Cloudflare AI Gateway BYOK -> ElevenLabs Music v2.5 (1-track direct MP3 to R2)
+                                           ├─► Cloudflare AI Gateway BYOK (`smol`, ElevenLabs-only, 25 req/day) -> ElevenLabs Music v2.5
                                            ├─► kale-worker (RPC Service Binding: Stellar relay submitTransaction + mainnet chain reads)
                                            ├─► UserQuotaDO (generation quota + play-beacon gate shards)
                                            └─► D1 (smol-d1) · KV (SMOL_KV) · R2 (smol-r2) · Vectorize · Queues
@@ -36,6 +36,7 @@ src/
 ├── ai/
 │   ├── pixellab.ts          # Pixel art generation (pixflux, bounded body, fixed error copy)
 │   ├── cf.ts                # Image description (@cf/moondream/moondream3.1-9B-A2B)
+│   ├── song-intent.ts       # Prompt intent extraction (@cf/deepseek-ai/deepseek-v4.1-flash-1017 + det fallback)
 │   ├── nsfw.ts              # Fail-closed NSFW classification (@cf/cloudflare/clef 27B + cover PNG)
 │   ├── aisonggenerator.ts   # AISG v6 HTTP Service Binding client (lyrics, split tasks, songs)
 │   ├── elevenlabs.ts        # ElevenLabs Music v2.5 via Cloudflare AI Gateway BYOK -> R2
@@ -74,7 +75,7 @@ migrations/
 ## API Endpoints
 
 ### Auth
-- `POST /login` — Passkey registration (`create`) or authentication (`connect`) across `smol.xyz`, `next.smol.xyz`, `noot.smol.xyz` (plus local dev hosts when `ALLOW_LOCALHOST_ORIGINS=true`)
+- `POST /login` — Passkey registration (`create`) or authentication (`connect`) across `smol.xyz` and `noot.smol.xyz` (plus local dev hosts when `ALLOW_LOCALHOST_ORIGINS=true`)
 - `POST /logout` — Clear `smol_token` cookie
 
 ### Smols
@@ -119,14 +120,14 @@ migrations/
 - `USER_QUOTA_OVERRIDES` — Optional JSON object keyed by Stellar address. Each entry can set `classic`, `elevenlabs`, or `burstPerMinute` to a non-negative integer.
 
 ### Variables (`wrangler.jsonc` `vars`)
-- `CF_AI_GATEWAY_ID` — AI Gateway ID configured with ElevenLabs BYOK stored key (`smol`, `byok_only: true`)
+- `CF_AI_GATEWAY_ID` — AI Gateway ID configured with ElevenLabs BYOK stored key (`smol`, `byok_only: true`, `25 req / 86400 s` sliding). Dedicated to ElevenLabs only — never route Workers AI through `smol`.
 - `CF_AIG_BYOK_ALIAS` — BYOK key alias (default: `default`)
 - `ELEVENLABS_MUSIC_LENGTH_MS` — Optional track duration override in ms (`3000..600000`); omitted on instrumentals by default so ElevenLabs chooses length naturally
 - `ELEVENLABS_OUTPUT_FORMAT` — Audio format (default: `mp3_44100_128`)
 - `ELEVENLABS_FALLBACK_ENABLED` — Enable automatic AISG → ElevenLabs fallback (`true` / `false`)
 - `DAILY_LIMIT_CLASSIC` (10), `DAILY_LIMIT_ELEVENLABS` (5), `BURST_LIMIT_PER_MINUTE` (5) — Default per-user generation quotas
-- `GLOBAL_DAILY_LIMIT_CLASSIC` (100), `GLOBAL_DAILY_LIMIT_ELEVENLABS` (20) — Global generation ceilings per UTC day. The ElevenLabs cap bounds worst-case spend at ~$30/day while the global quota Durable Object responds. During quota RPC outages, the sum of active users' effective ElevenLabs limits bounds usage.
-- `PLAY_COUNT_MODE` — `server` (count on media GET, current) or `beacon` (count via `POST /plays/:musicId`); optional `PLAY_BEACON_COOLDOWN_SECONDS` (30), `PLAY_BEACON_RATE_LIMIT_PER_MINUTE` (30)
+- `GLOBAL_DAILY_LIMIT_CLASSIC` (100), `GLOBAL_DAILY_LIMIT_ELEVENLABS` (20) — Global generation ceilings per UTC day. The ElevenLabs cap bounds worst-case spend at ~$30/day while the global quota Durable Object responds; the dedicated ElevenLabs `SMOL` key (`100k` credits/refresh, Auto Top Up off) and `smol` gateway (`25 req/day`) enforce hard outer caps.
+- `PLAY_COUNT_MODE` — `beacon` (current live mode: count via `POST /plays/:musicId`) or `server` (count on media GET); optional `PLAY_BEACON_COOLDOWN_SECONDS` (30), `PLAY_BEACON_RATE_LIMIT_PER_MINUTE` (30)
 - `MIXTAPE_DEDUPE_AI_ENABLED` — Tier 2 clef-flash mixtape tie-breaker (enabled unless exactly `false`)
 - `RPC_URL`, `NETWORK_PASSPHRASE`, `SMOL_CONTRACT_ID` — Stellar mainnet RPC & contract config
 - `SEARCH_BACKFILL_CRON_*` — Search backfill cron controls (`ENABLED`, `PAGE_LIMIT`, `STALL_RUNS`, `MAX_WAVES`)

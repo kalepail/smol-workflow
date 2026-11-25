@@ -1,12 +1,12 @@
-# SMOL Up Next / Backlog
+# SMOL Up Next / Notes
 
-Durable research notes and upcoming work for `smol-workflow` and the `next.smol.xyz` → `smol.xyz` cutover.
+Durable implementation notes and remaining follow-ups for `smol-workflow`.
 
 ---
 
-## 1. NSFW / Content Safety Classifier: `llama-guard-3-8b` → tuned `@cf/cloudflare/clef` (Implemented)
+## 1. NSFW / Content Safety Classifier: Tuned `@cf/cloudflare/clef` (Live)
 
-**Status:** Implemented in `src/ai/nsfw.ts` (branch `feat/wf-nsfw-clef`); `NSFW_PROVIDER="clef"` in `wrangler.jsonc`. Rollback is one var: `NSFW_PROVIDER="llama-guard"` restores the legacy Guard call exactly (text-only, JSON-stringified lyrics).
+**Status:** Live on `api.smol.xyz` (`NSFW_PROVIDER="clef"` in `wrangler.jsonc`). Rollback is one var: `NSFW_PROVIDER="llama-guard"` restores the legacy Guard call exactly (text-only, JSON-stringified lyrics).
 
 ### What runs in Step 5
 - `@cf/cloudflare/clef` (27B, `model: "clef"`) with `state: { prompt, description, lyrics }` (raw lyrics; empty for instrumentals), the frozen 12-question `noul` rubric (`S1`–`S5`, `S7`–`S13`; pinned by `test/fixtures/nsfw-clef-questions.json`), and the cover as `images: [{ content_type: "image/png", base64 }]`.
@@ -36,13 +36,12 @@ Durable research notes and upcoming work for `smol-workflow` and the `next.smol.
   - Pre-submit workflow step (`plan elevenlabs vocal pacing`) runs `@cf/zai-org/glm-5.3` (`reasoning_effort: "low"`) anchored on an L1-fitted empirical baseline (`12s/chunk + 2.5s/sungLine`), sizing each chunk strictly to perform its lyrics/style while ignoring arbitrary prompt runtime claims (e.g., `"9-minute suite"`).
   - Gracefully falls back to the pure empirical baseline on any AI error or malformed output; explicit `ELEVENLABS_MUSIC_LENGTH_MS` still works as an optional env override.
   - Also splits unheaded multi-stanza and `> 30`-line chunks (caught in 5/117 live Smols) so ElevenLabs never rejects valid songs with `422`.
-- Monitor live ElevenLabs spend (`$0.15/min`) and listen to uncapped instrumental and vocal tracks. With tracks up to 600 s ($1.50 each) and `GLOBAL_DAILY_LIMIT_ELEVENLABS = 20`, worst-case spend is ~$30/day while the global quota Durable Object responds. During quota RPC outages, the sum of active users' effective ElevenLabs limits bounds usage, including any `USER_QUOTA_OVERRIDES` (`docs/music-provider-economics.md` §1). An AI Gateway spend limit and ElevenLabs usage alert are still open (audit 47a H3).
+- Spend ceilings are live (closes 47a H3): `GLOBAL_DAILY_LIMIT_ELEVENLABS = 20` (~$30/day worst case), dedicated `SMOL` ElevenLabs key (`••••••087e`, 100k credits/refresh period, Auto Top Up Off), and Cloudflare AI Gateway `smol` at `25 req / 86400 s` sliding (ElevenLabs-only). See `docs/music-provider-economics.md` §1.
 
 ---
 
-## 3. `next.smol.xyz` → `smol.xyz` (`main`) Cutover
+## 3. Open Low-Priority Follow-Ups (from 2026-11-25 Post-Audit Wave)
 
-> **Source of truth:** the step-by-step runbook (gates, `smol-fe` deploy, `noindex` checks, the `PLAY_COUNT_MODE='beacon'` flip, rollback) lives in `smol/orchestration/CUTOVER_CHECKLIST.md`, outside this repo. The notes below are background only; follow the checklist when cutting over.
-
-- **ElevenLabs automatic fallback:** Already enabled by default on `api.smol.xyz` (`ELEVENLABS_FALLBACK_ENABLED: "true"` in `wrangler.jsonc`), serving both `next.smol.xyz` and `smol.xyz`. Keep enabled through and after cutover to `main`.
-- **Frontend cutover checks:** Verify 1-track fallback notice (`"Made with ElevenLabs — Classic was unavailable."`), provider badges, and daily quota display carry cleanly when `smol-fe` `next` merges into `main`.
+- **Zero-sung-line ElevenLabs vocal (`NDM-2`):** Currently rejected pre-dispatch with full quota refund (0/73 corpus); optionally auto-route to `force_instrumental`.
+- **Classic instrumental Custom mode (`NDM-3`):** Classic instrumentals currently use AISG Easy mode (exclusions go as prose); consider Custom + `instrumental: true` only after listening A/B.
+- **Song-intent fallback watch (`NDM-5`):** Spot-check `{"event":"song_intent","source":"det"}` rate in Workers logs for DeepSeek timeouts/429s.

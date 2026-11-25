@@ -1,7 +1,7 @@
 # SMOL Music Provider Economics, Plan Sizing & XLM Pricing
 
-> **Snapshot date:** 2026-11-23 (length policy and spend ceiling updated 2026-11-24 for `37bd537`)
-> **Applies to:** `smol-workflow`, `aisonggenerator-worker`, and `smol-fe` (`next.smol.xyz`)
+> **Snapshot date:** 2026-11-23 (updated 2026-11-25 for `75d15c7` quotas, scoped `SMOL` ElevenLabs key, and 25/day gateway cap)
+> **Applies to:** `smol-workflow`, `aisonggenerator-worker`, and `smol-fe` (`smol.xyz`)
 > **Related docs:** [`docs/workflows-and-media.md`](./workflows-and-media.md), `aisonggenerator-worker/docs/aisg-api-notes.md`
 
 This document records the vendor pricing research, live SMOL production usage baseline, ElevenLabs plan sizing, and XLM per-song pricing math behind SMOL's dual-provider music architecture (**AISongGenerator `v6` primary + ElevenLabs `music_v2_5` UI toggle & automatic fallback**).
@@ -15,7 +15,10 @@ This document records the vendor pricing research, live SMOL production usage ba
 - **Active ElevenLabs Plan:** **Creator ($22 / mo, 147 min included + $0.15/min usage-based overages, commercial streaming rights)**. Fits SMOL's fallback role and normal baseline usage without overpaying for idle capacity.
 - **Settled Track Shape (Q5):** AISG `v6` generates **2 tracks** (`Song_1`, `Song_2`); ElevenLabs generates **1 track** (`Song_2 = NULL`).
 - **ElevenLabs track length (since `37bd537`):** there is **no fixed 2-minute default any more**. Instrumentals omit `music_length_ms`, so `music_v2_5` picks the length itself (anything from 3 s to 600 s). Vocal composition plans are paced per chunk by `@cf/zai-org/glm-5.3` and clamped to 3–120 s per chunk and **600 s total**. Typical output is still ~2–3 min, but the per-song cost is **not bounded below $1.50** (10 min × $0.15/min) unless `ELEVENLABS_MUSIC_LENGTH_MS` is set. The 2-min and 3-min figures below are typical-case estimates, not caps.
-- **Spend ceiling.** `GLOBAL_DAILY_LIMIT_ELEVENLABS = 20` paid generations per UTC day, with a per-user default of `DAILY_LIMIT_ELEVENLABS = 5`. Worst-case spend is **20 × $1.50 = ~$30/day (~$900 per 30-day month)** while the global quota Durable Object responds. At a typical 2–3 min per track, spend is ~$6–$9/day. Global quota RPC errors fail open (`src/utils/quota.ts`), so during an outage the sum of active users' effective ElevenLabs limits bounds usage, including any `USER_QUOTA_OVERRIDES`. No AI Gateway spend limit or ElevenLabs balance alert is recorded yet (audit 47a H3).
+- **Spend ceilings (live 2026-11-25):**
+  - **Classic (AISG):** `GLOBAL_DAILY_LIMIT_CLASSIC = 100` (400 credits/day max), per-user default `10/day`.
+  - **ElevenLabs:** `GLOBAL_DAILY_LIMIT_ELEVENLABS = 20` paid generations/UTC day (~$30/day worst case, ~$6–$9/day typical at 2–3 min), per-user default `5/day` (optional per-address `USER_QUOTA_OVERRIDES` Worker secret).
+  - **Outer hard caps (closes 47a H3):** dedicated least-privilege ElevenLabs key `SMOL` (`••••••087e`, Music Generation + User only, **100,000 credits / refresh period**, **Auto Top Up Off**) + Cloudflare AI Gateway `smol` edge cap at **`25 req / 86400 s` sliding** (ElevenLabs-only — do not route Workers AI through `smol`; AI Gateway `$` spend limits do not fire on ElevenLabs music because logs report `cost: 0` / `0` tokens).
 - **Recommended XLM Pricing (at $0.1325 / XLM):**
   - **AISongGenerator (`v6`, 2 tracks):** **2 XLM** (~$0.27)
   - **ElevenLabs (`music_v2_5`, 1 track × ~2 min typical):** **4 XLM** (~$0.53)
