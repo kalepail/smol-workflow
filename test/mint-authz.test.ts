@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
-import { Address, Asset, hash, Keypair, nativeToScVal, Networks, StrKey, xdr } from '@stellar/stellar-sdk/minimal'
+import { Address, Asset, hash, Keypair, nativeToScVal, Networks, StrKey, xdr } from '@stellar/stellar-sdk/base'
 import {
 	assertSignedMintEnvelope,
 	assertUnsignedMintEnvelope,

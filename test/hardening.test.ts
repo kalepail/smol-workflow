@@ -3,8 +3,7 @@ import { createHash, generateKeyPairSync } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 import test, { after, before } from 'node:test'
-import base64url from 'base64url'
-import { Address, hash, Keypair, Networks, StrKey, xdr } from '@stellar/stellar-sdk/minimal'
+import { Address, hash, Keypair, Networks, StrKey, xdr } from '@stellar/stellar-sdk/base'
 import { derivePasskeyKitContractId } from '../src/passkey'
 import { instanceKey, type LedgerPage } from '../src/utils/chain'
 import {
@@ -94,7 +93,7 @@ function buildRegistrationResponse(params: {
 		encodeCborText('authData'), encodeCborBytes(authData),
 	])
 
-	const challenge = base64url.encode(Buffer.from('stellaristhebetterblockchain'))
+	const challenge = Buffer.from('stellaristhebetterblockchain').toString('base64url')
 	const clientDataJSON = Buffer.from(JSON.stringify({
 		type: 'webauthn.create',
 		challenge,
@@ -102,14 +101,14 @@ function buildRegistrationResponse(params: {
 		crossOrigin: false,
 	}))
 
-	const id = params.responseIdOverride ?? base64url.encode(params.credentialId)
+	const id = params.responseIdOverride ?? params.credentialId.toString('base64url')
 	return {
 		id,
 		rawId: id,
 		type: 'public-key' as const,
 		response: {
-			clientDataJSON: base64url.encode(clientDataJSON),
-			attestationObject: base64url.encode(attestationObject),
+			clientDataJSON: clientDataJSON.toString('base64url'),
+			attestationObject: attestationObject.toString('base64url'),
 		},
 		clientExtensionResults: {},
 	}
@@ -181,7 +180,7 @@ function createHarness(envOverrides: Partial<Env> = {}) {
 
 test('P0-1: passkey-kit contractId derivation matches passkey-kit@0.12.0 formula exactly', () => {
 	const credentialId = Buffer.from('0123456789abcdef0123456789abcdef', 'hex')
-	const keyId = base64url.encode(credentialId)
+	const keyId = credentialId.toString('base64url')
 
 	// Independent recomputation of passkey-kit@0.12.0 kit.ts:51,86,597-610
 	const deployer = Keypair.fromRawEd25519Seed(hash(Buffer.from('kalepail'))).publicKey()
@@ -203,7 +202,7 @@ test('P0-1: passkey-kit contractId derivation matches passkey-kit@0.12.0 formula
 
 test('P0-1 & Item 2: POST /login type=create enforces derivation, undeployed on-chain state, fail-closed 503, unique Users.Address, no testnet, and Cache-Control: no-store', async () => {
 	const credentialId = Buffer.from('11223344556677889900aabbccddeeff', 'hex')
-	const keyId = base64url.encode(credentialId)
+	const keyId = credentialId.toString('base64url')
 	const derivedContractId = derivePasskeyKitContractId(credentialId)
 	const victimContractId = StrKey.encodeContract(Buffer.alloc(32, 42))
 	const origin = 'https://smol.xyz'
@@ -529,7 +528,7 @@ test('Item 3: dedicated ADMIN_SECRET fails closed with 404 when unset or equal t
 
 test('Item 4: exact-match CORS allowlist and gated localhost in CORS + passkey origin verification', async () => {
 	const credentialId = Buffer.from('aabbccddeeff00112233445566778899', 'hex')
-	const keyId = base64url.encode(credentialId)
+	const keyId = credentialId.toString('base64url')
 	const derivedContractId = derivePasskeyKitContractId(credentialId)
 
 	// 1. Production defaults (ALLOW_LOCALHOST_ORIGINS unset)

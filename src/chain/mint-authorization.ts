@@ -13,7 +13,7 @@
  *   4. `signValidatedMint`        signs only the single admin entry with `authorizeEntry`
  *   5. `assertSignedMintEnvelope` signed-output predicate (only admin signature + expiry changed)
  */
-import { Address, Asset, authorizeEntry, hash, Keypair, nativeToScVal, Networks, StrKey, xdr } from '@stellar/stellar-sdk/minimal'
+import { Address, Asset, authorizeEntry, hash, Keypair, nativeToScVal, Networks, StrKey, xdr } from '@stellar/stellar-sdk/base'
 import { isLedgerSequence, KALE_SAC, SMOL_FACTORY, SMOL_ISSUER } from '../utils/chain'
 import { smolSpec } from './smol-spec'
 import { bytesEqual, compareBytes } from '../utils/bytes'

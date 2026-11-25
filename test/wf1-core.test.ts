@@ -3,7 +3,7 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import test, { after, before } from 'node:test'
-import { StrKey } from '@stellar/stellar-sdk/minimal'
+import { StrKey } from '@stellar/stellar-sdk/base'
 import {
 	assertSignedMintEnvelope, assertUnsignedMintEnvelope, buildMintExpectation, decodeMintCarrier, signValidatedMint, type MintKind,
 } from '../src/chain/mint-authorization'

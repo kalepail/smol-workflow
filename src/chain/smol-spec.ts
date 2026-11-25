@@ -1,4 +1,4 @@
-import { Spec } from '@stellar/stellar-sdk/minimal/contract'
+import { Spec } from '@stellar/stellar-sdk/contract'
 
 /**
  * The eight `contractspecv0` entries of the deployed SMOL factory

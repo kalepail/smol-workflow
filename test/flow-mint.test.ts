@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test, { after, before } from 'node:test'
-import { nativeToScVal, Networks, xdr } from '@stellar/stellar-sdk/minimal'
+import { nativeToScVal, Networks, xdr } from '@stellar/stellar-sdk/base'
 import { deriveMintPair } from '../src/utils/chain'
 import { reserveMintPrefixes } from '../src/utils/mint-eligibility'
 import {

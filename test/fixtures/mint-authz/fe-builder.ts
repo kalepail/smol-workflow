@@ -15,8 +15,8 @@
  * The WebAuthn signature is a real P-256 signature over the real Soroban auth payload.
  */
 import { createHash, createPrivateKey, generateKeyPairSync, sign as nodeSign, type KeyObject } from 'node:crypto'
-import { Address, Asset, hash, nativeToScVal, SorobanDataBuilder, StrKey, xdr } from '@stellar/stellar-sdk/minimal'
-import { Client, Spec } from '@stellar/stellar-sdk/minimal/contract'
+import { Address, Asset, hash, nativeToScVal, SorobanDataBuilder, StrKey, xdr } from '@stellar/stellar-sdk/base'
+import { Client, Spec } from '@stellar/stellar-sdk/contract'
 import { SMOL_SPEC_ENTRIES } from '../../../src/chain/smol-spec'
 
 export interface FeIdentity {
@@ -151,7 +151,7 @@ function recordTrack(identity: FeIdentity, user: string, assetBytes: Buffer, sal
 	// Decode the posted asset bytes the way the host does (an XDR `Asset`).
 	const asset = Asset.fromOperation(xdr.Asset.fromXDR(assetBytes))
 	const sac = asset.contractId(identity.networkPassphrase)
-	const admin = asset.getIssuer()
+	const admin = asset.getIssuer()!
 	const pool = poolAddress(identity.factory, salt, identity.networkPassphrase)
 	const coin = 10_000_000_0000000n
 	const base = 100_0000000n

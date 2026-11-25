@@ -2,7 +2,7 @@ import { type Context, Hono, type Next } from 'hono'
 import { HTTPException } from 'hono/http-exception'
 import { sign } from 'hono/jwt'
 import { setCookie } from 'hono/cookie'
-import { StrKey } from '@stellar/stellar-sdk/minimal'
+import { StrKey } from '@stellar/stellar-sdk/base'
 import type { HonoEnv } from '../types'
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from '@simplewebauthn/server'
 import {

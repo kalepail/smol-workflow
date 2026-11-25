@@ -1,4 +1,4 @@
-import { Address, Asset, hash, Networks, StrKey, xdr } from '@stellar/stellar-sdk/minimal'
+import { Address, Asset, hash, Networks, StrKey, xdr } from '@stellar/stellar-sdk/base'
 
 export const KALE_SAC = 'CB23WRDQWGSP6YPMY4UV5C4OW5CBTXKYN3XEATG7KJEZCXMJBYEHOUOV'
 export const SMOL_FACTORY = 'CBRNUVLGFM5OYWAGZVGU7CTMP2UJLKZCLFY2ANUCK5UGKND6BBAA5PLA'

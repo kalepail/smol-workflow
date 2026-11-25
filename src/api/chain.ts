@@ -1,4 +1,4 @@
-import { StrKey } from '@stellar/stellar-sdk/minimal'
+import { StrKey } from '@stellar/stellar-sdk/base'
 import { Hono } from 'hono'
 import { HTTPException } from 'hono/http-exception'
 import { parseAuth } from '../middleware/auth'

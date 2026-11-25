@@ -1,5 +1,5 @@
-import { Keypair, Networks, scValToNative, xdr } from "@stellar/stellar-sdk/minimal";
-import { Server } from "@stellar/stellar-sdk/minimal/rpc";
+import { Keypair, Networks, scValToNative, xdr } from "@stellar/stellar-sdk/base";
+import { Server } from "@stellar/stellar-sdk/rpc";
 import { WorkflowEntrypoint, WorkflowEvent, WorkflowStep, WorkflowStepConfig } from "cloudflare:workers";
 import { NonRetryableError } from "cloudflare:workflows";
 import {

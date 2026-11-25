@@ -14,7 +14,7 @@
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { Address, hash, Keypair, Networks, scValToNative, StrKey, xdr } from '@stellar/stellar-sdk/minimal'
+import { Address, hash, Keypair, Networks, scValToNative, StrKey, xdr } from '@stellar/stellar-sdk/base'
 import { KALE_SAC, SMOL_FACTORY, SMOL_ISSUER, instanceKey } from '../../../src/utils/chain'
 import { buildFeCoinItCarrier, buildFeCoinThemCarrier, createPasskey, type FeIdentity } from './fe-builder'
 

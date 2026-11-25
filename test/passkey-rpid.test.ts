@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
 import { createHash, generateKeyPairSync, sign as cryptoSign } from 'node:crypto'
 import test from 'node:test'
-import base64url from 'base64url'
 import { verifyAuthenticationResponse } from '@simplewebauthn/server'
 import {
 	APPROVED_SMOL_RP_HOSTS,
+	isValidChallenge,
+	normalizeBase64UrlId,
 	resolvePasskeyVerificationTarget,
 	verifyRegistration,
 } from '../src/passkey'
@@ -79,14 +80,14 @@ function buildMockRegistrationResponse(params: {
 		crossOrigin: false,
 	}))
 
-	const id = base64url.encode(params.credentialId)
+	const id = params.credentialId.toString('base64url')
 	return {
 		id,
 		rawId: id,
 		type: 'public-key' as const,
 		response: {
-			clientDataJSON: base64url.encode(clientDataJSON),
-			attestationObject: base64url.encode(attestationObject),
+			clientDataJSON: clientDataJSON.toString('base64url'),
+			attestationObject: attestationObject.toString('base64url'),
 		},
 		clientExtensionResults: {},
 	}
@@ -114,19 +115,37 @@ function buildMockAuthenticationResponse(params: {
 	const signedPayload = Buffer.concat([authenticatorData, clientDataHash])
 	const signature = cryptoSign('sha256', signedPayload, params.privateKey)
 
-	const id = base64url.encode(params.credentialId)
+	const id = params.credentialId.toString('base64url')
 	return {
 		id,
 		rawId: id,
 		type: 'public-key' as const,
 		response: {
-			clientDataJSON: base64url.encode(clientDataJSON),
-			authenticatorData: base64url.encode(authenticatorData),
-			signature: base64url.encode(signature),
+			clientDataJSON: clientDataJSON.toString('base64url'),
+			authenticatorData: authenticatorData.toString('base64url'),
+			signature: signature.toString('base64url'),
 		},
 		clientExtensionResults: {},
 	}
 }
+
+test('native base64url: normalizeBase64UrlId and isValidChallenge stay strict and canonical', () => {
+	const bytes = Buffer.from('0123456789abcdef0123456789abcdef', 'hex')
+	const canonical = bytes.toString('base64url')
+	assert.deepEqual(normalizeBase64UrlId(canonical), { canonical, buffer: bytes })
+	assert.equal(normalizeBase64UrlId(`${canonical}==`)?.canonical, canonical, 'up to 2 trailing = are stripped')
+	for (const bad of [undefined, 42, '', '==', `${canonical}===`, 'ab+c', 'ab/c', 'ab c', 'abc=d', 'AB', 'A', 'Ab$c']) {
+		assert.equal(normalizeBase64UrlId(bad), null, `normalizeBase64UrlId(${JSON.stringify(bad)})`)
+	}
+
+	assert.equal(isValidChallenge(Buffer.from('stellaristhebetterblockchain').toString('base64url')), true, 'passkey-kit static challenge')
+	assert.equal(isValidChallenge(Buffer.alloc(32, 7).toString('base64url')), true, 'smart-account-kit random challenge')
+	assert.equal(isValidChallenge(Buffer.alloc(16, 1).toString('base64url')), true, '16 bytes is the minimum')
+	assert.equal(isValidChallenge(Buffer.alloc(15, 1).toString('base64url')), false, '15 bytes is too short')
+	for (const bad of ['', '!!!!!!!!!!!!!!!!!!!!!!!!!!!!', `${'A'.repeat(24)}$`, `${'A'.repeat(23)}+/`, `${'A'.repeat(22)}B`, 42, null]) {
+		assert.equal(isValidChallenge(bad), false, `isValidChallenge(${JSON.stringify(bad)})`)
+	}
+})
 
 test('resolvePasskeyVerificationTarget maps approved smol.xyz hosts and local dev origins accurately', () => {
 	assert.deepEqual(APPROVED_SMOL_RP_HOSTS, ['smol.xyz', 'noot.smol.xyz'])
@@ -188,7 +207,7 @@ test('verifyRegistration and WebAuthn authentication accept smol.xyz RP ID on no
 	const spkiDer = publicKey.export({ type: 'spki', format: 'der' }) as Buffer
 	const cosePublicKey = buildCosePublicKeyFromSpki(spkiDer)
 	const credentialId = Buffer.from('0123456789abcdef0123456789abcdef', 'hex')
-	const challenge = base64url.encode(Buffer.from('challenge-at-least-16-bytes-long'))
+	const challenge = Buffer.from('challenge-at-least-16-bytes-long').toString('base64url')
 
 	// 1. Fresh registration on https://noot.smol.xyz with shared RP ID 'smol.xyz' succeeds
 	const nootReg = buildMockRegistrationResponse({
@@ -235,7 +254,7 @@ test('verifyRegistration and WebAuthn authentication accept smol.xyz RP ID on no
 		expectedOrigin: target.expectedOrigin,
 		expectedRPID: target.expectedRPID,
 		credential: {
-			id: base64url.encode(credentialId),
+			id: credentialId.toString('base64url'),
 			publicKey: new Uint8Array(cosePublicKey),
 			counter: 0,
 		},

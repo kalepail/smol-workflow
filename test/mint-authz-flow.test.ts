@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import test, { after, before } from 'node:test'
-import { hash, Keypair, nativeToScVal, Networks, StrKey, xdr } from '@stellar/stellar-sdk/minimal'
+import { hash, Keypair, nativeToScVal, Networks, StrKey, xdr } from '@stellar/stellar-sdk/base'
 import {
 	assertSignedMintEnvelope,
 	assertUnsignedMintEnvelope,

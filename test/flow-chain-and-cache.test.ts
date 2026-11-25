@@ -3,7 +3,7 @@ import { createHash, generateKeyPairSync, sign } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { DatabaseSync } from 'node:sqlite'
 import test, { after, before } from 'node:test'
-import { Account, Address, Networks, Operation, StrKey, TransactionBuilder, nativeToScVal, xdr } from '@stellar/stellar-sdk/minimal'
+import { Account, Address, Networks, Operation, StrKey, TransactionBuilder, nativeToScVal, xdr } from '@stellar/stellar-sdk/base'
 import { balanceKey, contractDataKey, deriveMintPair, instanceKey, KALE_SAC, poolRecordsKey, storageKey, type LedgerPage } from '../src/utils/chain'
 import {
 	createAuthToken, createMockEdgeCache, createMockExecutionContext, createMockR2Bucket,

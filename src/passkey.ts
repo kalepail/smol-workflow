@@ -1,7 +1,6 @@
 import { verifyRegistrationResponse, verifyAuthenticationResponse, AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server"
-import { Address, hash, Keypair, Networks, StrKey, xdr } from "@stellar/stellar-sdk/minimal";
-import { Server } from "@stellar/stellar-sdk/minimal/rpc";
-import base64url from "base64url";
+import { Address, hash, Keypair, Networks, StrKey, xdr } from "@stellar/stellar-sdk/base";
+import { Server } from "@stellar/stellar-sdk/rpc";
 import { HTTPException } from "hono/http-exception";
 import { contractDataKey, decodeLedgerPage, instanceKey, LEDGER_KEY_LIMIT, storageKey, type MainnetChainReads } from "./utils/chain";
 import { bytesEqual } from "./utils/bytes";
@@ -46,8 +45,8 @@ export function normalizeBase64UrlId(value: unknown): { canonical: string; buffe
     if (!stripped || value.length - stripped.length > 2 || !/^[A-Za-z0-9_-]+$/.test(stripped)) {
         return null;
     }
-    const buffer = base64url.toBuffer(stripped);
-    if (buffer.length === 0 || base64url.encode(buffer) !== stripped) {
+    const buffer = Buffer.from(stripped, 'base64url');
+    if (buffer.length === 0 || buffer.toString('base64url') !== stripped) {
         return null;
     }
     return { canonical: stripped, buffer };
@@ -59,7 +58,7 @@ export function normalizeBase64UrlId(value: unknown): { canonical: string; buffe
  */
 export function derivePasskeyKitContractId(keyId: string | Buffer): string {
     const keyIdBuffer = typeof keyId === 'string'
-        ? (normalizeBase64UrlId(keyId)?.buffer ?? base64url.toBuffer(keyId))
+        ? (normalizeBase64UrlId(keyId)?.buffer ?? Buffer.from(keyId, 'base64url'))
         : keyId;
     const preimage = xdr.HashIdPreimage.envelopeTypeContractId(
         new xdr.HashIdPreimageContractId({
@@ -154,15 +153,11 @@ export function resolvePasskeyVerificationTarget(
     throw new HTTPException(400, { message: 'Passkey origin does not match this domain' });
 }
 
-// Validate challenge: accept any valid base64url challenge >= 16 bytes
-// Works for both passkey-kit (static) and smart-account-kit (random) flows
-function isValidChallenge(challenge: string): boolean {
-    try {
-        const decoded = base64url.toBuffer(challenge);
-        return decoded.length >= 16;
-    } catch {
-        return false;
-    }
+// Validate challenge: accept any canonical base64url challenge that decodes to >= 16 bytes.
+// Works for both passkey-kit (static) and smart-account-kit (random) flows; rejects garbage.
+export function isValidChallenge(challenge: unknown): boolean {
+    const decoded = normalizeBase64UrlId(challenge);
+    return decoded !== null && decoded.buffer.length >= 16;
 }
 
 export async function verifyRegistration(
@@ -268,7 +263,7 @@ function getSignerReader(rpcUrl: string, binding?: MainnetChainReads): SignerRea
 }
 
 async function getPublicKeyFromPasskeyKit(read: SignerReader, contractId: string, keyId: string): Promise<Buffer> {
-    const key = contractDataKey(contractId, storageKey('Secp256r1', xdr.ScVal.scvBytes(base64url.toBuffer(keyId))));
+    const key = contractDataKey(contractId, storageKey('Secp256r1', xdr.ScVal.scvBytes(Buffer.from(keyId, 'base64url'))));
     const { values } = await read([key]);
     const signer = values.get(key.toXDR('base64'))?.vec()?.[1];
     if (!signer || signer.switch().name !== 'scvBytes') throw new Error('Passkey signer unavailable');
@@ -279,7 +274,7 @@ async function getPublicKeyFromPasskeyKit(read: SignerReader, contractId: string
 async function getPublicKeyFromSmartAccountKit(
     read: SignerReader, contractId: string, keyId: string, batchRules: boolean,
 ): Promise<Buffer> {
-    const credential = base64url.toBuffer(keyId);
+    const credential = Buffer.from(keyId, 'base64url');
     const idsKey = contractDataKey(contractId, storageKey('Ids', storageKey('Default')));
     const { ledger, values } = await read([idsKey]);
     const ids = values.get(idsKey.toXDR('base64'))?.vec();

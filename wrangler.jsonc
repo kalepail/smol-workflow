@@ -7,7 +7,7 @@
     "name": "smol-workflow",
     "main": "src/index.ts",
     "compatibility_date": "2026-11-16",
-    "minify": false,
+    "minify": true,
     "workers_dev": false,
     "routes": [
         {
