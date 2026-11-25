@@ -1,23 +1,18 @@
 import { Hono, type Context } from 'hono'
 import { isWorkflowAlreadyExistsError, isWorkflowNotFoundError } from '../utils/workflow-errors'
 import { HTTPException } from 'hono/http-exception'
-import { cache } from 'hono/cache'
 import type { HonoEnv } from '../types'
 import { parseAuth, optionalAuth, requireAdmin } from '../middleware/auth'
-import {
-	parsePaginationParams,
-	buildCursorWhereClause,
-	buildPaginationResponse,
-} from '../utils/pagination'
-import {
-	purgeCacheByTags,
-	userCacheKeyGenerator,
-} from '../utils/cache'
-import { artistSmolsCacheTag } from '../utils/cache-tags'
+import { parsePaginationParams, buildCursorWhereClause, paginate } from '../utils/pagination'
+import { purgeCacheByTags } from '../utils/cache'
+import { artistSmolsCacheTag, playlistCacheTags } from '../utils/cache-tags'
+import { privateNoStore, readJsonBody, runBackground } from '../utils/http'
+import { publicCache } from '../utils/public-cache'
+import { assertNoUnresolvedMintReceipt, MintIneligible } from '../utils/mint-eligibility'
 import { isDurableObjectId } from '../utils/durable-object-id'
 import { queueSearchDeletionById } from '../utils/search'
 import { requireOwnedVisibilityToggle, syncSearchVisibilityAfterToggle } from '../utils/search-visibility'
-import { isNsfwBlocked } from '../ai/nsfw'
+import { isNsfwBlocked, normalizeNsfwResult } from '../ai/nsfw'
 import { isContentPolicyMessage } from '../ai/aisonggenerator'
 import {
 	classifyRetryAdmission,
@@ -90,54 +85,55 @@ function sanitizeWorkflowStatusForDetail(wfStatus: InstanceStatus | null | undef
 	}
 }
 
-function runBackground(c: Context<HonoEnv>, task: Promise<unknown>): void {
-	const safeTask = task.catch((err) => {
-		console.warn('Background task failed:', err)
-	})
-	try {
-		c.executionCtx.waitUntil(safeTask)
-	} catch {
-		void safeTask
+// GET /:id exposes an allowlist of workflow state: what smol-fe renders, never vendor internals
+// (provider task/workspace IDs, raw upstream errors, credits, base64 images, quota/retry plumbing).
+const PAYLOAD_FIELDS = ['address', 'prompt', 'instrumental', 'public', 'playlist', 'provider']
+const LYRICS_FIELDS = ['title', 'style', 'lyrics']
+const SONG_FIELDS = ['music_id', 'status', 'audio', 'duration', 'service', 'provider']
+const PROVIDER_FIELDS = ['requested_provider', 'active_provider', 'actual_provider', 'fallback_from']
+const NSFW_CODE = /^S(?:[1-9]|1[0-4])$/
+const REASON_CODE = /^[a-z0-9_]{1,64}$/
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function pickFields(source: unknown, keys: readonly string[]): Record<string, unknown> {
+	const picked: Record<string, unknown> = {}
+	if (!isRecord(source)) return picked
+	for (const key of keys) {
+		if (source[key] !== undefined) picked[key] = source[key]
 	}
+	return picked
+}
+
+/** Provider names plus a fallback reason only when it is a plain code (never upstream text). */
+function pickProviderFields(source: unknown): Record<string, unknown> {
+	const picked = pickFields(source, PROVIDER_FIELDS)
+	const reason = isRecord(source) ? source.fallback_reason : undefined
+	if (typeof reason === 'string' && REASON_CODE.test(reason)) picked.fallback_reason = reason
+	return picked
+}
+
+/** Llama Guard verdict with only the S1-S14 category codes (no diagnostic words). */
+function sanitizeNsfw(raw: unknown) {
+	const { safe, categories, unknown } = normalizeNsfwResult(raw)
+	return { safe, categories: categories.filter((code) => NSFW_CODE.test(code)), ...(unknown ? { unknown } : {}) }
 }
 
 function sanitizeKvDoForDetail(raw: Record<string, any> | null | undefined, failure?: SmolFailure) {
-	const {
-		image_base64,
-		search: _search,
-		songs,
-		provider_attempt: _providerAttempt,
-		retry_successor_id: _retrySuccessorId,
-		retry_reservation: _retryReservation,
-		retry_chain_root_id: _retryChainRootId,
-		retry_source_id: _retrySourceId,
-		retry_seed_pending: _retrySeedPending,
-		retry_override_provider: _retryOverrideProvider,
-		workflow_executed: _workflowExecuted,
-		quota_reservation_id: _quotaReservationId,
-		quota_day_key: _quotaDayKey,
-		quota_needs_reservation: _quotaNeedsReservation,
-		quota_provider: _quotaProvider,
-		quota_reuse_only: _quotaReuseOnly,
-		original_fingerprints: _originalFingerprints,
-		last_known_urls: _lastKnownUrls,
-		fingerprint_attempts: _fingerprintAttempts,
-		streaming_fingerprints: _streamingFingerprints,
-		...rest
-	} = raw || {}
-
-	const sanitizedSongs = Array.isArray(songs)
-		? songs.map((song: unknown) => {
-			if (!song || typeof song !== 'object') return song
-			const { error_message: _errorMessage, ...safeSong } = song as Record<string, unknown>
-			return safeSong
-		})
-		: songs
-
+	const steps: Record<string, any> = raw ?? {}
 	return {
-		...rest,
-		...(songs !== undefined ? { songs: sanitizedSongs } : {}),
-		image: Boolean(image_base64 || rest.image),
+		...pickFields(steps, ['description', 'duration']),
+		...pickProviderFields(steps),
+		...(isRecord(steps.payload) ? { payload: pickFields(steps.payload, PAYLOAD_FIELDS) } : {}),
+		...(isRecord(steps.generation_meta) ? { generation_meta: pickProviderFields(steps.generation_meta) } : {}),
+		...(isRecord(steps.lyrics) ? { lyrics: pickFields(steps.lyrics, LYRICS_FIELDS) } : {}),
+		...(steps.nsfw != null ? { nsfw: sanitizeNsfw(steps.nsfw) } : {}),
+		...(Array.isArray(steps.songs)
+			? { songs: steps.songs.filter(isRecord).map((song) => pickFields(song, SONG_FIELDS)) }
+			: {}),
+		image: Boolean(steps.image_base64 || steps.image),
 		...(failure ? { failure } : {}),
 	}
 }
@@ -349,150 +345,38 @@ async function checkSongReferenceStatus(env: Env, musicId: string): Promise<'ref
 	}
 }
 
+/** One `LIMIT + 1` page of smol list items from `from` (aliased `s`), newest first. */
+async function listSmols(c: Context<HonoEnv>, from: string, conditions: string, bindings: unknown[]) {
+	const { limit, cursor } = parsePaginationParams(new URL(c.req.url))
+	const [where, ...cursorBindings] = buildCursorWhereClause(cursor, conditions, 's.')
+	const { results } = await c.env.SMOL_D1.prepare(`
+		SELECT s.Id, s.Title, s.Song_1, s.Mint_Token, s.Mint_Amm, s.Created_At, s.Public
+		FROM ${from}
+		WHERE ${where}
+		ORDER BY s.Created_At DESC, s.Id DESC
+		LIMIT ?
+	`).bind(...bindings, ...cursorBindings, limit + 1).all<SmolListItem>()
+	const { items, pagination } = paginate(results, limit)
+	return { smols: items, pagination }
+}
+
 // Get all public smols
-smols.get(
-	'/',
-	cache({
-		cacheName: 'smol-workflow',
-		cacheControl: 'public, max-age=30, stale-while-revalidate=60',
-	}),
-	async (c) => {
-		const { env, req } = c
-		const { limit, cursor } = parsePaginationParams(new URL(req.url))
+smols.get('/', publicCache, async (c) => {
+	const response = c.json(await listSmols(c, 'Smols s', 's.Public = 1', []))
+	response.headers.append('Cache-Tag', 'public-smols')
+	return response
+})
 
-		const whereClause = buildCursorWhereClause(cursor, 'Public = 1')
-		const bindings: any[] = whereClause.length > 1
-			? [whereClause[1], whereClause[2], whereClause[3], limit]
-			: [limit]
+// Get smols created by authenticated user (never shared-cached)
+smols.get('/created', privateNoStore, parseAuth, async (c) => {
+	return c.json(await listSmols(c, 'Smols s', 's."Address" = ?', [c.get('jwtPayload')!.sub]))
+})
 
-		const query = `
-			SELECT Id, Title, Song_1, Mint_Token, Mint_Amm, Created_At, Public
-			FROM Smols
-			WHERE ${whereClause[0]}
-			ORDER BY Created_At DESC, Id DESC
-			LIMIT ?
-		`
-
-		const { results } = await env.SMOL_D1.prepare(query)
-			.bind(...bindings)
-			.all<SmolListItem>()
-
-		const pagination = buildPaginationResponse(
-			results,
-			limit,
-			(item) => item.Created_At,
-			(item) => item.Id
-		)
-
-		const response = c.json({
-			smols: results,
-			pagination,
-		})
-
-		response.headers.append('Cache-Tag', 'public-smols')
-
-		return response
-	}
-)
-
-// Get smols created by authenticated user
-smols.get(
-	'/created',
-	parseAuth,
-	cache({
-		cacheName: 'smol-workflow',
-		cacheControl: 'private, max-age=30',
-		keyGenerator: userCacheKeyGenerator,
-	}),
-	async (c) => {
-		const { env, req } = c
-		const payload = c.get('jwtPayload')!
-		const { limit, cursor } = parsePaginationParams(new URL(req.url))
-
-		const whereClause = buildCursorWhereClause(cursor, '"Address" = ?')
-		const bindings: any[] = whereClause.length > 1
-			? [payload.sub, whereClause[1], whereClause[2], whereClause[3], limit]
-			: [payload.sub, limit]
-
-		const query = `
-			SELECT Id, Title, Song_1, Mint_Token, Mint_Amm, Created_At, Public
-			FROM Smols
-			WHERE ${whereClause[0]}
-			ORDER BY Created_At DESC, Id DESC
-			LIMIT ?
-		`
-
-		const { results } = await env.SMOL_D1.prepare(query)
-			.bind(...bindings)
-			.all<SmolListItem>()
-
-		const pagination = buildPaginationResponse(
-			results,
-			limit,
-			(item) => item.Created_At,
-			(item) => item.Id
-		)
-
-		const response = c.json({
-			smols: results,
-			pagination,
-		})
-
-		response.headers.append('Cache-Tag', `user:${payload.sub}:created`)
-
-		return response
-	}
-)
-
-// Get smols liked by authenticated user
-smols.get(
-	'/liked',
-	parseAuth,
-	cache({
-		cacheName: 'smol-workflow',
-		cacheControl: 'private, max-age=30',
-		keyGenerator: userCacheKeyGenerator,
-	}),
-	async (c) => {
-		const { env, req } = c
-		const payload = c.get('jwtPayload')!
-		const { limit, cursor } = parsePaginationParams(new URL(req.url))
-
-		const whereClause = buildCursorWhereClause(cursor, 'l."Address" = ?', 's.')
-		const bindings: any[] = whereClause.length > 1
-			? [payload.sub, whereClause[1], whereClause[2], whereClause[3], limit]
-			: [payload.sub, limit]
-
-		const query = `
-			SELECT s.Id, s.Title, s.Song_1, s.Mint_Token, s.Mint_Amm, s.Created_At, s.Public
-			FROM Smols s
-			INNER JOIN Likes l ON s.Id = l.Id
-			WHERE ${whereClause[0]}
-			ORDER BY s.Created_At DESC, s.Id DESC
-			LIMIT ?
-		`
-
-		const { results } = await env.SMOL_D1.prepare(query)
-			.bind(...bindings)
-			.all<SmolListItem>()
-
-		const pagination = buildPaginationResponse(
-			results,
-			limit,
-			(item) => item.Created_At,
-			(item) => item.Id
-		)
-
-		const response = c.json({
-			smols: results,
-			pagination,
-		})
-
-		response.headers.append('Cache-Tag', `user:${payload.sub}:liked`)
-
-		return response
-	}
-)
+// Get smols liked by authenticated user (never shared-cached)
+smols.get('/liked', privateNoStore, parseAuth, async (c) => {
+	const from = 'Smols s INNER JOIN Likes l ON s.Id = l.Id'
+	return c.json(await listSmols(c, from, 'l."Address" = ?', [c.get('jwtPayload')!.sub]))
+})
 
 // Get specific smol by ID
 smols.get(
@@ -1606,7 +1490,7 @@ smols.put('/:id', parseAuth, async (c) => {
 	if (targetPublic === 0 && visibleUpdate.Public === 1 && updated && isMintedSmolRecord(updated)) {
 		throw new HTTPException(409, { message: 'Minted songs must remain public' })
 	}
-	const playlistTitles = await getPlaylistTitlesForSmol(env, id)
+	const playlistTags = await playlistCacheTags(await getPlaylistTitlesForSmol(env, id))
 
 	runBackground(
 		c,
@@ -1631,7 +1515,7 @@ smols.put('/:id', parseAuth, async (c) => {
 			`user:${payload.sub}:smol:${id}`,
 			`smol:${id}:anonymous`,
 			`smol:${id}:media`,
-			...playlistTitles.map((title) => `playlist:${title}`),
+			...playlistTags,
 		])
 	)
 
@@ -1666,7 +1550,7 @@ smols.put('/:smol_id/:song_id', parseAuth, async (c) => {
 		throw new HTTPException(404, { message: 'No record found or no update needed' })
 	}
 
-	const playlistTitles = await getPlaylistTitlesForSmol(env, smol_id)
+	const playlistTags = await playlistCacheTags(await getPlaylistTitlesForSmol(env, smol_id))
 
 	runBackground(
 		c,
@@ -1677,214 +1561,153 @@ smols.put('/:smol_id/:song_id', parseAuth, async (c) => {
 			artistSmolsCacheTag(payload.sub),
 			`user:${payload.sub}:created`,
 			'mixtapes',
-			...playlistTitles.map((title) => `playlist:${title}`),
+			...playlistTags,
 		])
 	)
 
 	return c.body(null, 204)
 })
 
-// Admin bulk delete (gated behind dedicated ADMIN_SECRET, skips minted/public)
-smols.delete('/admin/bulk', requireAdmin, async (c) => {
-	const { env } = c
-	const { ids, allowPublic }: { ids: string[]; allowPublic?: boolean } = await c.req.json()
+interface DeletableSmol {
+	Id: string
+	Address: string
+	Public: number
+	Song_1: string | null
+	Song_2: string | null
+	Mint_Token: string | null
+	Mint_Amm: string | null
+}
 
-	if (!Array.isArray(ids) || ids.length === 0) {
-		throw new HTTPException(400, { message: 'Missing ids array' })
+function readDeletableSmol(env: Env, id: string): Promise<DeletableSmol | null> {
+	return env.SMOL_D1.prepare(`
+		SELECT Id, "Address", Public, Song_1, Song_2, Mint_Token, Mint_Amm FROM Smols WHERE Id = ?1
+	`).bind(id).first<DeletableSmol>()
+}
+
+/** 409 while an unresolved mint receipt covers the song (or its asset prefix); 503 if unreadable. */
+async function assertNotMinting(env: Env, id: string): Promise<void> {
+	try {
+		await assertNoUnresolvedMintReceipt(env, [id])
+	} catch (error) {
+		if (error instanceof MintIneligible) throw new HTTPException(409, { message: 'Smol has a mint in progress' })
+		throw new HTTPException(503, { message: 'Unable to verify mint status; please retry shortly' })
+	}
+}
+
+/**
+ * Deletes the smol's Likes, Playlists and Smols rows in ONE D1 batch, guarded on the row still being
+ * unminted (plus `extraGuard`). Likes and Playlists are deleted only while the same guard holds, so a
+ * mint (or ownership/visibility change) racing the request deletes nothing. Returns the cache tags to
+ * purge, or null when the guard failed. Storage cleanup afterwards is best-effort.
+ */
+async function deleteSmolGuarded(env: Env, smol: DeletableSmol, extraGuard = '', extraBindings: unknown[] = []) {
+	// An admitted mint's receipt (song id or 12-hex prefix) blocks the delete in the same atomic batch. The
+	// signer re-checks every target row after recording `submitting`, so whichever commits first wins.
+	const guard = `Id = ?1 AND Mint_Token IS NULL AND Mint_Amm IS NULL${extraGuard} AND NOT EXISTS (SELECT 1 FROM MintBatchStatus
+		WHERE Phase IN ('existing', 'queued', 'submitting', 'submitted', 'confirmed') AND instr(Ids, '"' || substr(?1, 1, 12)) > 0)`
+	const statement = (sql: string) => env.SMOL_D1.prepare(sql).bind(smol.Id, ...extraBindings)
+	const [likes, playlistTags, steps] = await Promise.all([
+		env.SMOL_D1.prepare(`SELECT "Address" as Address FROM Likes WHERE Id = ?1`).bind(smol.Id).all<{ Address: string }>(),
+		getPlaylistTitlesForSmol(env, smol.Id).then(playlistCacheTags),
+		env.SMOL_KV.get<WorkflowSteps>(smol.Id, 'json').catch(() => null),
+	])
+	const results = await env.SMOL_D1.batch([
+		statement(`DELETE FROM Likes WHERE Id = ?1 AND EXISTS (SELECT 1 FROM Smols WHERE ${guard})`),
+		statement(`DELETE FROM Playlists WHERE Id = ?1 AND EXISTS (SELECT 1 FROM Smols WHERE ${guard})`),
+		statement(`DELETE FROM Smols WHERE ${guard}`),
+	])
+	if (results[2].meta.changes === 0) return null
+
+	const musicIds = [...new Set([smol.Song_1, smol.Song_2, ...(steps?.songs ?? []).map((song) => song?.music_id)]
+		.filter((musicId): musicId is string => typeof musicId === 'string' && musicId.length > 0))]
+	const cleanup = await Promise.allSettled([
+		(async () => {
+			if (isDurableObjectId(smol.Id)) await env.DURABLE_OBJECT.get(env.DURABLE_OBJECT.idFromString(smol.Id)).setToFlush()
+		})(),
+		env.SMOL_KV.delete(smol.Id),
+		env.SMOL_BUCKET.delete(`${smol.Id}.png`),
+		queueSearchDeletionById(env, smol.Id),
+		// A retry or swap can share an MP3: delete it only once no remaining Smols row references it.
+		...musicIds.map(async (musicId) => {
+			if (await checkSongReferenceStatus(env, musicId) === 'unreferenced') await env.SMOL_BUCKET.delete(`${musicId}.mp3`)
+		}),
+	])
+	for (const outcome of cleanup) {
+		if (outcome.status === 'rejected') console.warn('Smol deletion cleanup failed:', smol.Id, outcome.reason)
 	}
 
+	return [
+		artistSmolsCacheTag(smol.Address),
+		'public-smols',
+		'mixtapes',
+		`user:${smol.Address}:created`,
+		`user:${smol.Address}:smol:${smol.Id}`,
+		`smol:${smol.Id}:anonymous`,
+		`smol:${smol.Id}:media`,
+		...musicIds.map((musicId) => `song:${musicId}:media`),
+		...playlistTags,
+		...likes.results.flatMap(({ Address }) => [`user:${Address}:liked`, `user:${Address}:likes`]),
+	]
+}
+
+// Admin bulk delete (gated behind dedicated ADMIN_SECRET; skips minted, minting and, unless allowPublic, public)
+smols.delete('/admin/bulk', requireAdmin, async (c) => {
+	const { env } = c
+	const body = await readJsonBody(c)
+	const { ids } = body
+	const allowPublic = Boolean(body.allowPublic)
+	if (!Array.isArray(ids) || ids.length === 0 || !ids.every((id) => typeof id === 'string')) {
+		throw new HTTPException(400, { message: 'Missing ids array' })
+	}
 	if (ids.length > 100) {
 		throw new HTTPException(400, { message: 'Max 100 ids per request' })
 	}
 
 	let deleted = 0
-	const skipped: string[] = []
-	const allPurgeTags = new Set<string>()
-
-	for (const id of ids) {
-		const smol = await env.SMOL_D1.prepare(
-			`SELECT Id, Mint_Token, Public, Address, Song_1, Song_2 FROM Smols WHERE Id = ?1`
-		)
-			.bind(id)
-			.first<{
-				Id: string
-				Mint_Token: string | null
-				Public: number
-				Address: string
-				Song_1?: string
-				Song_2?: string | null
-			}>()
-
-		if (!smol) {
-			skipped.push(id)
-			continue
-		}
-
-		if (smol.Mint_Token) {
-			skipped.push(id)
-			continue
-		}
-
-		if (smol.Public && !allowPublic) {
-			skipped.push(id)
-			continue
-		}
-
-		const likeRows = await env.SMOL_D1.prepare(`SELECT "Address" as Address FROM Likes WHERE Id = ?1`)
-			.bind(id)
-			.all<{ Address: string }>()
-		const playlistTitles = await getPlaylistTitlesForSmol(env, id)
-		const smolKv: any = await env.SMOL_KV.get(id, 'json')
-
-		await env.SMOL_D1.prepare(`DELETE FROM Likes WHERE Id = ?1`).bind(id).run()
-		await env.SMOL_D1.prepare(`DELETE FROM Playlists WHERE Id = ?1`).bind(id).run()
-		await env.SMOL_D1.prepare(`DELETE FROM Smols WHERE Id = ?1`).bind(id).run()
-
+	const purgeTags = new Set<string>()
+	for (const id of new Set<string>(ids)) {
+		const smol = await readDeletableSmol(env, id)
+		if (!smol || smol.Mint_Token != null || smol.Mint_Amm != null || (smol.Public && !allowPublic)) continue
 		try {
-			if (isDurableObjectId(id)) {
-				const doid = env.DURABLE_OBJECT.idFromString(id)
-				const stub = env.DURABLE_OBJECT.get(doid)
-				await stub.setToFlush()
-			}
-		} catch {}
-
-		await env.SMOL_KV.delete(id)
-		await env.SMOL_BUCKET.delete(`${id}.png`)
-
-		const candidateMusicIds = new Set<string>()
-		if (smol.Song_1) candidateMusicIds.add(smol.Song_1)
-		if (smol.Song_2) candidateMusicIds.add(smol.Song_2)
-		if (Array.isArray(smolKv?.songs)) {
-			for (const song of smolKv.songs) {
-				if (song?.music_id) candidateMusicIds.add(String(song.music_id))
-			}
+			await assertNotMinting(env, id)
+		} catch (error) {
+			if (error instanceof HTTPException && error.status === 409) continue
+			throw error
 		}
-
-		for (const musicId of candidateMusicIds) {
-			allPurgeTags.add(`song:${musicId}:media`)
-			// Fail closed: delete MP3 ONLY when confirmed unreferenced (never on lookup error)
-			if (await checkSongReferenceStatus(env, musicId) === 'unreferenced') {
-				await env.SMOL_BUCKET.delete(`${musicId}.mp3`)
-			}
-		}
-
-		runBackground(c, queueSearchDeletionById(env, id))
-
-		allPurgeTags.add(artistSmolsCacheTag(smol.Address))
-		allPurgeTags.add('public-smols')
-		allPurgeTags.add('mixtapes')
-		allPurgeTags.add(`user:${smol.Address}:created`)
-		allPurgeTags.add(`user:${smol.Address}:smol:${id}`)
-		allPurgeTags.add(`smol:${id}:anonymous`)
-		allPurgeTags.add(`smol:${id}:media`)
-		for (const title of playlistTitles) {
-			allPurgeTags.add(`playlist:${title}`)
-		}
-		for (const like of likeRows.results || []) {
-			allPurgeTags.add(`user:${like.Address}:liked`)
-			allPurgeTags.add(`user:${like.Address}:likes`)
-		}
-
-		deleted++
+		const tags = await deleteSmolGuarded(env, smol, allowPublic ? '' : ' AND Public = 0')
+		if (!tags) continue
+		for (const tag of tags) purgeTags.add(tag)
+		deleted += 1
 	}
 
-	if (allPurgeTags.size > 0) {
-		runBackground(c, purgeCacheByTags([...allPurgeTags]))
-	}
-
-	return c.json({ deleted, skipped: skipped.length, total: ids.length })
+	if (purgeTags.size > 0) runBackground(c, purgeCacheByTags([...purgeTags]))
+	return c.json({ deleted, skipped: ids.length - deleted, total: ids.length })
 })
 
-// Delete smol
+// Delete smol (owner only; minted songs and songs with an unresolved mint are 409)
 smols.delete('/:id', parseAuth, async (c) => {
-	const { env, req } = c
-	const id = req.param('id')
-	const payload = c.get('jwtPayload')!
+	const { env } = c
+	const id = c.req.param('id')
+	const sub = c.get('jwtPayload')!.sub
 
-	const ownedSmol = await env.SMOL_D1.prepare(`
-		SELECT Id, Song_1, Song_2
-		FROM Smols
-		WHERE Id = ?1 AND "Address" = ?2
-	`)
-		.bind(id, payload.sub)
-		.first<{ Id: string; Song_1?: string; Song_2?: string | null }>()
-
-	if (!ownedSmol) {
+	const smol = await readDeletableSmol(env, id)
+	if (!smol || smol.Address !== sub) {
 		throw new HTTPException(404, { message: 'Smol not found or not owned by you' })
 	}
+	if (smol.Mint_Token != null || smol.Mint_Amm != null) {
+		throw new HTTPException(409, { message: 'Minted smols cannot be deleted' })
+	}
+	await assertNotMinting(env, id)
 
-	const likeRows = await env.SMOL_D1.prepare(`SELECT "Address" as Address FROM Likes WHERE Id = ?1`)
-		.bind(id)
-		.all<{ Address: string }>()
-	const playlistTitles = await getPlaylistTitlesForSmol(env, id)
-	const smol: any = await env.SMOL_KV.get(id, 'json')
-
-	await env.SMOL_D1.prepare(`DELETE FROM Likes WHERE Id = ?1`).bind(id).run()
-	await env.SMOL_D1.prepare(`DELETE FROM Playlists WHERE Id = ?1`).bind(id).run()
-	await env.SMOL_D1.prepare(`DELETE FROM Smols WHERE Id = ?1 AND "Address" = ?2`)
-		.bind(id, payload.sub)
-		.run()
-
-	try {
-		if (isDurableObjectId(id)) {
-			const doid = env.DURABLE_OBJECT.idFromString(id)
-			const stub = env.DURABLE_OBJECT.get(doid)
-			await stub.setToFlush()
-		}
-	} catch {}
-
-	await env.SMOL_KV.delete(id)
-	await env.SMOL_BUCKET.delete(`${id}.png`)
-
-	const candidateMusicIds = new Set<string>()
-	if (ownedSmol.Song_1) candidateMusicIds.add(ownedSmol.Song_1)
-	if (ownedSmol.Song_2) candidateMusicIds.add(ownedSmol.Song_2)
-	if (Array.isArray(smol?.songs)) {
-		for (const song of smol.songs) {
-			if (song?.music_id) candidateMusicIds.add(String(song.music_id))
-		}
+	const tags = await deleteSmolGuarded(env, smol, ' AND "Address" = ?2', [sub])
+	if (!tags) {
+		// The guard (mint columns, owner, open mint receipt) failed at the batch; nothing was deleted.
+		const current = await readDeletableSmol(env, id)
+		if (!current || current.Address !== sub) throw new HTTPException(404, { message: 'Smol not found or not owned by you' })
+		throw new HTTPException(409, { message: 'Smol is minted or has a mint in progress' })
 	}
 
-	const songMediaTags: string[] = []
-	for (const musicId of candidateMusicIds) {
-		songMediaTags.push(`song:${musicId}:media`)
-		// Fail closed: delete MP3 ONLY when confirmed unreferenced (never on lookup error)
-		if (await checkSongReferenceStatus(env, musicId) === 'unreferenced') {
-			await env.SMOL_BUCKET.delete(`${musicId}.mp3`)
-		}
-	}
-
-	runBackground(
-		c,
-		queueSearchDeletionById(env, id).catch((error) => {
-			console.error(JSON.stringify({
-				event: 'search_sync_failed',
-				operation: 'deletion',
-				smolId: id,
-				error: error instanceof Error ? { message: error.message, stack: error.stack } : String(error),
-			}))
-		})
-	)
-
-	runBackground(
-		c,
-		purgeCacheByTags([
-			artistSmolsCacheTag(payload.sub),
-			'public-smols',
-			'mixtapes',
-			`user:${payload.sub}:created`,
-			`user:${payload.sub}:smol:${id}`,
-			`smol:${id}:anonymous`,
-			`smol:${id}:media`,
-			...songMediaTags,
-			...playlistTitles.map((title) => `playlist:${title}`),
-			...((likeRows.results || []).flatMap((like) => [
-				`user:${like.Address}:liked`,
-				`user:${like.Address}:likes`,
-			])),
-		])
-	)
-
+	runBackground(c, purgeCacheByTags(tags))
 	return c.body(null, 204)
 })
 

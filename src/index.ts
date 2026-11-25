@@ -1,5 +1,6 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
+import { HTTPException } from 'hono/http-exception'
 import { SmolDurableObject, SmolState } from './do'
 import { UserQuotaDO } from './quota-do'
 import { Workflow } from './workflow'
@@ -14,43 +15,15 @@ import playlists from './api/playlists'
 import mixtapes from './api/mixtapes'
 import mint from './api/mint'
 import chain from './api/chain'
-import media from './api/media'
+import { image, song } from './api/media'
 import search from './api/search'
 import artists from './api/artists'
 import quota from './api/quota'
 import plays from './api/plays'
 import { processSearchQueue, processSearchDLQ, runSearchBackfillCron } from './utils/search'
+import { allowedCorsOrigin } from './utils/cors'
 
 export const app = new Hono<HonoEnv>()
-
-export const ALLOWED_CORS_ORIGINS = new Set([
-	'https://smol.xyz',
-	'https://next.smol.xyz',
-	'https://noot.smol.xyz',
-])
-
-const DEV_CORS_ORIGINS = new Set([
-	'http://localhost:3000',
-	'http://localhost:5173',
-	'http://127.0.0.1:3000',
-	'http://127.0.0.1:5173',
-])
-
-export function allowedCorsOrigin(origin: string, allowLocalhost = false): string | null {
-	if (!origin) {
-		return null
-	}
-
-	if (ALLOWED_CORS_ORIGINS.has(origin)) {
-		return origin
-	}
-
-	if (allowLocalhost && DEV_CORS_ORIGINS.has(origin)) {
-		return origin
-	}
-
-	return null
-}
 
 // Global CORS middleware
 app.use(
@@ -62,11 +35,6 @@ app.use(
 	})
 )
 
-// Note: ETag middleware removed for cached endpoints
-// The cache() middleware already handles caching efficiently
-// ETags would be redundant since cache hits return the stored response
-// without recalculating hashes or checking If-None-Match headers
-
 // Mount route modules
 app.route('/', auth)
 app.route('/likes', likes)
@@ -74,8 +42,8 @@ app.route('/playlist', playlists)
 app.route('/mixtapes', mixtapes)
 app.route('/mint', mint)
 app.route('/chain', chain)
-app.route('/song', media)
-app.route('/image', media)
+app.route('/song', song)
+app.route('/image', image)
 app.route('/search', search)
 app.route('/artists', artists)
 app.route('/quota', quota)
@@ -85,6 +53,13 @@ app.route('/', smols)
 // 404 handler
 app.notFound((c) => {
 	return c.body(null, 404)
+})
+
+// HTTPExceptions keep their status and body; anything else is an opaque, never-cached 500.
+app.onError((err, c) => {
+	if (err instanceof HTTPException) return err.getResponse()
+	console.error('Unhandled request error:', c.req.method, c.req.path, err)
+	return c.json({ error: 'internal_error' }, 500, { 'Cache-Control': 'no-store' })
 })
 
 // Export handler

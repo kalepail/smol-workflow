@@ -32,7 +32,7 @@ import {
 	releaseMintPrefixesIfAbsent,
 	reserveMintPrefixes,
 } from '../utils/mint-eligibility'
-import { privateNoStore, readJsonBody } from './mixtapes'
+import { privateNoStore, readJsonBody } from '../utils/http'
 
 const mint = new Hono<HonoEnv>()
 
@@ -41,7 +41,7 @@ function mintError(status: ContentfulStatusCode, body: Record<string, unknown>):
 }
 
 /** Closed-by-default kill switch. Runs before auth, body reads, D1 claims and workflow creation. */
-async function requireMintSigningEnabled(c: Context<HonoEnv>, next: Next) {
+async function requireMintSigningEnabled(c: Context<HonoEnv, string>, next: Next) {
 	if (c.env.MINT_SIGNING_ENABLED !== 'true') return c.json({ error: 'mint_paused' }, 503)
 	await next()
 }

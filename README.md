@@ -69,7 +69,6 @@ migrations/
 ├── 0002_mixtapes_lifecycle.sql          # Mixtape soft delete, merge, derived visibility
 ├── 0003_storage_query_optimization.sql  # Smols.Tags + minted/playlist indexes
 └── 0004_users_address_unique.sql        # Unique Users.Address
-ext/smol-sdk/                # Soroban smart contract SDK (built via scripts/build-sdk.mjs)
 ```
 
 ## API Endpoints
@@ -87,21 +86,22 @@ ext/smol-sdk/                # Soroban smart contract SDK (built via scripts/bui
 - `POST /retry/:id` — Retry failed Smol (caller-independent, deduplicated, preserves original creator & provider) → `200 text/plain` instance ID. An optional `{ override_provider }` / `{ provider }` body requires the creator's session (`401` / `403` otherwise)
 - `PUT /:id` — Toggle public/private visibility (blocked when NSFW is unsafe or unclassified)
 - `PUT /:smol_id/:song_id` — Swap `Song_1`/`Song_2` on 2-track Smols (guarded against `NULL`/empty `Song_2` on 1-track Smols)
-- `DELETE /:id` — Delete owned Smol, clean `Likes`/`Playlists`, protect shared MP3s, purge caches
-- `DELETE /admin/bulk` — Admin bulk delete (gated behind dedicated `ADMIN_SECRET` via `x-admin-secret` or `Authorization: Bearer`; fails closed with 404 when unset; skips minted and by default public rows)
+- `DELETE /:id` — Delete owned, unminted Smol (`409` when minted or a mint is unresolved) in one guarded D1 batch with its `Likes`/`Playlists`; best-effort KV/cover/unreferenced-MP3 cleanup, purge caches
+- `DELETE /admin/bulk` — Admin bulk delete (gated behind dedicated `ADMIN_SECRET` via `x-admin-secret` or `Authorization: Bearer`; fails closed with 404 when unset; skips minted, minting and by default public rows)
 
 ### Media, Likes, Playlists, Mixtapes, Artists, Search, Minting
-- `GET` / `HEAD /song/:id.mp3` — RFC 9110 Range/206, suffix & EOF-clamped ranges, `416` with `Content-Range`, `If-None-Match` (`304`), `If-Range`, edge caching without partial-body poisoning, play counting (in `server` mode) excluding `HEAD` and `bytes=0-1` probes
-- `GET` / `HEAD /image/:id.png[?scale=1..32]` — Pixel art serving with nearest-neighbor scaling and per-scale edge caching
+- `GET` / `HEAD /song/:id.mp3` (MP3 only) — RFC 9110 Range/206, suffix & EOF-clamped ranges, `416` with `Content-Range`, `If-None-Match` (`304`), `If-Range`, edge caching without partial-body poisoning, play counting (in `server` mode) excluding `HEAD` and `bytes=0-1` probes
+- `GET` / `HEAD /image/:id.png[?scale=1..32]` (PNG only) — Pixel art serving with nearest-neighbor scaling and per-scale edge caching
 - `GET /likes`, `PUT /likes/:id` — User likes
 - `GET /playlist/:title` — Public playlist feed
 - `GET /mixtapes`, `GET /mixtapes/:id` — Public mixtapes (derived visibility)
 - `GET /mixtapes/mine`, `POST /mixtapes/check-uniqueness`, `POST /mixtapes`, `PUT`/`PATCH`/`DELETE /mixtapes/:id`, `POST /mixtapes/:id/restore`, `POST /mixtapes/:id/merge` — Owner mixtape management (soft delete, restore, merge)
 - `GET /artists/:address/smols` — Public artist feed
-- `GET /search`, `GET /search/:id/similar`, `POST /search/admin/{reindex/:id,backfill,reconcile}`, `GET /search/admin/backfill/status` — Semantic search & indexing ops
+- `GET /search`, `GET /search/:id/similar`, `POST /search/admin/{reindex/:id,backfill,reconcile}`, `GET /search/admin/backfill/status`, `GET /search/admin/dlq`, `POST /search/admin/dlq/replay` — Semantic search, indexing ops and DLQ record replay
 - `POST /mint/:id`, `POST /mint` — Deduplicated single & batch Stellar minting (`202`)
 - `POST /mint/status` — Authenticated per-batch mint progress and track `Mint_Token` / `Mint_Amm`
 - `POST /chain/snapshot` — Authenticated mainnet ledger snapshot (SAC, pool, reserves, balance, optional Comet quote)
+- `GET /chain/balance` — Authenticated smart-wallet KALE balance (archive-aware; `503` when unreadable, never a fabricated `0`)
 
 ### Quota & Plays
 - `GET /quota` — Authenticated per-provider daily quota snapshot (`no-store`)
@@ -140,10 +140,7 @@ ext/smol-sdk/                # Soroban smart contract SDK (built via scripts/bui
 ## Development & Verification
 
 ```sh
-# Build local ext/smol-sdk artifacts
-pnpm run build:sdk
-
-# Type check (builds ext/smol-sdk automatically before tsc)
+# Type check
 pnpm run typecheck
 
 # Run full test suite (zero paid calls)
@@ -151,6 +148,9 @@ pnpm test
 
 # Dry-run Wrangler bundle verification (no credentials, no local .dev.vars)
 EMPTY_ENV=$(mktemp) && CLOUDFLARE_API_TOKEN='' npx wrangler deploy --dry-run --env-file "$EMPTY_ENV"; rm -f "$EMPTY_ENV"
+
+# Exact-bundle workerd smoke (Miniflare; local bindings only, outbound network blocked)
+pnpm exec wrangler deploy --dry-run --outdir /tmp/wf1-lean-dry && pnpm exec tsx scripts/wf1-bundle-smoke.ts /tmp/wf1-lean-dry
 
 # Whitespace check
 git diff --check

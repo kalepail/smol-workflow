@@ -1,44 +1,25 @@
 import { Hono } from 'hono'
-import { cache } from 'hono/cache'
 import { HTTPException } from 'hono/http-exception'
 import type { HonoEnv } from '../types'
 import { parseAuth } from '../middleware/auth'
-import { purgeUserLikedCache, userCacheKeyGenerator } from '../utils/cache'
+import { purgeUserLikedCache } from '../utils/cache'
+import { privateNoStore } from '../utils/http'
 
 const likes = new Hono<HonoEnv>()
 
-// Get user's likes
-likes.get(
-	'/',
-	parseAuth,
-	cache({
-		cacheName: 'smol-workflow',
-		cacheControl: 'private, max-age=20',
-		keyGenerator: userCacheKeyGenerator, // Each user gets separate cache via sub claim
-	}),
-	async (c) => {
-		const { env } = c
-		const payload = c.get('jwtPayload')!
+// Get user's likes (never shared-cached)
+likes.get('/', privateNoStore, parseAuth, async (c) => {
+	const { results } = await c.env.SMOL_D1.prepare(`
+		SELECT l.Id
+		FROM Likes l
+		INNER JOIN Smols s ON s.Id = l.Id
+		WHERE l."Address" = ?1
+	`)
+		.bind(c.get('jwtPayload')!.sub)
+		.all<{ Id: string }>()
 
-		const { results } = await env.SMOL_D1.prepare(`
-			SELECT l.Id
-			FROM Likes l
-			INNER JOIN Smols s ON s.Id = l.Id
-			WHERE l."Address" = ?1
-		`)
-			.bind(payload.sub)
-			.all()
-
-		const likeIds = results.map((like: any) => like.Id)
-
-		const response = c.json(likeIds)
-
-		// Add cache tag for user-specific likes list
-		response.headers.append('Cache-Tag', `user:${payload.sub}:likes`)
-
-		return response
-	}
-)
+	return c.json(results.map((like) => like.Id))
+})
 
 // Toggle like
 likes.put('/:id', parseAuth, async (c) => {

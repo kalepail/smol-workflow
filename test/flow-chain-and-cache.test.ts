@@ -10,6 +10,7 @@ import {
 	createMockUserQuotaNamespace, createSqliteD1, createWorkflowStep, installCloudflareStubs,
 } from './helpers/harness'
 import { MAINNET_MINT_IDENTITY } from '../src/chain/mint-authorization'
+import { playlistCacheTag } from '../src/utils/cache-tags'
 import { buildFeCoinItCarrier, buildFeCoinThemCarrier, createPasskey, type FeIdentity } from './fixtures/mint-authz/fe-builder'
 import { testIdentity, testIssuerKeypair } from './fixtures/mint-authz/generate'
 
@@ -458,7 +459,7 @@ test('a mainnet mint signs with a gateway tip, confirms the relay hash and purge
 		const epoch = db.prepare('SELECT Epoch FROM MixtapeState').get()!.Epoch as number
 		await wf.run({ instanceId, payload, timestamp: new Date() }, createWorkflowStep(new Map()).step as never)
 		assert.deepEqual(requests, ['tip', 'submit', 'receipt'])
-		assert.ok(['mixtapes', 'mixtape:indexed-mixtape', 'public-smols', 'playlist:arcade', `smol:${TRACK}:anonymous`]
+		assert.ok(['mixtapes', 'mixtape:indexed-mixtape', 'public-smols', await playlistCacheTag('arcade'), `smol:${TRACK}:anonymous`]
 			.every((tag) => tags.has(tag)))
 		assert.equal(db.prepare('SELECT Epoch FROM MixtapeState').get()?.Epoch, epoch + 1)
 		const status = await send('/mint/status', { workflowIds: [instanceId] }, WALLET)
@@ -506,7 +507,7 @@ test('a mainnet mint signs with a gateway tip, confirms the relay hash and purge
 		}, createWorkflowStep(batchSteps).step as never)
 		assert.equal(db.prepare('SELECT Mint_Token FROM Smols WHERE Id = ?').get(SECOND)?.Mint_Token, returnedPair.sac)
 		assert.ok(tags.has('mixtape:indexed-mixtape'))
-		assert.ok(tags.has('playlist:chill'))
+		assert.ok(tags.has(await playlistCacheTag('chill')))
 	} finally {
 		globalThis.fetch = fetchBefore
 		db.close()

@@ -1,7 +1,3 @@
-export function sleep(ms: number) {
-	return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 export type ParsedByteRange =
 	| {
 		kind: 'range'
@@ -116,19 +112,5 @@ export function parseByteRange(header: string, size: number): ParsedByteRange {
 		length: end - start + 1,
 		isSuffix: false,
 		isOpenEnded: false,
-	};
-}
-
-/**
- * Backwards-compatible wrapper returning `{ offset, length }` for satisfiable single ranges.
- */
-export function parseRange(header: string, size: number): { offset: number; length: number } | undefined {
-	const parsed = parseByteRange(header, size);
-	if (parsed.kind !== 'range') {
-		return undefined;
-	}
-	return {
-		offset: parsed.offset,
-		length: parsed.length,
 	};
 }

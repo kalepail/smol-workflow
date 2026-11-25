@@ -4,6 +4,7 @@ import { Server } from "@stellar/stellar-sdk/minimal/rpc";
 import base64url from "base64url";
 import { HTTPException } from "hono/http-exception";
 import { contractDataKey, decodeLedgerPage, instanceKey, LEDGER_KEY_LIMIT, storageKey, type MainnetChainReads } from "./utils/chain";
+import { bytesEqual } from "./utils/bytes";
 
 // Protocol types for different smart account implementations
 export type Protocol = 'passkey-kit' | 'smart-account-kit';
@@ -188,7 +189,7 @@ export async function verifyRegistration(
         if (options.expectedKeyId) {
             const expected = normalizeBase64UrlId(options.expectedKeyId);
             const attested = normalizeBase64UrlId(verification.registrationInfo?.credential.id);
-            if (!expected || !attested || !expected.buffer.equals(attested.buffer)) {
+            if (!expected || !attested || !bytesEqual(expected.buffer, attested.buffer)) {
                 throw new HTTPException(400, { message: 'Passkey credential ID mismatch' });
             }
         }
@@ -301,7 +302,7 @@ async function getPublicKeyFromSmartAccountKit(
                 if (!fields || fields.length < 3 || fields[0].sym().toString() !== 'External') continue;
                 const keyData = Buffer.from(fields[2].bytes());
                 if (keyData.length > SECP256R1_PUBLIC_KEY_SIZE
-                    && keyData.subarray(SECP256R1_PUBLIC_KEY_SIZE).equals(credential)) {
+                    && bytesEqual(keyData.subarray(SECP256R1_PUBLIC_KEY_SIZE), credential)) {
                     return keyData.subarray(0, SECP256R1_PUBLIC_KEY_SIZE);
                 }
             }

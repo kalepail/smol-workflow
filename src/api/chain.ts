@@ -9,7 +9,7 @@ import {
 	type Balance, type LedgerLife, type QuoteRequest,
 } from '../utils/chain'
 import { parseTrackTarget, readChainTarget } from '../utils/chain-target'
-import { privateNoStore, readJsonBody } from './mixtapes'
+import { privateNoStore, readJsonBody } from '../utils/http'
 
 const chain = new Hono<HonoEnv>()
 
@@ -147,6 +147,21 @@ chain.post('/snapshot', privateNoStore, parseAuth, async (c) => {
 		incompleteMembership: membership.incompleteMembership,
 		ownership,
 	})
+})
+
+// KALE balance of the signed-in smart wallet, read archive-aware through kale-worker. Fails closed:
+// an unavailable, incoherent or undecodable read is a 503, never a fabricated "0" (an archive-aware
+// read that proves the entry absent is the only zero).
+chain.get('/balance', privateNoStore, parseAuth, async (c) => {
+	const sub = c.get('jwtPayload')?.sub
+	if (typeof sub !== 'string' || !StrKey.isValidContract(sub)) {
+		throw new HTTPException(400, { message: 'Balances require a contract account' })
+	}
+	const key = balanceKey(KALE_SAC, sub).toXDR('base64')
+	const { values, latestLedger, coherent } = await readChainSnapshot(c.env.KALE_WORKER, [key])
+	const kale = coherent ? readSacBalance(values.get(key)) : UNKNOWN_BALANCE
+	if (kale.state !== 'known') return c.json({ error: 'balance_unavailable' }, 503)
+	return c.json({ network: 'mainnet', latestLedger, kale })
 })
 
 export default chain

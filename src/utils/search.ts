@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { HTTPException } from 'hono/http-exception'
-import { buildCursorWhereClause, buildPaginationResponse, type PaginationResponse } from './pagination'
+import { buildCursorWhereClause, paginate, type PaginationResponse } from './pagination'
 
 export const SEARCH_INDEX_VERSION = 'v2'
 
@@ -33,29 +33,6 @@ const MODALITY_CODES: Record<SearchModality, string> = {
 	lyrics: 'l',
 	description: 'd',
 }
-
-const SEARCH_METADATA_JSON_SCHEMA = {
-	type: 'object',
-	additionalProperties: false,
-	required: [
-		'style_primary',
-		'mood_primary',
-		'theme_primary',
-		'lyric_presence',
-		'brightness_level',
-		'energy_level',
-		'modality_guess',
-	],
-	properties: {
-		style_primary: { type: 'string', maxLength: 80 },
-		mood_primary: { type: 'string', maxLength: 80 },
-		theme_primary: { type: 'string', maxLength: 80 },
-		lyric_presence: { type: 'string', enum: ['instrumental', 'sparse', 'lyric-heavy'] },
-		brightness_level: { type: 'string', enum: ['dark', 'neutral', 'bright'] },
-		energy_level: { type: 'string', enum: ['low', 'mid', 'high'] },
-		modality_guess: { type: 'string', enum: ['minor', 'major', 'mixed', 'unknown'] },
-	},
-} as const
 
 export type SearchModality = typeof SEARCH_MODALITIES[number]
 
@@ -483,9 +460,7 @@ function getVectorIdsForSmol(smolId: string): string[] {
 }
 
 function getSearchIndex(env: Env): Vectorize {
-	// Wrangler 4.59 still emits the legacy VectorizeIndex binding type even though
-	// the runtime binding supports the V2 Vectorize methods used here.
-	return env.SMOL_SEARCH_INDEX as unknown as Vectorize
+	return env.SMOL_SEARCH_INDEX
 }
 
 export function isSearchQueryableState(
@@ -1154,7 +1129,7 @@ async function embedTexts(env: Env, texts: string[]): Promise<number[][]> {
 	const response = await env.AI.run(EMBEDDING_MODEL, {
 		text: texts,
 		truncate_inputs: true,
-	}) as Ai_Cf_Baai_Bge_M3_Ouput_Embedding
+	}) as Ai_Cf_Baai_Bge_M3_Output_Embedding
 
 	if (!response.data?.length) {
 		throw new Error('Embedding model returned no vectors')
@@ -1454,6 +1429,44 @@ async function clearRecoverableSearchFailure(
 	await env.SMOL_KV.delete(`${SEARCH_DLQ_RECORD_PREFIX}${kind}:${smolId}`).catch(() => {})
 }
 
+export type SearchDlqEntry = { key: string; kind: 'upsert' | 'delete'; smolId: string }
+
+function parseSearchDlqKey(key: string): SearchDlqEntry | null {
+	if (!key.startsWith(SEARCH_DLQ_RECORD_PREFIX)) return null
+	const [kind, ...rest] = key.slice(SEARCH_DLQ_RECORD_PREFIX.length).split(':')
+	const smolId = rest.join(':')
+	return (kind === 'upsert' || kind === 'delete') && smolId ? { key, kind, smolId } : null
+}
+
+/** One page (<= 100) of recorded search failures that exhausted the queue and its DLQ. */
+export async function listSearchDlq(env: Env, cursor?: string) {
+	const page = await env.SMOL_KV.list({ prefix: SEARCH_DLQ_RECORD_PREFIX, cursor, limit: 100 })
+	return {
+		entries: page.keys.flatMap(({ name }) => parseSearchDlqKey(name) ?? []),
+		cursor: page.list_complete ? null : page.cursor,
+	}
+}
+
+/**
+ * Re-enqueues each recorded upsert/delete through the normal queue path and drops its record only once
+ * the message was sent. An upsert that could not be enqueued (e.g. no source KV record) keeps its
+ * record and is reported in `failed`.
+ */
+export async function replaySearchDlq(env: Env, keys: string[]): Promise<{ replayed: string[]; failed: string[] }> {
+	const replayed: string[] = []
+	const failed: string[] = []
+	for (const entry of keys.flatMap((key) => parseSearchDlqKey(key) ?? [])) {
+		if (entry.kind === 'upsert' && !(await queueSearchIndexingById(env, entry.smolId))) {
+			failed.push(entry.key)
+			continue
+		}
+		if (entry.kind === 'delete') await queueSearchDeletionById(env, entry.smolId)
+		await env.SMOL_KV.delete(entry.key)
+		replayed.push(entry.key)
+	}
+	return { replayed, failed }
+}
+
 async function upsertSmolVectorBatch(env: Env, smolIds: string[], attempts: number): Promise<SearchQueueDisposition> {
 	const uniqueSmolIds = uniqueStrings(smolIds)
 	if (!uniqueSmolIds.length) {
@@ -1577,6 +1590,13 @@ async function upsertSmolVectorBatch(env: Env, smolIds: string[], attempts: numb
 }
 
 async function deleteSmolVectors(env: Env, smolId: string, vectorIds: string[] = getVectorIdsForSmol(smolId)): Promise<void> {
+	// A late delete (an old hide, a replayed DLQ record) must never de-index a song that is public now;
+	// making it public queued its own upsert. A D1 error throws, so the message retries.
+	const row = await env.SMOL_D1.prepare('SELECT Public FROM Smols WHERE Id = ?1').bind(smolId).first<{ Public: number }>()
+	if (row?.Public === 1) {
+		logSearchEvent('search_delete_skipped_public', { smolId })
+		return
+	}
 	await getSearchIndex(env).deleteByIds(vectorIds)
 }
 
@@ -1987,21 +2007,14 @@ export async function getSearchBackfillPage(
 		bindings.push(whereClause[1], whereClause[2], whereClause[3])
 	}
 
-	bindings.push(effectiveLimit)
+	bindings.push(effectiveLimit + 1)
 
 	const { results } = await env.SMOL_D1.prepare(query)
 		.bind(...bindings)
 		.all<SearchBackfillPageRow>()
 
-	return {
-		rows: results,
-		pagination: buildPaginationResponse(
-			results,
-			effectiveLimit,
-			(item) => item.Created_At,
-			(item) => item.Id
-		),
-	}
+	const { items, pagination } = paginate(results, effectiveLimit)
+	return { rows: items, pagination }
 }
 
 export async function runSearchBackfillCron(env: Env): Promise<SearchBackfillCronResult> {

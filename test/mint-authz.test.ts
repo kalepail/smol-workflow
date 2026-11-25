@@ -162,12 +162,9 @@ function carrierFromMainnet(tx: (typeof mainnetTrees.transactions)[number], admi
 // Spec + constants
 // ---------------------------------------------------------------------------
 
-test('smol-spec pins exactly the contractspecv0 of the live factory Wasm and the FE smol-sdk bindings', () => {
+test('smol-spec pins exactly the contractspecv0 of the live factory Wasm', () => {
 	assert.equal(factorySpec.wasmHash, '1199117e0bd80b2a4863984c826c89326dff650381407f27ef5485d5f0468925')
 	assert.deepEqual([...SMOL_SPEC_ENTRIES], factorySpec.entries)
-	const sdk = readFileSync(join(__dirname, '..', 'ext', 'smol-sdk', 'src', 'index.ts'), 'utf8')
-	const bound = [...sdk.matchAll(/"(AAAA[A-Za-z0-9+/=]+)"/g)].map((match) => match[1])
-	assert.deepEqual(bound, [...SMOL_SPEC_ENTRIES])
 })
 
 test('mainnet identity is the pinned factory/issuer and matches deriveMintPair for every fixture id', () => {

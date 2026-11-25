@@ -16,6 +16,7 @@
 import { Address, Asset, authorizeEntry, hash, Keypair, nativeToScVal, Networks, StrKey, xdr } from '@stellar/stellar-sdk/minimal'
 import { isLedgerSequence, KALE_SAC, SMOL_FACTORY, SMOL_ISSUER } from '../utils/chain'
 import { smolSpec } from './smol-spec'
+import { bytesEqual, compareBytes } from '../utils/bytes'
 
 /** Live mainnet `contract_bandwidth_v0.tx_max_size_bytes`. The signed envelope must fit. */
 export const MAX_SIGNED_MINT_XDR_BYTES = 132_096
@@ -191,7 +192,7 @@ export interface DecodedMintCarrier {
 	readonly ids: readonly string[]
 }
 
-const NULL_ACCOUNT_KEY = Buffer.alloc(32)
+const NULL_ACCOUNT_KEY = new Uint8Array(32)
 
 export function decodeMintCarrier(value: unknown, kind: MintKind, identity: MintIdentity = MAINNET_MINT_IDENTITY): DecodedMintCarrier {
 	return closedSet('xdr_malformed', () => decodeCarrier(value, kind, identity))
@@ -212,7 +213,7 @@ function decodeCarrier(value: unknown, kind: MintKind, identity: MintIdentity): 
 	} catch {
 		reject('xdr_malformed')
 	}
-	if (!envelope.toXDR().equals(bytes)) reject('xdr_noncanonical')
+	if (!bytesEqual(envelope.toXDR(), bytes)) reject('xdr_noncanonical')
 
 	const invokeArgs = carrierInvokeArgs(envelope)
 	if (addressOf(invokeArgs.contractAddress(), 'contract_mismatch') !== identity.factory) reject('contract_mismatch')
@@ -237,7 +238,7 @@ function carrierInvokeArgs(envelope: xdr.TransactionEnvelope): xdr.InvokeContrac
 	const tx = v1.tx()
 
 	const source = tx.sourceAccount()
-	if (source.switch().name !== 'keyTypeEd25519' || !Buffer.from(source.ed25519()).equals(NULL_ACCOUNT_KEY)) {
+	if (source.switch().name !== 'keyTypeEd25519' || !bytesEqual(source.ed25519(), NULL_ACCOUNT_KEY)) {
 		reject('carrier_source')
 	}
 	if (tx.seqNum().toString() !== '1') reject('carrier_sequence')
@@ -496,13 +497,13 @@ function assertInvocation(
 ): void {
 	const fn = actual.function()
 	// The full tagged authorized function, then the bare InvokeContractArgs payload.
-	if (!fn.toXDR().equals(expected.rootFunction)
+	if (!bytesEqual(fn.toXDR(), expected.rootFunction)
 		|| fn.switch().name !== 'sorobanAuthorizedFunctionTypeContractFn'
-		|| !fn.contractFn().toXDR().equals(expected.invokeArgs)) {
+		|| !bytesEqual(fn.contractFn().toXDR(), expected.invokeArgs)) {
 		reject(which === 'admin' ? 'admin_root_mismatch' : 'user_root_mismatch')
 	}
 	const tree = which === 'admin' ? expected.adminInvocation : expected.userInvocation
-	if (!actual.toXDR().equals(tree)) reject(which === 'admin' ? 'admin_tree_mismatch' : 'user_tree_mismatch')
+	if (!bytesEqual(actual.toXDR(), tree)) reject(which === 'admin' ? 'admin_tree_mismatch' : 'user_tree_mismatch')
 }
 
 function isUnsignedCredential(credentials: xdr.SorobanAddressCredentials): boolean {
@@ -565,7 +566,7 @@ function assertWalletSigner(entry: xdr.ScMapEntry): void {
 	}
 }
 
-const scValBytes = (value: string | Buffer): Buffer => (Buffer.isBuffer(value) ? value : Buffer.from(value, 'utf8'))
+const scValBytes = (value: string | Uint8Array): Uint8Array => (typeof value === 'string' ? new TextEncoder().encode(value) : value)
 const u64 = (value: { toString(): string }): bigint => BigInt(value.toString())
 const i128Of = (parts: xdr.Int128Parts | xdr.UInt128Parts): bigint => (u64(parts.hi()) << 64n) + u64(parts.lo())
 const i256Of = (parts: xdr.Int256Parts | xdr.UInt256Parts): bigint =>
@@ -616,11 +617,11 @@ export function compareScVal(a: xdr.ScVal, b: xdr.ScVal): number {
 		case 'scvI256':
 			return sign(i256Of(a.i256()), i256Of(b.i256()))
 		case 'scvBytes':
-			return Buffer.compare(Buffer.from(a.bytes()), Buffer.from(b.bytes()))
+			return compareBytes(a.bytes(), b.bytes())
 		case 'scvString':
-			return Buffer.compare(scValBytes(a.str()), scValBytes(b.str()))
+			return compareBytes(scValBytes(a.str()), scValBytes(b.str()))
 		case 'scvSymbol':
-			return Buffer.compare(scValBytes(a.sym()), scValBytes(b.sym()))
+			return compareBytes(scValBytes(a.sym()), scValBytes(b.sym()))
 		case 'scvVec': {
 			const left = a.vec()
 			const right = b.vec()
@@ -691,7 +692,7 @@ function assertUnsigned(carrier: DecodedMintCarrier, expected: MintExpectation):
 	const envelope = xdr.TransactionEnvelope.fromXDR(snapshot)
 	carrierInvokeArgs(envelope)
 	const op = invokeOp(envelope)
-	if (!op.hostFunction().toXDR().equals(expected.hostFunction)) reject('host_function_mismatch')
+	if (!bytesEqual(op.hostFunction().toXDR(), expected.hostFunction)) reject('host_function_mismatch')
 
 	const { admin, user } = classifyAuthEntries(op.auth(), expected.identity.issuer, expected.sub)
 	assertInvocation(admin.rootInvocation, expected, 'admin')
@@ -787,7 +788,7 @@ function assertSigned(
 	} catch {
 		reject('signed_malformed')
 	}
-	if (!envelope.toXDR().equals(bytes) || envelope.switch().name !== 'envelopeTypeTx') reject('signed_malformed')
+	if (!bytesEqual(envelope.toXDR(), bytes) || envelope.switch().name !== 'envelopeTypeTx') reject('signed_malformed')
 	const operations = envelope.v1().tx().operations()
 	if (operations.length !== 1 || operations[0].body().switch().name !== 'invokeHostFunction') reject('signed_mismatch')
 
@@ -808,12 +809,12 @@ function assertSigned(
 		field.key().switch().name === 'scvSymbol' && field.key().sym().toString() === name
 		&& field.val().switch().name === 'scvBytes' && field.val().bytes().length === size
 	if (!isField(publicKeyField, 'public_key', 32) || !isField(signatureField, 'signature', 64)) reject('signature_invalid')
-	if (!Buffer.from(publicKeyField.val().bytes()).equals(StrKey.decodeEd25519PublicKey(issuer))) reject('signature_invalid')
+	if (!bytesEqual(publicKeyField.val().bytes(), StrKey.decodeEd25519PublicKey(issuer))) reject('signature_invalid')
 	const payload = sorobanAuthorizationPayload(expected.networkPassphrase, credentials, entry.rootInvocation())
 	if (!Keypair.fromPublicKey(issuer).verify(payload, Buffer.from(signatureField.val().bytes()))) reject('signature_invalid')
 
 	// Only the admin signature and expiry may differ from the validated input.
 	credentials.signature(xdr.ScVal.scvVoid())
 	credentials.signatureExpirationLedger(0)
-	if (!envelope.toXDR().equals(snapshot)) reject('signed_mismatch')
+	if (!bytesEqual(envelope.toXDR(), snapshot)) reject('signed_mismatch')
 }

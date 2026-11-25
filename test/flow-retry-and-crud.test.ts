@@ -13,6 +13,7 @@ import {
 	installCloudflareStubs,
 	type CloudflareStubHandle,
 } from './helpers/harness'
+import { playlistCacheTag } from '../src/utils/cache-tags'
 
 let stubs: CloudflareStubHandle
 let appModule: typeof import('../src/index')
@@ -23,16 +24,25 @@ const OWNER = 'GOWNERADDRESS000000000000'
 const OLD_ID = 'a'.repeat(64)
 const NEW_ID = 'b'.repeat(64)
 
+const liveFetch = globalThis.fetch
+
 before(async () => {
 	stubs = installCloudflareStubs({
 		CF_API_TOKEN: 'test-cf-token',
 		CF_ZONE_ID: 'test-zone-id',
 	})
+	// Tests that do not inspect purges still trigger them: answer them locally, never live.
+	globalThis.fetch = (async (input: string | URL | Request) => {
+		const url = input instanceof Request ? input.url : String(input)
+		if (url.endsWith('/purge_cache')) return Response.json({ success: true })
+		throw new Error(`Unmocked fetch in test: ${url}`)
+	}) as typeof fetch
 	appModule = await import('../src/index')
 	workflowModule = await import('../src/workflow')
 })
 
 after(() => {
+	globalThis.fetch = liveFetch
 	stubs.cleanup()
 })
 
@@ -574,7 +584,7 @@ test('Gate 5 swap & delete: 2-track swap purges list/mixtape/playlist tags, 1-tr
 		assert.equal(harness.smolsTable.get(twoTrackId)?.Song_1, 'alt-mp3')
 		assert.equal(harness.smolsTable.get(twoTrackId)?.Song_2, sharedSongId)
 		const swapTags = purgePayloads.flat()
-		for (const expectedTag of ['public-smols', 'mixtapes', 'playlist:favorites', `smol:${twoTrackId}:anonymous`, `artist:${OWNER}:smols`]) {
+		for (const expectedTag of ['public-smols', 'mixtapes', await playlistCacheTag('favorites'), `smol:${twoTrackId}:anonymous`, `artist:${OWNER}:smols`]) {
 			assert.ok(swapTags.includes(expectedTag), `Missing swap purge tag ${expectedTag} in ${JSON.stringify(swapTags)}`)
 		}
 

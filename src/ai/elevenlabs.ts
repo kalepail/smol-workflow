@@ -103,10 +103,6 @@ export function resolveOptionalElevenLabsMusicLengthMs(env: Env): number | undef
 	return Math.round(Math.min(MAX_ELEVENLABS_TOTAL_MS, Math.max(MIN_ELEVENLABS_TOTAL_MS, parsed)));
 }
 
-export function resolveElevenLabsMusicLengthMs(env: Env): number {
-	return resolveOptionalElevenLabsMusicLengthMs(env) ?? DEFAULT_ELEVENLABS_MUSIC_LENGTH_MS;
-}
-
 function cleanStyleList(styles: string[] | undefined, fallbackPrompt?: string): string[] {
 	const cleaned: string[] = [];
 	const seen = new Set<string>();

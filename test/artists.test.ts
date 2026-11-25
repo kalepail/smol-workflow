@@ -94,9 +94,10 @@ test('artist smols endpoint lists only public smols for one artist query', async
 	assert.deepEqual(body.artist, { Username: 'Artist', Address: artistAddress })
 	assert.deepEqual(body.users, [{ Username: 'Artist', Address: artistAddress }])
 	assert.deepEqual(body.smols, [smol])
-	assert.equal(body.pagination.hasMore, true)
-	assert.equal(body.pagination.nextCursor, encodeCursor(smol.Created_At, smol.Id))
-	assert.deepEqual(calls[0].bindings, [artistAddress, 1])
+	// LIMIT + 1 read: a single row for limit=1 proves there is no next page.
+	assert.equal(body.pagination.hasMore, false)
+	assert.equal(body.pagination.nextCursor, null)
+	assert.deepEqual(calls[0].bindings, [artistAddress, 2])
 	assert.deepEqual(calls[1].bindings, [artistAddress])
 	assert.equal(response.headers.get('Cache-Tag'), `artist:${artistAddress}:smols`)
 })
@@ -128,7 +129,7 @@ test('artist smols endpoint includes cursor bindings after artist address', asyn
 		'2026-05-14T12:00:00.000Z',
 		'2026-05-14T12:00:00.000Z',
 		'smol-2',
-		25,
+		26,
 	])
 })
 

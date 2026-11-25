@@ -3,6 +3,8 @@ import { HTTPException } from 'hono/http-exception'
 import type { HonoEnv, SmolKVData } from '../types'
 import { parseAuth } from '../middleware/auth'
 import { purgeMixtapeCache } from '../utils/cache'
+import { PRIVATE_HEADERS, privateNoStore, readJsonBody } from '../utils/http'
+import { stripOriginSpecificHeaders } from '../utils/public-cache'
 import {
 	borderlineTrigger,
 	classifyOwnerMixtapes,
@@ -40,11 +42,6 @@ const BUMP_EPOCH_SQL = 'UPDATE MixtapeState SET Epoch = Epoch + 1 WHERE Id = 1'
 const ABORT_IF_PREVIOUS_MISSED_SQL = 'UPDATE MixtapeState SET Epoch = -1 WHERE Id = 1 AND changes() = 0'
 /** Rolls the whole batch back when anything mixtape-related committed since the epoch was captured. */
 const ABORT_IF_EPOCH_MOVED_SQL = 'UPDATE MixtapeState SET Epoch = -1 WHERE Id = 1 AND Epoch != ?1'
-const PRIVATE_HEADERS = {
-	'Cache-Control': 'private, no-store',
-	'CDN-Cache-Control': 'no-store',
-	Vary: 'Cookie, Authorization',
-} as const
 
 interface MixtapeRow {
 	Id: string
@@ -167,19 +164,6 @@ function parseExpectedRevision(value: unknown): number | undefined {
 	return value
 }
 
-export async function readJsonBody(c: Context<HonoEnv>): Promise<Record<string, unknown>> {
-	let body: unknown
-	try {
-		body = await c.req.json()
-	} catch {
-		throw new HTTPException(400, { message: 'Invalid JSON body' })
-	}
-	if (!body || typeof body !== 'object' || Array.isArray(body)) {
-		throw new HTTPException(400, { message: 'Invalid JSON body' })
-	}
-	return body as Record<string, unknown>
-}
-
 /** Owner routes require a verified user subject (the generic admin token has none). */
 function requireOwnerSub(c: Context<HonoEnv>): string {
 	const sub = c.get('jwtPayload')?.sub
@@ -276,15 +260,6 @@ async function publicCacheKey(c: Context<HonoEnv>): Promise<string> {
 	return url.toString()
 }
 
-function stripOriginSpecificHeaders(headers: Headers): Headers {
-	const clean = new Headers(headers)
-	for (const name of [...clean.keys()]) {
-		if (name.startsWith('access-control-')) clean.delete(name)
-	}
-	clean.delete('Vary')
-	return clean
-}
-
 /**
  * Serve an edge-cache HIT. Origin-specific headers are stripped on the hit path too, so a warm entry
  * written before the strip-on-write deploy (same v2 namespace, <= 60s TTL) can never replay its first
@@ -307,7 +282,7 @@ function withBrowserPolicy(response: Response): Response {
  * rename, delete or song privacy change is never served stale from a browser cache. Non-200s
  * are `no-store` everywhere (browser and CDN).
  */
-const publicCache = () => async (c: Context<HonoEnv>, next: Next) => {
+const publicCache = () => async (c: Context<HonoEnv, string>, next: Next) => {
 	const edge = typeof caches === 'undefined' ? null : await caches.open(PUBLIC_CACHE_NAME)
 	const key = edge ? await publicCacheKey(c) : ''
 	const hit = edge ? await edge.match(key) : undefined
@@ -330,12 +305,6 @@ const publicCache = () => async (c: Context<HonoEnv>, next: Next) => {
 	}
 	c.res.headers.set('Cache-Control', BROWSER_CACHE_CONTROL)
 	c.res.headers.set('CDN-Cache-Control', CDN_CACHE_CONTROL)
-}
-
-/** Private, never-shared cache policy on EVERY response (incl. 400/401/403 thrown before handlers). */
-export async function privateNoStore(c: Context<HonoEnv>, next: Next) {
-	await next()
-	for (const [name, value] of Object.entries(PRIVATE_HEADERS)) c.res.headers.set(name, value)
 }
 
 // ---------------------------------------------------------------------------

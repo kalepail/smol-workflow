@@ -6,7 +6,7 @@
     "$schema": "node_modules/wrangler/config-schema.json",
     "name": "smol-workflow",
     "main": "src/index.ts",
-    "compatibility_date": "2025-09-25",
+    "compatibility_date": "2026-11-16",
     "minify": false,
     "workers_dev": false,
     "routes": [
@@ -98,7 +98,7 @@
                 "queue": "smol-search-queue-dlq",
                 "max_batch_size": 5,
                 "max_batch_timeout": 10,
-                "max_retries": 0
+                "max_retries": 3
             }
         ]
     },
@@ -181,15 +181,13 @@
     "r2_buckets": [
         {
             "binding": "SMOL_BUCKET",
-            "bucket_name": "smol-r2",
-            "preview_bucket_name": "smol-r2"
+            "bucket_name": "smol-r2"
         }
     ],
     "kv_namespaces": [
         {
             "binding": "SMOL_KV",
-            "id": "a42b9877d5c947e1917a2f0f56bbbc7f",
-            "preview_id": "a42b9877d5c947e1917a2f0f56bbbc7f"
+            "id": "a42b9877d5c947e1917a2f0f56bbbc7f"
         }
     ],
     "d1_databases": [

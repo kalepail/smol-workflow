@@ -773,7 +773,9 @@ function createCronBackfillEnv(options: {
 								if (sql.includes('SELECT Id, Created_At')) {
 									const rows = pages[Math.min(pageReads, pages.length - 1)] ?? []
 									pageReads += 1
-									return { results: rows as T[] }
+									// The page query reads LIMIT + 1: a full page carries one probe row proving more exist.
+									const probe = rows.length === 2 ? [{ Id: 'smol-probe', Created_At: '2000-01-01 00:00:00' }] : []
+									return { results: [...rows, ...probe] as T[] }
 								}
 
 								return { results: [] as T[] }

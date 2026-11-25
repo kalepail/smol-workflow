@@ -3,28 +3,24 @@
 	"version": "0.0.0",
 	"scripts": {
 		"start": "wrangler dev --test-scheduled",
-		"start:remote": "wrangler dev --remote --env dev",
-		"build:sdk": "node scripts/build-sdk.mjs",
-		"deploy": "node scripts/build-sdk.mjs && wrangler deploy",
+		"deploy": "wrangler deploy",
 		"backfill:search": "node scripts/search-backfill.mjs",
 		"typegen": "wrangler types --strict-vars=false",
-		"typecheck": "node scripts/build-sdk.mjs && tsc --noEmit",
+		"typecheck": "tsc --noEmit",
 		"test": "tsx --test test/**/*.test.ts"
 	},
 	"devDependencies": {
-		"@cloudflare/workers-types": "^4.20260115.0",
-		"@types/node": "^25.0.8",
-		"tsx": "^4.21.0",
+		"@types/node": "^26.6.6",
+		"tsx": "^4.23.15",
 		"typescript": "^5.9.3",
-		"wrangler": "^4.59.2"
+		"wrangler": "^4.167.0"
 	},
 	"dependencies": {
 		"@simplewebauthn/server": "^13.2.2",
 		"@stellar/stellar-sdk": "^14.4.3",
 		"base64url": "^3.0.1",
-		"hono": "^4.11.4",
+		"hono": "^4.13.21",
 		"jimp": "^1.6.0",
-		"music-metadata": "^11.10.6",
-		"smol-sdk": "file:./ext/smol-sdk"
+		"music-metadata": "^11.10.6"
 	}
 }

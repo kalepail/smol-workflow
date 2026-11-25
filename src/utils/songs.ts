@@ -281,16 +281,6 @@ export async function classifyRetryAdmission(
 	};
 }
 
-export async function doesRetryReuseExistingAttempt(
-	env: Env,
-	retryId: string,
-	retrySteps: WorkflowSteps,
-	overrideProvider?: MusicProvider
-): Promise<boolean> {
-	const plan = await classifyRetryAdmission(env, retryId, retrySteps, overrideProvider);
-	return plan.kind === 'reuse';
-}
-
 async function saveProviderProgress(
 	stub: DurableObjectStub<SmolDurableObject>,
 	progress: {

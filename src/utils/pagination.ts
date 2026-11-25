@@ -65,29 +65,19 @@ export function decodeCursor(cursor: string): CursorData | null {
 }
 
 /**
- * Build pagination response metadata
- * @param results - Query results
- * @param limit - Requested limit
- * @param getCreatedAt - Function to extract Created_At from result
- * @param getId - Function to extract Id from result
+ * Split a `LIMIT limit + 1` result into one page. The extra row only proves that another page
+ * exists, so `hasMore` is exact (no empty trailing page when the total is a multiple of `limit`).
  */
-export function buildPaginationResponse<T>(
-	results: T[],
-	limit: number,
-	getCreatedAt: (item: T) => string,
-	getId: (item: T) => string
-): PaginationResponse {
-	const hasMore = results.length === limit
-	let nextCursor: string | null = null
-
-	if (hasMore && results.length > 0) {
-		const lastItem = results[results.length - 1]
-		nextCursor = encodeCursor(getCreatedAt(lastItem), getId(lastItem))
-	}
-
+export function paginate<T extends { Created_At: string; Id: string }>(
+	rows: T[],
+	limit: number
+): { items: T[]; pagination: PaginationResponse } {
+	const items = rows.slice(0, limit)
+	const last = items[items.length - 1]
+	const hasMore = rows.length > limit && last !== undefined
 	return {
-		nextCursor,
-		hasMore,
+		items,
+		pagination: { nextCursor: hasMore ? encodeCursor(last.Created_At, last.Id) : null, hasMore },
 	}
 }
 

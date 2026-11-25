@@ -1,12 +1,8 @@
 import { Hono } from 'hono'
-import { cache } from 'hono/cache'
 import type { HonoEnv } from '../types'
-import {
-	parsePaginationParams,
-	buildCursorWhereClause,
-	buildPaginationResponse,
-} from '../utils/pagination'
+import { parsePaginationParams, buildCursorWhereClause, paginate } from '../utils/pagination'
 import { artistSmolsCacheTag } from '../utils/cache-tags'
+import { publicCache } from '../utils/public-cache'
 
 const artists = new Hono<HonoEnv>()
 
@@ -28,66 +24,35 @@ interface ArtistSmol {
 	Public: number
 }
 
-artists.get(
-	'/:address/smols',
-	cache({
-		cacheName: 'smol-workflow',
-		cacheControl: 'public, max-age=30, stale-while-revalidate=60',
-	}),
-	async (c) => {
-		const { env, req } = c
-		const artistAddress = c.req.param('address')
-		const { limit, cursor } = parsePaginationParams(new URL(req.url))
+artists.get('/:address/smols', publicCache, async (c) => {
+	const { env, req } = c
+	const artistAddress = c.req.param('address')
+	const { limit, cursor } = parsePaginationParams(new URL(req.url))
+	const [where, ...cursorBindings] = buildCursorWhereClause(cursor, 's."Address" = ? AND s.Public = 1', 's.')
 
-		const whereClause = buildCursorWhereClause(cursor, 's."Address" = ? AND s.Public = 1', 's.')
-		const bindings: any[] = []
+	const { results } = await env.SMOL_D1.prepare(`
+		SELECT s.Id, s.Title, s.Song_1, s.Address, s.Plays, s.Views, s.Mint_Token, s.Mint_Amm, s.Created_At, s.Public
+		FROM Smols s
+		WHERE ${where}
+		ORDER BY s.Created_At DESC, s.Id DESC
+		LIMIT ?
+	`).bind(artistAddress, ...cursorBindings, limit + 1).all<ArtistSmol>()
+	const { items, pagination } = paginate(results ?? [], limit)
 
-		const query = `
-			SELECT s.Id, s.Title, s.Song_1, s.Address, s.Plays, s.Views, s.Mint_Token, s.Mint_Amm, s.Created_At, s.Public
-			FROM Smols s
-			WHERE ${whereClause[0]}
-			ORDER BY s.Created_At DESC, s.Id DESC
-			LIMIT ?
-		`
+	const artist = items.length > 0
+		? await env.SMOL_D1.prepare(`SELECT Username, Address FROM Users WHERE Address = ? LIMIT 1`)
+			.bind(artistAddress)
+			.first<Artist>()
+		: null
 
-		if (whereClause.length > 1) {
-			bindings.push(artistAddress, whereClause[1], whereClause[2], whereClause[3], limit)
-		} else {
-			bindings.push(artistAddress, limit)
-		}
-
-		const smolsD1Result = await env.SMOL_D1.prepare(query)
-			.bind(...bindings)
-			.all<ArtistSmol>()
-
-		const smolsFromDb = smolsD1Result.results || []
-		let artist: Artist | null = null
-		if (smolsFromDb.length > 0) {
-			artist = await env.SMOL_D1.prepare(
-				`SELECT Username, Address FROM Users WHERE Address = ? LIMIT 1`
-			)
-				.bind(artistAddress)
-				.first<Artist>()
-		}
-
-		const pagination = buildPaginationResponse(
-			smolsFromDb,
-			limit,
-			(item) => item.Created_At,
-			(item) => item.Id
-		)
-
-		const response = c.json({
-			artist: artist ?? null,
-			smols: smolsFromDb,
-			users: artist ? [artist] : [],
-			pagination,
-		})
-
-		response.headers.append('Cache-Tag', artistSmolsCacheTag(artistAddress))
-
-		return response
-	}
-)
+	const response = c.json({
+		artist: artist ?? null,
+		smols: items,
+		users: artist ? [artist] : [],
+		pagination,
+	})
+	response.headers.append('Cache-Tag', artistSmolsCacheTag(artistAddress))
+	return response
+})
 
 export default artists

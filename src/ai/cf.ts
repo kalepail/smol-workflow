@@ -27,7 +27,7 @@ export async function imageDescribe(env: Env, base64: string, prompt: string) {
 // fields at the top level, so accept both.
 export function extractImageDescription(response: unknown) {
     const output = response && typeof response === 'object'
-        ? response as Ai_Cf_Moondream_Moondream3_1_9B_A2B_Output
+        ? response as Ai_Cf_Moondream_Moondream3_1_9B_A2B_Output & { result?: Ai_Cf_Moondream_Moondream3_1_9B_A2B_Output }
         : undefined
     const result = output?.result ?? output
     const description = (result?.answer ?? result?.caption ?? '').trim()

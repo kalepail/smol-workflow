@@ -14,7 +14,7 @@ import {
 	type ValidatedUnsignedMint,
 } from "./chain/mint-authorization";
 import { purgeCacheByTags } from "./utils/cache";
-import { artistSmolsCacheTag } from "./utils/cache-tags";
+import { artistSmolsCacheTag, playlistCacheTags } from "./utils/cache-tags";
 import { deriveMintPair, isLedgerSequence, type MainnetChainReads } from "./utils/chain";
 import type { MintPhase } from "./utils/chain-target";
 import {
@@ -312,13 +312,15 @@ async function purgeMintCaches(env: Env, ids: string[], tags: Iterable<string>):
 	if (!ids.length) return;
 	const { results } = await env.SMOL_D1.prepare(`
 		WITH ids AS (SELECT value AS Id FROM json_each(?1))
-		SELECT 'mixtape:' || m.mix_id AS Tag
+		SELECT 'mixtape:' || m.mix_id AS Tag, NULL AS Playlist
 		FROM ids CROSS JOIN MixtapeMember m ON m.smol_id = ids.Id
 		UNION
-		SELECT 'playlist:' || p.Title AS Tag
+		SELECT NULL AS Tag, p.Title AS Playlist
 		FROM ids CROSS JOIN Playlists p ON p.Id = ids.Id
-	`).bind(JSON.stringify(ids)).all<{ Tag: string }>();
-	await purgeCacheByTags(['mixtapes', 'public-smols', ...tags, ...results.map(({ Tag }) => Tag)]);
+	`).bind(JSON.stringify(ids)).all<{ Tag: string | null; Playlist: string | null }>();
+	const playlistTags = await playlistCacheTags(results.flatMap(({ Playlist }) => Playlist === null ? [] : [Playlist]));
+	const mixtapeTags = results.flatMap(({ Tag }) => Tag === null ? [] : [Tag]);
+	await purgeCacheByTags(['mixtapes', 'public-smols', ...tags, ...mixtapeTags, ...playlistTags]);
 }
 
 /** Records the batch's phase. It only ever adds this attempt's own receipt (never clears one). */
@@ -533,6 +535,15 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
 				} catch (error) {
 					const message = error instanceof Error ? error.message : 'Unversioned signing checkpoint refused (requires reconciliation)';
 					throw await concludeMintRefusal(this.env, event, message, preSubmit);
+				}
+				// The submit intent is now in D1 (a racing delete's guarded batch sees it), so a target row
+				// a delete already removed (or one minted meanwhile) stops the mint before dispatch.
+				const targets = [...new Set(mintLockIds(event.payload))];
+				const present = await this.env.SMOL_D1.prepare(`
+					SELECT count(*) AS n FROM Smols WHERE Id IN (SELECT value FROM json_each(?1)) AND Mint_Token IS NULL AND Mint_Amm IS NULL
+				`).bind(JSON.stringify(targets)).first<number>('n').catch(() => null);
+				if (present !== targets.length) {
+					throw await concludeMintRefusal(this.env, event, 'Mint target song missing or minted before dispatch (nothing relayed)', preSubmit);
 				}
 				// Durable, owner-checked dispatch marker, written BEFORE the relay call. Only this
 				// workflow's `signing` claim can become `dispatched`; a replay finds `dispatched` (or

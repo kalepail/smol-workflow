@@ -59,7 +59,7 @@ async function timingSafeSecretEqual(provided: string, expected: string): Promis
  * Validates x-admin-secret or Authorization: Bearer <token> against ADMIN_SECRET
  * using SHA-256 + timing-safe comparison. Never accepts the JWT signing SECRET.
  */
-export async function requireAdmin(c: Context<HonoEnv>, next: Next) {
+export async function requireAdmin(c: Context<HonoEnv, string>, next: Next) {
 	const expectedSecret = c.env.ADMIN_SECRET?.trim()
 	if (!expectedSecret) {
 		throw new HTTPException(404, { message: 'Not Found' })
@@ -82,7 +82,7 @@ export async function requireAdmin(c: Context<HonoEnv>, next: Next) {
  * Required authentication middleware
  * Throws 401 if no valid user JWT is found
  */
-export async function parseAuth(c: Context<HonoEnv>, next: Next) {
+export async function parseAuth(c: Context<HonoEnv, string>, next: Next) {
 	const authHeader = c.req.header('Authorization')
 
 	if (authHeader) {
@@ -111,15 +111,12 @@ export async function parseAuth(c: Context<HonoEnv>, next: Next) {
  * Optional authentication middleware
  * Sets jwtPayload if token present but does not throw on missing/invalid tokens
  */
-export async function optionalAuth(c: Context<HonoEnv>, next: Next) {
+export async function optionalAuth(c: Context<HonoEnv, string>, next: Next) {
 	const authHeader = c.req.header('Authorization')
-	let token: string | undefined
-
-	if (authHeader && authHeader.startsWith('Bearer ')) {
-		token = authHeader.split(' ')[1]
-	} else {
-		token = getCookie(c, 'smol_token')
-	}
+	// Same scheme parsing as parseAuth: case-insensitive `Bearer`, any whitespace.
+	const token = authHeader
+		? /^Bearer\s+(.+)$/i.exec(authHeader.trim())?.[1]?.trim()
+		: getCookie(c, 'smol_token')
 
 	if (token) {
 		try {

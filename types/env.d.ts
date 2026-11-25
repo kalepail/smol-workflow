@@ -18,47 +18,50 @@ interface KaleWorkerBinding extends Fetcher, KaleWorkerChainReads {
 	}>
 }
 
-// Wrangler generates a generic Fetcher for the sibling Worker. Refine the app's Env
-// here so `wrangler types` can regenerate its declaration independently.
-interface Env {
-	KALE_WORKER: KaleWorkerBinding
+// Secrets that `wrangler types` cannot know. Both the global `Env` and the `cloudflare:workers`
+// `Cloudflare.Env` get them, so `wrangler types` can regenerate independently.
+interface SmolSecrets {
+	SECRET: string
+	ADMIN_SECRET?: string
+	ALLOW_LOCALHOST_ORIGINS?: string
+	SK: string
+	/**
+	 * Mint kill switch, closed by default. Anything other than exactly 'true' makes POST /mint and
+	 * POST /mint/:id answer 503 mint_paused and makes TxWorkflow refuse to sign or relay.
+	 */
+	MINT_SIGNING_ENABLED?: string
+	PIXELLAB_KEY: string
+	CF_API_TOKEN: string
+	CF_ZONE_ID: string
+	CF_AI_GATEWAY_ID?: string
+	CF_AIG_TOKEN?: string
+	CF_AIG_BYOK_ALIAS?: string
+	ELEVENLABS_MUSIC_LENGTH_MS?: string
+	ELEVENLABS_OUTPUT_FORMAT?: string
+	ELEVENLABS_FALLBACK_ENABLED?: string
+	DAILY_LIMIT_CLASSIC?: string
+	DAILY_LIMIT_ELEVENLABS?: string
+	BURST_LIMIT_PER_MINUTE?: string
+	GLOBAL_DAILY_LIMIT_CLASSIC?: string
+	GLOBAL_DAILY_LIMIT_ELEVENLABS?: string
+	PLAY_COUNT_MODE?: string
+	PLAY_BEACON_COOLDOWN_SECONDS?: string
+	PLAY_BEACON_RATE_LIMIT_PER_MINUTE?: string
+	/** Tier 2 clef-flash mixtape tie-breaker. Enabled unless exactly 'false'. */
+	MIXTAPE_DEDUPE_AI_ENABLED?: string
 }
 
+// Refined bindings are own members so they take precedence over the generated (wider) types:
+// KALE_WORKER is the sibling Worker's RPC surface, and smol-search-index is a Vectorize V2 index
+// (Wrangler still emits the legacy VectorizeIndex type).
+interface Env extends SmolSecrets {
+	KALE_WORKER: KaleWorkerBinding
+	SMOL_SEARCH_INDEX: Vectorize
+	SEARCH_QUEUE: Queue<SearchQueueMessage>
+}
 declare namespace Cloudflare {
-	interface Env {
-		SECRET: string
-		ADMIN_SECRET?: string
-		ALLOW_LOCALHOST_ORIGINS?: string
-		SK: string
-		/**
-		 * Mint kill switch, closed by default. Anything other than exactly 'true' makes POST /mint and
-		 * POST /mint/:id answer 503 mint_paused and makes TxWorkflow refuse to sign or relay.
-		 */
-		MINT_SIGNING_ENABLED?: string
-		PIXELLAB_KEY: string
-		CF_API_TOKEN: string
-		CF_ZONE_ID: string
-		CF_AI_GATEWAY_ID?: string
-		CF_AIG_TOKEN?: string
-		CF_AIG_BYOK_ALIAS?: string
-		ELEVENLABS_MUSIC_LENGTH_MS?: string
-		ELEVENLABS_OUTPUT_FORMAT?: string
-		ELEVENLABS_FALLBACK_ENABLED?: string
-		DAILY_LIMIT_CLASSIC?: string
-		DAILY_LIMIT_ELEVENLABS?: string
-		BURST_LIMIT_PER_MINUTE?: string
-		GLOBAL_DAILY_LIMIT_CLASSIC?: string
-		GLOBAL_DAILY_LIMIT_ELEVENLABS?: string
-		PLAY_COUNT_MODE?: string
-		PLAY_BEACON_COOLDOWN_SECONDS?: string
-		PLAY_BEACON_RATE_LIMIT_PER_MINUTE?: string
-		/** Tier 2 clef-flash mixtape tie-breaker. Enabled unless exactly 'false'. */
-		MIXTAPE_DEDUPE_AI_ENABLED?: string
-		USER_QUOTA: DurableObjectNamespace<import('../src/quota-do').UserQuotaDO>
-		SEARCH_BACKFILL_CRON_ENABLED: string
-		SEARCH_BACKFILL_CRON_PAGE_LIMIT: string
-		SEARCH_BACKFILL_CRON_STALL_RUNS: string
-		SEARCH_BACKFILL_CRON_MAX_WAVES: string
+	interface Env extends SmolSecrets {
+		KALE_WORKER: KaleWorkerBinding
 		SMOL_SEARCH_INDEX: Vectorize
 		SEARCH_QUEUE: Queue<SearchQueueMessage>
 	}

@@ -3,9 +3,6 @@
  */
 
 import { env } from 'cloudflare:workers'
-import type { Context } from 'hono'
-import type { HonoEnv } from '../types'
-import { artistSmolsCacheTag } from './cache-tags'
 
 /**
  * Purge cache by tags using Cloudflare API
@@ -67,13 +64,6 @@ export async function purgeCacheByTags(tags: string[]): Promise<boolean> {
 }
 
 /**
- * Helper to purge cache for a specific user's created smols
- */
-export function purgeUserCreatedCache(userId: string): Promise<boolean> {
-	return purgeCacheByTags([`user:${userId}:created`])
-}
-
-/**
  * Helper to purge cache for a specific user's liked smols
  * Purges both the /liked list and /likes array
  */
@@ -94,54 +84,9 @@ export function purgeUserLikedCache(
 }
 
 /**
- * Helper to purge cache for mixtapes
- */
-export function purgeMixtapesCache(): Promise<boolean> {
-	return purgeCacheByTags(['mixtapes'])
-}
-
-/**
  * Purge the mixtapes listing plus the detail entries of every mixtape whose
  * content or derived visibility changed (edited row, promoted/hidden siblings, merge target).
  */
 export function purgeMixtapeCache(mixtapeIds: string[]): Promise<boolean> {
 	return purgeCacheByTags(['mixtapes', ...mixtapeIds.map((id) => `mixtape:${id}`)])
-}
-
-/**
- * Helper to purge cache for public smols list
- */
-export function purgePublicSmolsCache(): Promise<boolean> {
-	return purgeCacheByTags(['public-smols'])
-}
-
-/**
- * Helper to purge public smols for a specific artist.
- */
-export function purgeArtistSmolsCache(artistAddress: string): Promise<boolean> {
-	return purgeCacheByTags([artistSmolsCacheTag(artistAddress)])
-}
-
-/**
- * Helper to purge cache for a specific playlist
- */
-export function purgePlaylistCache(playlistTitle: string): Promise<boolean> {
-	return purgeCacheByTags([`playlist:${playlistTitle}`])
-}
-
-/**
- * Cache key generator that varies by user's sub claim (contract/wallet address)
- * instead of the raw Cookie header. This ensures cache hits even when the JWT
- * token changes (e.g., after logout/login).
- */
-export function userCacheKeyGenerator(c: Context<HonoEnv>): string {
-	const payload = c.get('jwtPayload')
-	const userSub = payload?.sub || 'anonymous'
-	const url = new URL(c.req.url)
-
-	// Create a unique URL by adding user identifier as a query param
-	// This keeps it a valid URL while varying by user
-	url.searchParams.set('__cache_user', userSub)
-
-	return url.toString()
 }

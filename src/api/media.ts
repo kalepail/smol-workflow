@@ -4,8 +4,11 @@ import { Jimp, ResizeStrategy } from 'jimp'
 import type { HonoEnv } from '../types'
 import { parseByteRange, type ParsedByteRange } from '../utils'
 import { getPlayCountMode } from './plays'
+import { stripOriginSpecificHeaders } from '../utils/public-cache'
 
-const media = new Hono<HonoEnv>()
+// Separate routers so /song serves only MP3s and /image only PNGs (cross-media GET/HEAD is 404).
+export const song = new Hono<HonoEnv>()
+export const image = new Hono<HonoEnv>()
 export const MEDIA_CACHE_CONTROL = 'public, max-age=2592000, stale-while-revalidate=86400'
 const CANONICAL_MEDIA_ORIGIN = 'https://api.smol.xyz'
 const MAX_PROBE_BYTES = 2
@@ -223,15 +226,6 @@ function warmSongCache(env: Env, cache: Cache, cacheKey: Request, id: string, mu
 	return warm
 }
 
-function stripOriginSpecificHeaders(headers: Headers): Headers {
-	const clean = new Headers(headers)
-	clean.delete('Access-Control-Allow-Origin')
-	clean.delete('Access-Control-Allow-Credentials')
-	clean.delete('Access-Control-Expose-Headers')
-	clean.delete('Vary')
-	return clean
-}
-
 function resolveR2Range(
 	object: R2ObjectBody,
 	fallback: { offset: number; end: number; length: number },
@@ -283,7 +277,7 @@ function unsatisfiableRangeResponse(baseHeaders: Headers, size: number): Respons
 }
 
 // Serve songs (handles both GET and HEAD via Hono method dispatch)
-media.get('/:id{.+\\.mp3}', async (c) => {
+song.get('/:id{.+\\.mp3}', async (c) => {
 	const { env, req } = c
 	const isHead = req.method === 'HEAD'
 	const id = req.param('id')
@@ -495,7 +489,7 @@ function buildImageHeaders(smolId: string, objectMeta: R2Object, size: number): 
 }
 
 // Serve images (handles both GET and HEAD)
-media.get('/:id{.+\\.png}', async (c) => {
+image.get('/:id{.+\\.png}', async (c) => {
 	const { env, req } = c
 	const isHead = req.method === 'HEAD'
 	const id = req.param('id')
@@ -608,5 +602,3 @@ media.get('/:id{.+\\.png}', async (c) => {
 
 	return new Response(responseBody, { status: 200, headers })
 })
-
-export default media

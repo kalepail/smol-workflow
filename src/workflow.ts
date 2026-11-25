@@ -6,9 +6,10 @@ import { generateLyrics } from './ai/aisonggenerator';
 import { checkNSFW, isNsfwBlocked, normalizeNsfwResult } from './ai/nsfw';
 import { NonRetryableError } from 'cloudflare:workflows';
 import { purgeCacheByTags } from './utils/cache';
-import { artistSmolsCacheTag } from './utils/cache-tags';
+import { artistSmolsCacheTag, playlistCacheTag } from './utils/cache-tags';
 import { generateOrReuseSongs, isValidMusicProvider, normalizeMusicProvider } from './utils/songs';
 import { isDurableObjectId } from './utils/durable-object-id';
+import { isWorkflowNotFoundError } from './utils/workflow-errors';
 import { createHiddenSearchState, createQueuedSearchState, queueSearchIndexingById } from './utils/search';
 import { refundGenerationQuota } from './utils/quota';
 
@@ -505,9 +506,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 							return;
 						}
 					} catch (err) {
-						const msg = err instanceof Error ? `${err.name} ${err.message}` : String(err);
-						const isNotFound = /instance\.not_found|not[\s_-]*found|does\s*not\s*exist|unknown\s*instance|\b404\b/i.test(msg);
-						if (!isNotFound) {
+						if (!isWorkflowNotFoundError(err)) {
 							// Indeterminate workflow lookup error: fail closed & retry step
 							throw err;
 						}
@@ -538,7 +537,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 				purgeTags.add(artistSmolsCacheTag(address));
 			}
 			if (playlist) {
-				purgeTags.add(`playlist:${playlist}`);
+				purgeTags.add(await playlistCacheTag(playlist));
 			}
 
 			await purgeCacheByTags([...purgeTags]);

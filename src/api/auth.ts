@@ -13,6 +13,7 @@ import {
 	verifyAuthentication,
 	type Protocol,
 } from '../passkey'
+import { bytesEqual } from '../utils/bytes'
 
 const auth = new Hono<HonoEnv>()
 
@@ -26,7 +27,7 @@ function withNoStore(response: Response): Response {
 	})
 }
 
-async function enforceAuthNoStore(c: Context<HonoEnv>, next: Next) {
+async function enforceAuthNoStore(c: Context<HonoEnv, string>, next: Next) {
 	try {
 		await next()
 	} catch (err) {
@@ -104,7 +105,7 @@ auth.post('/login', async (c) => {
 
 			const normalizedKeyId = normalizeBase64UrlId(keyId)
 			const normalizedResponseId = normalizeBase64UrlId(response.id)
-			if (!normalizedKeyId || !normalizedResponseId || !normalizedKeyId.buffer.equals(normalizedResponseId.buffer)) {
+			if (!normalizedKeyId || !normalizedResponseId || !bytesEqual(normalizedKeyId.buffer, normalizedResponseId.buffer)) {
 				throw new HTTPException(400, { message: 'Passkey credential ID mismatch' })
 			}
 

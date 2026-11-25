@@ -142,6 +142,9 @@ function createMintEnv(initialRows: Record<string, { Address: string; Mint_Token
 							if (sql.includes('FROM Smols WHERE Id = ?1')) {
 								return rows.get(String(args[0])) ?? null
 							}
+							if (sql.includes('count(*) AS n FROM Smols')) {
+								return (JSON.parse(String(args[0])) as string[]).filter((id) => rows.get(id)?.Mint_Token === null && rows.get(id)?.Mint_Amm === null).length
+							}
 							return null
 						},
 						all: async () => {
@@ -437,7 +440,8 @@ test('Gate 3b: batch mint maps reversed contract push_front tuples to signed coi
 			(err: unknown) => err instanceof Error && err.name === 'NonRetryableError' && /conflict/i.test(err.message)
 		)
 
-		// Terminal on-chain FAILED throws NonRetryableError
+		// Terminal on-chain FAILED throws NonRetryableError (a fresh attempt: the targets are unminted again)
+		for (const id of [smolA, smolB]) Object.assign(harness.rows.get(id)!, { Mint_Token: null, Mint_Amm: null })
 		rpcStatus = 'FAILED'
 		resetMintLocks(harness.env)
 		await assert.rejects(
@@ -576,6 +580,7 @@ test('A2: a relay error that still carries a valid 64-hex hash is checkpointed a
 		assert.equal(harness.rows.get(SINGLE_ID)?.Mint_Token, SINGLE_PAIR.sac, 'landed mint is persisted')
 
 		// An error with no usable hash is still a hard stop (no confirm, no duplicate submit).
+		Object.assign(harness.rows.get(SINGLE_ID)!, { Mint_Token: null, Mint_Amm: null })
 		for (const response of [{ error: 'WAIT_TIMEOUT' }, { hash: 'not-a-hash', error: 'ONCHAIN_FAILED' }]) {
 			harness.setRelayResponder(async () => response)
 			resetMintLocks(harness.env)
