@@ -3,6 +3,7 @@ import type { SmolDurableObject } from './do';
 import { pixellab } from './ai/pixellab';
 import { imageDescribe } from './ai/cf';
 import { generateLyrics } from './ai/aisonggenerator';
+import { finalizeSongText, resolveSongIntent } from './ai/song-intent';
 import { checkNSFW, isNsfwBlocked, normalizeNsfwResult } from './ai/nsfw';
 import { NonRetryableError } from 'cloudflare:workflows';
 import { purgeCacheByTags } from './utils/cache';
@@ -322,28 +323,26 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 			// =====================================================================
 			// STEP 4: Generate lyrics / title / style (or reuse from retry)
 			// =====================================================================
+			// The song-intent call runs beside the songwriter and never throws (null -> deterministic).
+			// The completeness check runs on the FINAL object that is stored and sent to the providers.
 			lyrics = retry_steps?.lyrics || await step.do('generate lyrics', config, async () => {
-				const generated = await generateLyrics(this.env, prompt, description);
+				const [generated, intent] = await Promise.all([
+					generateLyrics(this.env, prompt),
+					resolveSongIntent(this.env, prompt, is_instrumental),
+				]);
+				const final = finalizeSongText(generated, intent, prompt, is_instrumental);
 
-				const missingLyrics = !is_instrumental && !generated.lyrics?.trim();
-				if (
-					!generated.title?.trim()
-					|| missingLyrics
-					|| (generated.style?.length ?? 0) < 2
-				) {
+				const missingLyrics = !is_instrumental && !final.lyrics.trim();
+				if (!final.title || missingLyrics || final.style.length < 2) {
 					const missing = [
-						!generated.title?.trim() && 'title',
+						!final.title && 'title',
 						missingLyrics && 'lyrics',
-						(generated.style?.length ?? 0) < 2 && 'style',
+						final.style.length < 2 && 'style',
 					].filter(Boolean).join(', ');
 					throw new Error(`Lyrics generation incomplete (missing: ${missing}). Try a different prompt.`);
 				}
 
-				return {
-					title: generated.title.trim(),
-					style: generated.style,
-					lyrics: generated.lyrics ?? '',
-				};
+				return final;
 			});
 
 			await step.do('save generated lyrics', config, () => stub.saveStep('lyrics', lyrics));

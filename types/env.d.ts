@@ -73,6 +73,10 @@ interface AiSongGeneratorLyrics {
 	title: string
 	style: string[]
 	lyrics: string
+	/** Song-intent fields (set only when `intent_v` is): forwarded to AISG by the `...lyrics` spread. */
+	vocalGender?: 'f' | 'm'
+	negativeTags?: string
+	intent_v?: 1
 }
 
 interface AiSongGeneratorSong {

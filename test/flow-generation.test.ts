@@ -45,6 +45,7 @@ function buildMockEnv(options: {
 	cfGatewayId?: string
 	cfAigToken?: string
 	fallbackEnabled?: string
+	intentText?: string
 } = {}) {
 	const r2 = createMockR2Bucket()
 	const doNs = createMockDoNamespace(r2.bucket)
@@ -55,6 +56,7 @@ function buildMockEnv(options: {
 	const queueMessages: unknown[] = []
 	const createdWorkflows: Array<{ id: string; params: WorkflowParams }> = []
 	const aiCalls: Array<{ model: string; input: any }> = []
+	const lyricsBodies: Array<Record<string, unknown>> = []
 
 	const d1 = {
 		prepare(sql: string) {
@@ -203,6 +205,9 @@ function buildMockEnv(options: {
 				if (model === '@cf/cloudflare/clef') {
 					return options.clefRaw ?? clefNsfwPayload()
 				}
+				if (model === '@cf/deepseek-ai/deepseek-v4.1-flash-1017' && options.intentText) {
+					return { response: options.intentText }
+				}
 				if (model === '@cf/zai-org/glm-5.3') {
 					return {
 						choices: [{
@@ -219,6 +224,7 @@ function buildMockEnv(options: {
 			fetch: async (url: string | URL | Request, init?: RequestInit) => {
 				const urlStr = typeof url === 'string' ? url : url instanceof URL ? url.toString() : url.url
 				if (urlStr.endsWith('/api/lyrics')) {
+					lyricsBodies.push(JSON.parse(String(init?.body)))
 					return new Response(JSON.stringify({
 						title: 'Sunset Harbor',
 						style: ['dream pop', 'synthwave'],
@@ -233,7 +239,7 @@ function buildMockEnv(options: {
 		},
 	} as unknown as Env
 
-	return { env, r2, doNs, kv, d1Smols, d1Playlists, queueMessages, createdWorkflows, aiCalls }
+	return { env, r2, doNs, kv, d1Smols, d1Playlists, queueMessages, createdWorkflows, aiCalls, lyricsBodies }
 }
 
 function makeAudioBytes(seed: number, size = 40_000): Uint8Array {
@@ -250,10 +256,13 @@ test('Gate 1a: default AISG v6 flow uses split /api/tasks submit + discovery, co
 	let taskSubmitCalls = 0
 	let taskDiscoverCalls = 0
 	let songPollCalls = 0
+	const submitBodies: string[] = []
 
 	const harness = buildMockEnv({
-		aisgFetch: async (url) => {
+		intentText: '{"mode":"write","lyrics_lines":null,"title":null,"vocal_gender":"f","styles":["dream pop","synth pads","slow tempo","female vocals","nocturnal"],"exclusions":["drums"]}',
+		aisgFetch: async (url, init) => {
 			if (url.endsWith('/api/tasks')) {
+				submitBodies.push(String(init?.body))
 				taskSubmitCalls += 1
 				return new Response(JSON.stringify({ task_id: 'task-123', workspace_id: 'ws-9' }), {
 					status: 200,
@@ -346,6 +355,14 @@ test('Gate 1a: default AISG v6 flow uses split /api/tasks submit + discovery, co
 		const secondRun = createWorkflowStep(cache)
 		await wf.run(event as never, secondRun.step as never)
 		assert.equal(taskSubmitCalls, 1, 'Replay must never re-submit paid AISG task')
+		// Song intent: computed inside the checkpointed lyrics step, forwarded by the existing spread.
+		const submitted = JSON.parse(submitBodies[0])
+		assert.deepEqual(
+			[submitted.vocalGender, submitted.negativeTags, submitted.intent_v, submitted.style.slice(0, 3)],
+			['f', 'male vocals, drums', 1, ['dream pop', 'female vocals', 'synth pads']],
+		)
+		assert.deepEqual(harness.lyricsBodies.map((b) => b.user_prompt), ['dreamy harbor night'])
+		assert.ok(!String(harness.lyricsBodies[0].prompt).includes('# Description'))
 		assert.equal(taskDiscoverCalls, 2)
 		assert.equal(songPollCalls, 2)
 

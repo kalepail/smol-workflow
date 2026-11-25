@@ -1,5 +1,6 @@
 import { NonRetryableError } from 'cloudflare:workflows';
 import { BoundedReadError, readBoundedStream } from '../utils/bounded-read';
+import { ensureVocalistInFirstThree, sanitizeLyrics } from './song-intent';
 
 export const ELEVENLABS_MODEL_ID = 'music_v2_5';
 export const ELEVENLABS_PACING_MODEL = '@cf/zai-org/glm-5.3' as const;
@@ -238,7 +239,9 @@ export function splitElevenLabsLyricSections(lyricsText: string, maxChunks = MAX
  * can never mistake an interior `[Section]` heading for a lyric.
  */
 function parseElevenLabsLyricSections(lyricsText: string): ParsedLyricSection[] {
-	const normalized = lyricsText.replace(/\r\n/g, '\n').trim();
+	// The one shared sanitizer: the pacing planner and the chunk builder both parse through here, so
+	// their section counts match, and `(No lyrics)` / `(guitar solo)` never reach the sung text.
+	const normalized = sanitizeLyrics(lyricsText);
 	if (!normalized) {
 		throw new ElevenLabsProviderError({
 			message: 'Vocal ElevenLabs composition requires non-empty lyrics',
@@ -555,16 +558,32 @@ export async function planElevenLabsVocalDurations(params: {
  * Uses explicit plannedDurationsMs when provided, explicit totalDurationMs override if set,
  * or the empirical baseline durations otherwise.
  */
+/** `negativeTags` (AISG comma string) as EL negative styles. */
+export function negativeStylesFromTags(negativeTags: string | undefined): string[] {
+	return cleanStyleList((negativeTags ?? '').split(',')).slice(0, MAX_ELEVENLABS_STYLES);
+}
+
+/** Every chunk carries the song's negatives; a heading-only chunk also avoids "vocals". */
+function chunkNegativeStyles(text: string, negatives: string[]): string[] {
+	if (countSungLines(text) > 0 || negatives.some((tag) => tag.toLowerCase() === 'vocals')) {
+		return negatives;
+	}
+	return [...negatives.slice(0, MAX_ELEVENLABS_STYLES - 1), 'vocals'];
+}
+
 export function buildElevenLabsCompositionChunks(
 	lyricsText: string,
 	styles: string[],
 	totalDurationMs?: number,
 	fallbackPrompt?: string,
-	plannedDurationsMs?: number[]
+	plannedDurationsMs?: number[],
+	intent: { vocalGender?: 'f' | 'm'; negativeTags?: string } = {}
 ): ElevenLabsCompositionChunk[] {
 	const parsedSections = parseElevenLabsLyricSections(lyricsText);
 	const sections = packLyricSectionsLossless(parsedSections, MAX_ELEVENLABS_CHUNKS);
-	const positiveStyles = cleanStyleList(styles, fallbackPrompt);
+	const positiveStyles = ensureVocalistInFirstThree(cleanStyleList(styles, fallbackPrompt), intent.vocalGender)
+		.slice(0, MAX_ELEVENLABS_STYLES);
+	const negatives = negativeStylesFromTags(intent.negativeTags);
 
 	let durations: number[];
 	if (plannedDurationsMs && plannedDurationsMs.length === sections.length) {
@@ -606,7 +625,7 @@ export function buildElevenLabsCompositionChunks(
 			text,
 			duration_ms: durations[idx],
 			positive_styles: positiveStyles,
-			negative_styles: [],
+			negative_styles: chunkNegativeStyles(text, negatives),
 		}));
 	} else {
 		durations = estimateFallbackChunkDurationsMs(sections);
@@ -616,7 +635,7 @@ export function buildElevenLabsCompositionChunks(
 		text,
 		duration_ms: durations[idx],
 		positive_styles: positiveStyles,
-		negative_styles: [],
+		negative_styles: chunkNegativeStyles(text, negatives),
 	}));
 }
 
@@ -633,11 +652,11 @@ export function buildElevenLabsRequestBody(params: {
 		: undefined;
 
 	if (params.isInstrumental) {
+		// No cover caption: it describes pixel art, not the song. music_length_ms stays as configured.
 		const styleSummary = cleanStyleList(params.lyrics?.style).join(', ');
 		const parts = [
 			params.prompt.trim(),
 			styleSummary ? `Style: ${styleSummary}` : '',
-			params.description?.trim() && params.prompt.trim().length <= 240 ? params.description.trim() : '',
 		].filter(Boolean);
 		const combinedPrompt = parts.join('\n').trim();
 		if (!combinedPrompt) {
@@ -663,7 +682,8 @@ export function buildElevenLabsRequestBody(params: {
 		params.lyrics?.style ?? [],
 		clampedTotalMs,
 		params.prompt,
-		params.chunkDurationsMs
+		params.chunkDurationsMs,
+		{ vocalGender: params.lyrics?.vocalGender, negativeTags: params.lyrics?.negativeTags }
 	);
 
 	return {

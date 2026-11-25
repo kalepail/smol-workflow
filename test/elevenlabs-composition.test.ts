@@ -194,3 +194,56 @@ test('P2: pacing helper never throws (AI error, helper error, or unrepresentable
 	const huge = { ...lyrics, lyrics: Array.from({ length: 1000 }, (_, i) => `l${i}`).join('\n') }
 	assert.equal(await songsModule.planElevenLabsVocalDurationsSafely(throwingAi, 'p', huge), undefined)
 })
+
+test('song intent on EL: vocalist in the first 3, negatives on every chunk, heading-only chunks avoid vocals, one sanitizer for pacing and builder', async () => {
+	// Direction-heavy songwriter output: placeholders and parenthesised instrument cues.
+	const lyrics: AiSongGeneratorLyrics = {
+		title: 'Neon',
+		style: ['soft rock', 'romantic', 'gentle guitars', 'slow tempo', 'female vocals'],
+		lyrics: '[Intro]\n(No lyrics)\n(guitar solo)\n\n[Verse]\n(Your smile pulls me in)\nline one\nline two\n(drum break)\nline three\n\n[Outro]\n(fade out)',
+		vocalGender: 'f',
+		negativeTags: 'male vocals, drums',
+		intent_v: 1,
+	}
+	const plannedFor: number[] = []
+	const env = {
+		AI: {
+			run: async (_model: string, input: { messages: Array<{ content: string }> }) => {
+				const count = JSON.parse(input.messages[1].content).chunk_count as number
+				plannedFor.push(count)
+				return { response: JSON.stringify({ durations_ms: Array(count).fill(9000) }) }
+			},
+		},
+	} as unknown as Env
+	const planned = await el.planElevenLabsVocalDurations({ env, prompt: 'soft romantic rock', lyrics })
+	const body = el.buildElevenLabsRequestBody({ prompt: 'soft romantic rock', description: 'pixel caption', lyrics, isInstrumental: false, chunkDurationsMs: planned })
+	assert.ok('composition_plan' in body)
+	const chunks = body.composition_plan.chunks
+	assert.equal(plannedFor[0], chunks.length, 'pacing planned exactly the chunks the builder sends')
+	assert.deepEqual(chunks.map((c) => c.duration_ms), Array(chunks.length).fill(9000), 'planned durations used, not discarded')
+	assert.deepEqual(chunks.map((c) => c.text), [
+		'[Intro]',
+		'[guitar solo]',
+		'[Verse]\n(Your smile pulls me in)\nline one\nline two',
+		'[drum break]\nline three',
+		'[Outro]',
+		'[fade out]',
+	])
+	assert.ok(!chunks.some((c) => /\(no lyrics\)/i.test(c.text)))
+	assert.match(chunks[0].positive_styles.slice(0, 3).join('|'), /female vocals/)
+	assert.deepEqual(chunks[0].positive_styles, chunks[2].positive_styles)
+	for (const chunk of chunks) {
+		const headingOnly = chunk.text.split('\n').every(isHeading)
+		assert.deepEqual(chunk.negative_styles, headingOnly ? ['male vocals', 'drums', 'vocals'] : ['male vocals', 'drums'], chunk.text)
+	}
+
+	// Old stored lyrics (no intent fields) keep empty negatives on sung chunks.
+	const old = el.buildElevenLabsCompositionChunks('[Verse]\nla la\nla', ['pop', 'rock'])
+	assert.deepEqual(old[0].negative_styles, [])
+
+	// Instrumental: prompt mode, no cover caption, music_length_ms left to configuration.
+	const inst = el.buildElevenLabsRequestBody({ prompt: 'calm ambient', description: 'pixel caption', lyrics: { ...lyrics, lyrics: '' }, isInstrumental: true })
+	assert.ok('prompt' in inst)
+	assert.equal(inst.prompt, 'calm ambient\nStyle: soft rock, romantic, gentle guitars, slow tempo, female vocals')
+	assert.equal('music_length_ms' in inst, false)
+})

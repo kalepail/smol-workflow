@@ -17,7 +17,9 @@
  * WF-2b/AE-8: `GET /image/:id?scale=` runs the dependency-free PNG scaler (RGBA + indexed PLTE/tRNS,
  * exact pixels; corrupt and decompression-bomb PNGs -> 422), an in-isolate probe proves workerd's
  * `node:zlib` honours `maxOutputLength`, and `GET /created?q=` filters owner titles with escaped
- * wildcards and cursor pagination. The compatibility date comes from wrangler.jsonc; pass
+ * wildcards and cursor pagination. Lane 2a: a retry Workflow regenerates lyrics through the bundled song-intent
+ * module (an RPC `AI` mock answers DeepSeek) and the captured AISG submit carries `vocalGender`/`negativeTags`.
+ * The compatibility date comes from wrangler.jsonc; pass
  * `MINIFLARE_WORKERD_PATH` to run a newer workerd than the one wrangler ships.
  */
 import assert from 'node:assert/strict'
@@ -117,7 +119,19 @@ export default {
 const KALE_MOCK = `
 import { WorkerEntrypoint } from 'cloudflare:workers'
 export default class extends WorkerEntrypoint {
-	async fetch() { return new Response(null, { status: 404 }) }
+	async fetch(request) {
+		// Song-intent smoke: the songwriter answer, and a capture of the paid AISG submit body (rejected).
+		const path = new URL(request.url).pathname
+		if (path === '/api/lyrics') {
+			await this.env.CAPTURE.put('lyrics-request', await request.text())
+			return Response.json({ title: 'Songwriter', style: ['pop', 'male vocals', 'bright'], lyrics: '[Verse]\\n(No lyrics)\\nwritten one\\nwritten two\\nwritten three\\nwritten four' })
+		}
+		if (path === '/api/tasks' && request.method === 'POST') {
+			await this.env.CAPTURE.put('task-submit', await request.text())
+			return Response.json({ code: 'invalid_request', message: 'smoke capture', outcome: 'rejected' }, { status: 400 })
+		}
+		return new Response(null, { status: 404 })
+	}
 	async getTip() { return { sequence: ${TIP}, closeTime: new Date().toISOString() } }
 	async readEntries({ keys }) {
 		const entries = []
@@ -151,7 +165,22 @@ function splitSql(sql: string): string[] {
 	return statements
 }
 
-async function start(vars: Record<string, string>, rows: Array<[string, string, number]>) {
+// Workers AI stand-in (song-intent smoke only): answers DeepSeek with a recorded-shape intent and
+// records how it was called; every other model throws (NSFW then fails closed, as in production).
+// Bound as an RPC service named AI (Miniflare 5's v4 converter drops wrappedBindings).
+const AI_MOCK = `
+import { WorkerEntrypoint } from 'cloudflare:workers'
+export default class extends WorkerEntrypoint {
+	async run(model, input, options) {
+		await this.env.AI_CALLS.put(model, JSON.stringify({ argc: arguments.length, input, options: options ?? null }))
+		if (model === '@cf/deepseek-ai/deepseek-v4.1-flash-1017') {
+			return { response: '{"mode":"user_lyrics","lyrics_lines":[4,13],"title":null,"vocal_gender":"f","styles":["dream pop","synth pads","slow tempo","nocturnal","female vocals"],"exclusions":["drums"]}' }
+		}
+		throw new Error('smoke: no Workers AI model ' + model)
+	}
+}`
+
+async function start(vars: Record<string, string>, rows: Array<[string, string, number]>, withAi = false) {
 	const mf = new Miniflare(convertV4MiniflareOptions({
 		workers: [{
 			name: 'smol-workflow',
@@ -173,10 +202,12 @@ async function start(vars: Record<string, string>, rows: Array<[string, string, 
 				TX_WORKFLOW: { name: 'smol-tx-workflow', className: 'TxWorkflow' },
 				SMOKE_TX_WORKFLOW: { name: 'smoke-tx-workflow', className: 'SmokeTxWorkflow' },
 			},
-			serviceBindings: { KALE_WORKER: 'kale-mock', AISONGGENERATOR: 'kale-mock' },
+			serviceBindings: { KALE_WORKER: 'kale-mock', AISONGGENERATOR: 'kale-mock', ...(withAi ? { AI: 'ai-mock' } : {}) },
 			outboundService: (request: Request) => (escaped.push(request.url), new Response('blocked', { status: 599 })),
 		}, {
 			name: 'kale-mock', modules: true, script: KALE_MOCK, compatibilityDate: config.compatibility_date, kvNamespaces: ['CAPTURE'],
+		}, {
+			name: 'ai-mock', modules: true, script: AI_MOCK, compatibilityDate: config.compatibility_date, kvNamespaces: ['AI_CALLS'],
 		}],
 	}))
 	const db = await mf.getD1Database('SMOL_D1')
@@ -603,6 +634,49 @@ async function imagesAndCreatedSearch() {
 	}
 }
 
+// --- Song intent (lane 2a): DeepSeek intent -> finalized lyrics -> AISG submit body, in the bundle ----
+
+async function songIntent() {
+	const { mf } = await start({}, [], true)
+	try {
+		const prompt = 'Title: Night Bus\r\n[STYLE: lo-fi hip hop, female vocals, no drums]\r\n\r\n[Verse]\r\nWindow fogged\r\nthe city hums\r\n\r\nneon puddles\r\nslow bus turns\r\n[Chorus]\r\nRide on\r\nride on\r\n"one more stop"'
+		const kv = await mf.getKVNamespace('SMOL_KV')
+		await kv.put('smoke-intent-retry', JSON.stringify({
+			payload: { address: 'CSMOKEINTENT', prompt, public: false, instrumental: false, provider: 'aisonggenerator' },
+			image_base64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNgAAAAAgABSK+kcQAAAABJRU5ErkJggg==',
+			description: 'a pixel bus at night',
+		}))
+		const { id } = JSON.parse((await call(mf, '/__smoke/generate', { body: { retry_id: 'smoke-intent-retry' } })).text)
+		const lyrics = await until(async () => JSON.parse((await call(mf, `/__smoke/do-steps?id=${id}`)).text).lyrics ?? undefined, 'finalized lyrics')
+		assert.deepEqual(lyrics, {
+			title: 'Night Bus',
+			style: ['dream pop', 'female vocals', 'synth pads', 'slow tempo', 'nocturnal'],
+			lyrics: '[Verse]\nWindow fogged\nthe city hums\n\nneon puddles\nslow bus turns\n[Chorus]\nRide on\nride on\n"one more stop"',
+			vocalGender: 'f',
+			negativeTags: 'male vocals, drums',
+			intent_v: 1,
+		})
+		const aiCalls = await mf.getKVNamespace('AI_CALLS', 'ai-mock')
+		const intentCall = JSON.parse((await aiCalls.get('@cf/deepseek-ai/deepseek-v4.1-flash-1017'))!)
+		assert.equal(intentCall.argc, 2, 'env.AI.run(model, input): no gateway option')
+		assert.deepEqual(intentCall.input.response_format, { type: 'json_object' })
+		const capture = await mf.getKVNamespace('CAPTURE', 'kale-mock')
+		const lyricsRequest = JSON.parse((await capture.get('lyrics-request'))!)
+		assert.equal(lyricsRequest.user_prompt, prompt)
+		assert.ok(!lyricsRequest.prompt.includes('# Description') && !lyricsRequest.prompt.includes('pixel bus'))
+		const logs = await workerLogs(mf)
+		const intentLog = logs.find((line) => line.includes('"song_intent"'))
+		assert.ok(intentLog, 'song_intent log line')
+		assert.deepEqual(Object.keys(JSON.parse(intentLog)).sort(), ['event', 'mode', 'ms', 'source'])
+		assert.match(intentLog, /"source":"model","mode":"user_lyrics"/)
+		const submitted = JSON.parse(await until(async () => (await capture.get('task-submit')) ?? undefined, 'AISG submit body'))
+		assert.deepEqual([submitted.vocalGender, submitted.negativeTags, submitted.lyrics, submitted.description], ['f', 'male vocals, drums', lyrics.lyrics, 'a pixel bus at night'])
+		console.log('ok song intent in workerd: DeepSeek via env.AI (no gateway) -> verbatim user lyrics, female vocals first, negativeTags string; AISG submit carries vocalGender/negativeTags; /api/lyrics gets user_prompt, no caption')
+	} finally {
+		await mf.dispose()
+	}
+}
+
 async function main() {
 	console.log(`compatibility_date ${config.compatibility_date}`)
 	await imagesAndCreatedSearch()
@@ -610,6 +684,7 @@ async function main() {
 	await mainnetAdmission()
 	await testIdentitySigning()
 	await webauthnAndAudio()
+	await songIntent()
 	assert.deepEqual(escaped, [], 'no outbound network calls')
 	console.log('wf1 bundle smoke: PASS (0 outbound calls)')
 }

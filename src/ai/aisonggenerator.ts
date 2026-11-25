@@ -234,37 +234,35 @@ function normalizeDistinctSongIds(values: unknown): string[] {
 	return result;
 }
 
-// Generate lyrics from a prompt (AISG primary with Workers AI fallback inside aisonggenerator-worker)
-export async function generateLyrics(env: Env, prompt: string, description: string): Promise<AiSongGeneratorLyrics> {
-	const promptWithDescription = `
-        # Prompt
-        ${prompt}
+/**
+ * Instrumental caption sent to AISG. New lyrics (`intent_v`) send "" so the cover caption never steers
+ * an instrumental; old stored lyrics keep sending it, so their idempotency hashes stay stable.
+ */
+export function aisgSubmitDescription(description: string, lyrics: AiSongGeneratorLyrics, is_instrumental: boolean): string {
+	return is_instrumental && lyrics.intent_v ? '' : description;
+}
 
-        # Description
-        ${description}
+// Generate lyrics from a prompt (AISG primary with Workers AI fallback inside aisonggenerator-worker).
+// The cover caption is not sent: it is a description of pixel art, not of the song.
+export async function generateLyrics(env: Env, prompt: string): Promise<AiSongGeneratorLyrics> {
+	const finalPrompt = `# Prompt
+${prompt}
 
-        # NOTES
-        Write the title, lyrics, and style tags in the exact language of # Prompt unless another language is explicitly requested.
-        Keep # Prompt authoritative for genre, mood, and subject, using # Description as visual flavor.
-    `;
-	const promptWithoutDescription = `
-        # Prompt
-        ${prompt}
-
-        # NOTES
-        Write the title, lyrics, and style tags in the exact language of # Prompt unless another language is explicitly requested.
-        Focus on vivid imagery, singable cadence, and a memorable hook while staying faithful to # Prompt.
-    `;
-
-	const finalPrompt = prompt.length > 760 ? promptWithoutDescription : promptWithDescription;
+# NOTES
+Write the title, lyrics, and style tags in the exact language of # Prompt unless another language is explicitly requested.
+Stay faithful to # Prompt for genre, mood, vocalist, and subject; if it contains lyrics, keep them.
+Put [Section] headings on their own lines. Never write stage directions or instrument cues in parentheses.
+`;
 
 	const res = await env.AISONGGENERATOR.fetch('http://aisonggenerator-worker/api/lyrics', {
 		method: 'POST',
 		headers: {
 			'Content-Type': 'application/json',
 		},
+		// `user_prompt` (raw) lets the worker's language guard ignore the wrapper; older workers ignore it.
 		body: JSON.stringify({
 			prompt: finalPrompt,
+			user_prompt: prompt,
 		}),
 		signal: AbortSignal.timeout(45_000),
 	});
@@ -294,7 +292,7 @@ export async function submitAisgTask(
 	const requestPayload = JSON.stringify({
 		...lyrics,
 		prompt,
-		description,
+		description: aisgSubmitDescription(description, lyrics, is_instrumental),
 		public: is_public,
 		instrumental: is_instrumental,
 		...(attemptId ? { attempt_id: attemptId } : {}),
@@ -399,7 +397,7 @@ export async function replayAisgTaskSubmit(
 			body: JSON.stringify({
 				...lyrics,
 				prompt,
-				description,
+				description: aisgSubmitDescription(description, lyrics, is_instrumental),
 				public: is_public,
 				instrumental: is_instrumental,
 				attempt_id: attemptId,
@@ -498,7 +496,7 @@ export async function generateSongs(
 			body: JSON.stringify({
 				...lyrics,
 				prompt,
-				description,
+				description: aisgSubmitDescription(description, lyrics, is_instrumental),
 				public: is_public,
 				instrumental: is_instrumental,
 				...(attemptId ? { attempt_id: attemptId } : {}),
