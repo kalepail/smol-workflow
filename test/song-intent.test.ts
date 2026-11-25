@@ -215,3 +215,63 @@ test('AISG wire: old lyrics give byte-identical submit/replay/legacy bodies; new
 	assert.match(lyricsBody.prompt, /^# Prompt\nsoft romantic rock song with female voice\n/)
 	assert.ok(!lyricsBody.prompt.includes('# Description'))
 })
+
+test('pass-1 #2: styles never fail a complete song (refill from songwriter, then neutral defaults)', () => {
+	const sw = (style: string[]): AiSongGeneratorLyrics => ({ title: 'Night Bus', style, lyrics: SONGWRITER.lyrics })
+	const run = (prompt: string, model: Parameters<typeof mergeSongIntent>[0], style: string[], instrumental = false) =>
+		finalizeSongText(sw(style), mergeSongIntent(model, prompt, instrumental), prompt, instrumental).style
+
+	const nightBus = run('Sad indie folk about a night bus', null, ['indie folk', 'female vocals'])
+	assert.deepEqual(nightBus, ['indie folk', 'female vocals'], 'null model: refill restores the songwriter tag')
+	assert.ok(run('a song', null, ['female vocals', 'male vocals']).length >= 2, 'two single-gender tags')
+	assert.deepEqual(run('a song', null, ['female vocals']), ['female vocals', 'original song'])
+	assert.deepEqual(run('soft piano', null, [], true), ['instrumental', 'full arrangement'])
+
+	const folk = { mode: 'write' as const, lyrics_lines: null, title: null, vocal_gender: null, styles: ['folk', 'Folk', 'FOLK', 'fOlK'], exclusions: [] }
+	const variants = run('folk song', folk, ['Folk', 'acoustic guitar', 'warm'])
+	assert.deepEqual(variants, ['folk', 'acoustic guitar', 'warm'], 'case variants collapse, then refill')
+	assert.deepEqual(run('folk song', folk, []), ['folk', 'original song'])
+
+	// Exclusions still apply to the refill.
+	assert.ok(!run('folk song, no drums', { ...folk, exclusions: ['drums'] }, ['drums', 'banjo']).includes('drums'))
+	// Zero ASCII tags: unchanged behaviour (the unfiltered songwriter tags).
+	assert.deepEqual(run('गीत', null, ['नेपाली गीत', 'भावपूर्ण']), ['नेपाली गीत', 'भावपूर्ण'])
+})
+
+test('pass-1 #3: range extension needs a quoted line; plain instructions after the lyric are never appended', () => {
+	const lyric = '[Verse]\nWindow fogged\nCity asleep\nNeon puddles\n[Chorus]\nRide on\nOne more stop\nOver the hill'
+	const model = { mode: 'user_lyrics' as const, lyrics_lines: [1, 8] as [number, number], title: null, vocal_gender: null, styles: [], exclusions: [] }
+	const notes = `${lyric}\nPlease mix the drums louder.\nDo not sing these instructions.`
+	const merged = mergeSongIntent(model, notes, false)
+	assert.deepEqual(merged.lyrics_lines, [1, 8])
+	assert.equal(finalizeSongText(SONGWRITER, merged, notes, false).lyrics, lyric)
+
+	const quoted = `${lyric}\n“One more stop,” she said\nPlease mix the drums louder.`
+	assert.deepEqual(mergeSongIntent(model, quoted, false).lyrics_lines, [1, 9])
+})
+
+test('pass-1 #4: sanitizeLyrics unwraps markdown cues and drops chord-chart lines (corpus 328a45, 4c46a7)', () => {
+	const raw = [
+		'[Verse 6]', '**[Outro – Screaming slide guitar]**', 'Roll him up!', '__[Bridge]__', '*[Fade]*',
+		'**Verse 1**', '**Chorus:**', '**Really loud and proud**',
+		'Dm........A#...........C..........Dm.......', 'G | D/F# | Em7 | Cmaj7', 'F#m7 - Bbmaj7 - G/B', 'C',
+		'A day in May', 'Am I the one', 'Bad dreams again',
+	].join('\n')
+	const once = sanitizeLyrics(raw)
+	assert.equal(once, [
+		'[Verse 6]', '[Outro – Screaming slide guitar]', 'Roll him up!', '[Bridge]', '[Fade]',
+		'[Verse 1]', '[Chorus]', '**Really loud and proud**',
+		'C', 'A day in May', 'Am I the one', 'Bad dreams again',
+	].join('\n'))
+	assert.equal(sanitizeLyrics(once), once, 'idempotent')
+})
+
+test('pass-1 #5: vocal lyrics are never empty (1f65e2 with songwriter "(No lyrics)")', () => {
+	const noLyrics = { ...fixtures['1f65e2'].songwriter!, lyrics: '(No lyrics)' }
+	const out = finalize('1f65e2', modelOf('1f65e2'), noLyrics, false)
+	assert.ok(out.lyrics.trim().length > 0)
+	assert.ok(out.title && out.style.length >= 2)
+	const chordsOnly = { ...noLyrics, lyrics: '(No lyrics)\nDm....C....G\nAm..F' }
+	assert.equal(finalize('1f65e2', modelOf('1f65e2'), chordsOnly, false).lyrics, 'Dm....C....G\nAm..F', 'raw minus placeholders')
+	assert.equal(finalize('1f65e2', modelOf('1f65e2'), noLyrics, true).lyrics, '', 'instrumental stays empty')
+})

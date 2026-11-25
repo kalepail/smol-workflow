@@ -221,18 +221,40 @@ export function deterministicIntent(prompt: string): Pick<SongIntent, 'title' | 
 const PLACEHOLDER_LINES = new Set(['(no lyrics)', '(instrumental)', '(instrumental break)', '(no vocals)']);
 const DIRECTION_KEYWORDS = /\b(solos?|instrumental|break(?:down)?s?|riffs?|fade(?:s|d|\s?out|\s?in)?|intro|outro|guitars?|piano|drums?|bass|synths?|strings|violins?|beat drop|build(?:-?up)?s?)\b/i;
 const HEADING_LINE = /^\s*\[[^\]]+\]\s*$/;
+const EMPHASIZED_CUE = /^(\*\*|__|\*|_)\s*(\[[^\]]+\])\s*\1$/; // **[Outro – x]** -> [Outro – x]
+const BOLD_SECTION = /^(\*\*|__)\s*([^*_\n]{1,40}?)\s*:?\s*\1$/; // **Verse 1** -> [Verse 1]
+const SECTION_WORD = /^(?:verse|chorus|pre-?chorus|post-?chorus|bridge|intro|outro|hook|refrain|interlude|breakdown|instrumental|solo|drop|coda|final chorus)\b[\w\s#.\-–]*$/i;
+const CHORD = /^[A-G](?:#|b)?(?:maj|min|m|dim|aug|sus|add)?\d*(?:\/[A-G](?:#|b)?)?$/;
+
+/** A chord-chart line ("Dm........A#....C", "G | D/F# | Em7"): only chord tokens between dots/spaces/dashes/pipes. */
+function isChordLine(trimmed: string): boolean {
+	const tokens = trimmed.split(/[\s.\-|]+/).filter(Boolean);
+	if (!tokens.length || !tokens.every((t) => CHORD.test(t))) return false;
+	return tokens.length >= 2 || /[.|]/.test(trimmed);
+}
 
 /**
- * Idempotent: drops exact placeholder lines and turns a full-line `( … )` into a `[ … ]` heading
- * only when it names an instrument/arrangement cue. Everything else (sung backing vocals such as
- * "(Your smile pulls me in)") is kept verbatim.
+ * Idempotent: drops exact placeholder lines and chord-chart lines, unwraps markdown-emphasized
+ * cues (`**[Outro]**`, `**Verse 1**` -> `[Verse 1]`), and turns a full-line `( … )` into a `[ … ]`
+ * heading only when it names an instrument/arrangement cue. Everything else (sung backing vocals
+ * such as "(Your smile pulls me in)") is kept verbatim.
  */
 export function sanitizeLyrics(text: string): string {
 	const lines = String(text ?? '').replace(/\r\n?/g, '\n').split('\n');
 	const out: string[] = [];
 	for (const line of lines) {
 		const trimmed = line.trim();
-		if (PLACEHOLDER_LINES.has(trimmed.toLowerCase())) continue;
+		if (PLACEHOLDER_LINES.has(trimmed.toLowerCase()) || isChordLine(trimmed)) continue;
+		const cue = EMPHASIZED_CUE.exec(trimmed);
+		if (cue) {
+			out.push(cue[2]);
+			continue;
+		}
+		const bold = BOLD_SECTION.exec(trimmed);
+		if (bold && SECTION_WORD.test(bold[2])) {
+			out.push(`[${bold[2]}]`);
+			continue;
+		}
 		const paren = /^\(([^()]+)\)$/.exec(trimmed);
 		out.push(paren && DIRECTION_KEYWORDS.test(paren[1]) ? `[${paren[1].trim()}]` : line);
 	}
@@ -272,24 +294,41 @@ export function ensureVocalistInFirstThree(styles: string[], gender: VocalGender
 
 const toAscii = (s: string) => s.normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[đĐ]/g, (c) => (c === 'đ' ? 'd' : 'D'));
 
-function finalizeStyles(candidates: string[], exclusions: string[], gender: VocalGender | null): string[] {
+const isAscii = (tag: string) => /^[\x20-\x7e]+$/.test(tag);
+
+function finalizeStyles(
+	candidates: string[],
+	songwriterTags: string[],
+	exclusions: string[],
+	gender: VocalGender | null,
+	isInstrumental: boolean
+): string[] {
 	const excluded = exclusions.map((e) => new RegExp(`\\b${escapeRe(e)}\\b`, 'i'));
 	const seen = new Set<string>();
 	const cleaned: string[] = [];
-	for (const raw of candidates) {
+	const add = (raw: unknown, refill: boolean) => {
 		const tag = typeof raw === 'string' ? raw.replace(/\s+/g, ' ').trim() : '';
-		if (!tag || excluded.some((re) => re.test(tag))) continue;
+		if (!tag || excluded.some((re) => re.test(tag))) return;
 		const g = genderOfTag(tag);
-		if (gender === null && (g === 'f' || g === 'm')) continue; // unstated gender: no single-gender tag
-		if (gender && g && g !== 'both' && g !== gender) continue;
-		const key = tag.toLowerCase();
-		if (seen.has(key)) continue;
+		if (!refill && gender === null && (g === 'f' || g === 'm')) return; // unstated gender: no single-gender tag
+		if (gender && g && g !== 'both' && g !== gender) return;
+		const key = toAscii(tag).toLowerCase();
+		if (seen.has(key)) return;
 		seen.add(key);
 		cleaned.push(tag);
+	};
+	for (const raw of candidates) add(raw, false);
+	const asciiCount = () => cleaned.filter((tag) => isAscii(toAscii(tag))).length;
+	// Styles never fail a complete song: refill from the songwriter, then neutral English defaults.
+	if (asciiCount() < 3) for (const raw of songwriterTags) add(raw, true);
+	const ascii = cleaned.map(toAscii).filter(isAscii);
+	// Zero ASCII tags (non-English songwriter): keep the unfiltered tags, as before.
+	const base = ascii.length ? ascii : cleaned;
+	const defaults = isInstrumental ? ['instrumental', 'full arrangement'] : ['original song', 'full arrangement'];
+	for (const tag of defaults) {
+		if (base.length >= 2) break;
+		if (!base.some((t) => t.toLowerCase() === tag)) base.push(tag);
 	}
-	const ascii = cleaned.map(toAscii).filter((tag) => /^[\x20-\x7e]+$/.test(tag));
-	// Never let the ASCII rule empty a non-English songwriter's tags (the step needs >= 2).
-	const base = ascii.length >= 2 ? ascii : cleaned;
 	return ensureVocalistInFirstThree(base, gender).slice(0, MAX_STYLES);
 }
 
@@ -333,13 +372,12 @@ function styleBlockLines(lines: string[]): Set<number> {
 	return out;
 }
 
-const isQuoted = (line: string) => /^\s*["“'‘«]/.test(line);
-const isLabel = (line: string) => /^\s*[^\s"“'‘\[(][^:]{0,30}:/.test(line);
+const isQuoted = (line: string) => /^\s*["“”'‘]/.test(line);
 
 /**
  * The model's lyric range, if it passes every check; otherwise null (the songwriter writes).
  * >= 8 non-empty lines, >= 4 sung lines, a [heading] or a clear lyric shape, no [STYLE] overlap;
- * extends by up to 2 lines when the next line continues the lyric (quoted or same-shape, no label).
+ * extends by up to 2 lines only onto quoted lines (positive evidence of a continued lyric).
  */
 export function validatedLyricRange(prompt: string, range: [number, number] | null): [number, number] | null {
 	const lines = promptLines(prompt);
@@ -357,12 +395,8 @@ export function validatedLyricRange(prompt: string, range: [number, number] | nu
 	const shortLines = sung.filter((line) => line.trim().length <= 80).length;
 	if (!hasHeading && (shortLines / sung.length < 0.75 || sung.some((line) => line.trim().length > 160))) return null;
 
-	const maxSung = Math.max(...sung.map((line) => line.trim().length));
 	for (let step = 0; step < 2 && b < lines.length; step++) {
-		const next = lines[b];
-		const t = next.trim();
-		if (!t || style.has(b) || isLabel(next)) break;
-		if (!(isQuoted(next) || HEADING_LINE.test(next) || t.length <= Math.max(80, maxSung))) break;
+		if (style.has(b) || !isQuoted(lines[b])) break;
 		b += 1;
 	}
 	return [a, b];
@@ -418,12 +452,18 @@ export function finalizeSongText(
 		lyrics = songwriterLyrics;
 	}
 	if (!isInstrumental && countSungLines(lyrics) < 4) lyrics = songwriterLyrics; // vocal guard
+	if (!isInstrumental && !lyrics) {
+		// Never empty vocal lyrics: the songwriter's raw text minus placeholders, else as-is.
+		const raw = String(generated.lyrics ?? '').replace(/\r\n?/g, '\n');
+		const kept = raw.split('\n').filter((line) => !PLACEHOLDER_LINES.has(line.trim().toLowerCase())).join('\n').trim();
+		lyrics = kept || raw.trim();
+	}
 
 	const title = Array.from((intent.title ?? generated.title ?? '').trim()).slice(0, MAX_TITLE_CHARS).join('').trim();
 	const songwriterTags = Array.isArray(generated.style) ? generated.style : [];
 	const candidates = intent.styles
 		?? (intent.clauses.length ? [...intent.clauses, ...songwriterTags.slice(0, 2)] : songwriterTags);
-	const style = finalizeStyles(candidates, intent.exclusions, intent.vocal_gender);
+	const style = finalizeStyles(candidates, songwriterTags, intent.exclusions, intent.vocal_gender, isInstrumental);
 	const negativeTags = buildNegativeTags(intent.vocal_gender, intent.exclusions);
 
 	return {
