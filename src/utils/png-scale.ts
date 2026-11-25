@@ -2,8 +2,9 @@
  * Nearest-neighbor integer upscaling of non-interlaced PNGs with no dependencies beyond `node:zlib`.
  *
  * Every size is checked before anything large is allocated: input bytes, source pixels, output
- * dimensions and output raw bytes are capped, and the image data is inflated with `maxOutputLength`
- * set to the exact size the header declares, so a decompression bomb stops at that size.
+ * dimensions and output raw bytes are capped. The image data is inflated with `maxOutputLength` set to
+ * the size the header declares plus `INFLATE_HEADROOM`, so a decompression bomb stops there. Anything
+ * that is not exactly the declared size is then rejected.
  *
  * The output keeps the source colour type and bit depth. PLTE, tRNS and the colour-space chunks are
  * copied verbatim (integer upscaling does not change a single sample). Malformed, oversized or
@@ -13,6 +14,13 @@ import { deflateSync, inflateSync } from 'node:zlib'
 import { HTTPException } from 'hono/http-exception'
 
 export const PNG_MAX_INPUT_BYTES = 8 * 1024 * 1024
+/**
+ * workerd's sync zlib reserves output in fixed 40 KiB steps (`ZLIB_PERFORMANT_CHUNK_SIZE`, whatever
+ * `chunkSize` says) and throws `RangeError: Memory limit exceeded` as soon as a reservation would pass
+ * `maxOutputLength`, even when the data itself fits. An exact bound therefore rejects valid images
+ * (e.g. 128x128 RGBA = 65,664 bytes). One step of headroom is always enough; 64 KiB leaves margin.
+ */
+export const INFLATE_HEADROOM = 64 * 1024
 const PNG_MAX_SOURCE_PIXELS = 2048 * 2048
 const PNG_MAX_OUTPUT_SIDE = 4096
 /** Raw (filtered, uncompressed) output bytes: a 4096×4096 8-bit RGBA image and nothing larger. */
@@ -147,7 +155,7 @@ function inflatePixels(png: ParsedPng): DecodedPng {
 	const expected = png.height * (stride + 1)
 	let data: Uint8Array
 	try {
-		data = inflateSync(png.idat, { maxOutputLength: expected })
+		data = inflateSync(png.idat, { maxOutputLength: expected + INFLATE_HEADROOM })
 	} catch {
 		fail('image data does not inflate to the declared size')
 	}

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import zlib, { deflateSync } from 'node:zlib'
 import { HTTPException } from 'hono/http-exception'
-import { decodePng, PNG_MAX_INPUT_BYTES, scalePng } from '../src/utils/png-scale'
+import { decodePng, INFLATE_HEADROOM, PNG_MAX_INPUT_BYTES, scalePng } from '../src/utils/png-scale'
 import { CHANNELS, encodeTestPng, ihdr, inflateIdat, packRows, pngChunk, readChunks, type TestPngSpec } from './helpers/png'
 
 const ALL_FILTERS = [0, 1, 2, 3, 4]
@@ -70,12 +70,15 @@ const FORMATS: Array<[colorType: number, bitDepth: number]> = [
 ]
 
 test('every colour type and bit depth, all five scanline filters, scales 1/2/3/7: exact nearest-neighbor output', () => {
-	const palette = Uint8Array.of(255, 0, 0, 0, 255, 0, 0, 0, 255, 10, 20, 30)
 	for (const [colorType, bitDepth] of FORMATS) {
+		// At most 2 ** bitDepth palette entries (2 for 1-bit, 4 otherwise), tRNS no longer than PLTE.
+		const entries = Math.min(4, 2 ** bitDepth)
+		const palette = Uint8Array.of(255, 0, 0, 0, 255, 0, 0, 0, 255, 10, 20, 30).subarray(0, entries * 3)
+		const trns = Uint8Array.of(255, 0, 128).subarray(0, Math.min(3, entries))
 		const spec: TestPngSpec = {
 			width: 7, height: 5, bitDepth, colorType, filters: ALL_FILTERS,
 			pixels: samplePixels(7, 5, bitDepth, colorType, colorType * 31 + bitDepth),
-			before: colorType === 3 ? [['PLTE', palette], ['tRNS', Uint8Array.of(255, 0, 128)]] : [],
+			before: colorType === 3 ? [['PLTE', palette], ['tRNS', trns]] : [],
 		}
 		const input = encodeTestPng(spec)
 		assert.deepEqual(decodePng(input).pixels, new Uint8Array(Buffer.concat(packRows(7, 5, bitDepth, colorType, spec.pixels))), `${colorType}/${bitDepth} decode`)
@@ -84,7 +87,7 @@ test('every colour type and bit depth, all five scanline filters, scales 1/2/3/7
 			assertScaled(output, spec, scale, `ct${colorType} bd${bitDepth} x${scale}`)
 			if (colorType === 3) {
 				const kept = readChunks(output).filter((c) => c.type === 'PLTE' || c.type === 'tRNS').map((c) => Buffer.from(c.raw))
-				assert.deepEqual(kept, [pngChunk('PLTE', palette), pngChunk('tRNS', Uint8Array.of(255, 0, 128))].map((c) => Buffer.from(c)), 'PLTE/tRNS copied verbatim')
+				assert.deepEqual(kept, [pngChunk('PLTE', palette), pngChunk('tRNS', trns)].map((c) => Buffer.from(c)), 'PLTE/tRNS copied verbatim')
 			}
 		}
 	}
@@ -177,7 +180,7 @@ test('interlaced PNGs are rejected', () => {
 })
 
 test('decompression bombs and oversized inputs/outputs fail before large allocations', () => {
-	// 1x1 header, ~64 MiB of zeros in ~64 KiB of zlib: inflate stops at the 2 declared bytes.
+	// 1x1 header, ~64 MiB of zeros in ~64 KiB of zlib: inflate stops at the 2 declared bytes + headroom.
 	const bomb = encodeTestPng({ width: 1, height: 1, bitDepth: 8, colorType: 0, pixels: [[0]], idat: deflateSync(Buffer.alloc(64 * 1024 * 1024)) })
 	assert.ok(bomb.byteLength < 100_000)
 	const { inflateSync } = zlib
@@ -188,7 +191,14 @@ test('decompression bombs and oversized inputs/outputs fail before large allocat
 	} finally {
 		zlib.inflateSync = inflateSync
 	}
-	assert.deepEqual(bounds, [2], 'inflate is capped at the declared 1 x (1 + 1) bytes')
+	assert.deepEqual(bounds, [2 + INFLATE_HEADROOM], 'inflate is capped at the declared 1 x (1 + 1) bytes plus headroom')
+
+	// Overruns that fit inside the headroom are still rejected by the exact-length check.
+	const rgba128 = 128 * (1 + 128 * 4)
+	for (const extra of [1, 1000, INFLATE_HEADROOM]) {
+		const near = encodeTestPng({ width: 128, height: 128, bitDepth: 8, colorType: 6, pixels: [], idat: deflateSync(Buffer.alloc(rgba128 + extra)) })
+		assert422(() => scalePng(near, 2), /does not inflate to the declared size/, `+${extra} bytes`)
+	}
 
 	const tiny = deflateSync(Buffer.alloc(1))
 	const header = (w: number, h: number, bd: number, ct: number) => encodeTestPng({ width: w, height: h, bitDepth: bd, colorType: ct, pixels: [], idat: tiny })

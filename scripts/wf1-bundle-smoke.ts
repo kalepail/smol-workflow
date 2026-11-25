@@ -35,7 +35,7 @@ import { derivePasskeyKitContractId } from '../src/passkey'
 import { decodePng } from '../src/utils/png-scale'
 import { contractDataKey, storageKey } from '../src/utils/chain'
 import { testIdentity, testIssuerKeypair } from '../test/fixtures/mint-authz/generate'
-import { encodeTestPng, packRows, readChunks } from '../test/helpers/png'
+import { encodeTestPng, inflateIdat, packRows, readChunks } from '../test/helpers/png'
 
 const ROOT = resolve(__dirname, '..')
 const BUNDLE = resolve(process.argv[2] ?? '/tmp/wf1-lean-dry')
@@ -503,6 +503,12 @@ async function imagesAndCreatedSearch() {
 		await put('indexed.png', encodeTestPng({ width: 5, height: 3, bitDepth: 4, colorType: 3, pixels: indexed, filters: [4, 3, 1], before: [['PLTE', plte], ['tRNS', trns]] }))
 		await put('broken.png', Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13))
 		await put('bomb.png', encodeTestPng({ width: 1, height: 1, bitDepth: 8, colorType: 0, pixels: [], idat: deflateSync(Buffer.alloc(8 << 20)) }))
+		// 128x128 RGBA declares 65,664 inflated bytes: an exact maxOutputLength trips workerd's 40 KiB
+		// output reservation (RangeError: Memory limit exceeded), so this proves the inflate headroom.
+		const cover = Array.from({ length: 128 * 128 }, (_, i) => [(i & 127) * 2, (i >> 7) * 2, ((i & 127) ^ (i >> 7)) & 0xff, 255 - (((i & 127) + (i >> 7)) & 0x7f)])
+		await put('cover128.png', encodeTestPng({ width: 128, height: 128, bitDepth: 8, colorType: 6, pixels: cover, filters: [0, 1, 2, 3, 4] }))
+		// Same header, 1,000 bytes too many: inside the headroom, so only the exact-length check stops it.
+		await put('bomb128.png', encodeTestPng({ width: 128, height: 128, bitDepth: 8, colorType: 6, pixels: [], idat: deflateSync(Buffer.alloc(128 * (1 + 128 * 4) + 1000)) }))
 
 		const scaled = await mf.dispatchFetch('https://api.smol.xyz/image/rgba.png?scale=4')
 		const bytes = new Uint8Array(await scaled.arrayBuffer())
@@ -528,13 +534,43 @@ async function imagesAndCreatedSearch() {
 		const head = await mf.dispatchFetch('https://api.smol.xyz/image/rgba.png?scale=4', { method: 'HEAD' })
 		assert.equal(head.status, 200)
 		await head.arrayBuffer()
-		for (const key of ['broken.png', 'bomb.png']) {
+		const big = await mf.dispatchFetch('https://api.smol.xyz/image/cover128.png?scale=32')
+		const bigBytes = new Uint8Array(await big.arrayBuffer())
+		assert.equal(big.status, 200, `128x128 cover x32: ${new TextDecoder().decode(bigBytes.subarray(0, 200))}`)
+		assert.equal(Number(big.headers.get('Content-Length')), bigBytes.byteLength)
+		const bigHeader = Buffer.from(readChunks(bigBytes)[0].data)
+		assert.deepEqual([bigHeader.readUInt32BE(0), bigHeader.readUInt32BE(4), bigHeader[8], bigHeader[9]], [4096, 4096, 8, 6])
+		// Decode independently (Node inflate + Sub/Up, the only filters the scaler writes) and check both
+		// edge columns of every scaled pixel block on each block's first and last row, plus every 97th row.
+		const stride = 4096 * 4
+		const raw = inflateIdat(bigBytes)
+		assert.equal(raw.byteLength, 4096 * (stride + 1))
+		let prev = new Uint8Array(stride)
+		let checked = 0
+		for (let y = 0; y < 4096; y++) {
+			const filter = raw[y * (stride + 1)]
+			const row = Uint8Array.from(raw.subarray(y * (stride + 1) + 1, (y + 1) * (stride + 1)))
+			if (filter === 1) for (let i = 4; i < stride; i++) row[i] += row[i - 4]
+			else if (filter === 2) for (let i = 0; i < stride; i++) row[i] += prev[i]
+			else assert.fail(`row ${y}: unexpected filter ${filter}`)
+			if (y % 32 === 0 || y % 32 === 31 || y % 97 === 0) {
+				for (let sx = 0; sx < 128; sx++) {
+					for (const x of [sx * 32, sx * 32 + 31]) {
+						assert.deepEqual([...row.subarray(x * 4, x * 4 + 4)], cover[(y >> 5) * 128 + sx], `pixel ${x},${y}`)
+						checked += 1
+					}
+				}
+			}
+			prev = row
+		}
+
+		for (const key of ['broken.png', 'bomb.png', 'bomb128.png']) {
 			const rejected = await mf.dispatchFetch(`https://api.smol.xyz/image/${key}?scale=2`)
 			assert.equal(rejected.status, 422, key)
 			assert.match(await rejected.text(), /Unsupported or malformed PNG/)
 		}
 		assert.equal((await mf.dispatchFetch('https://api.smol.xyz/image/rgba.png?scale=33')).status, 400)
-		console.log(`ok png scaler in workerd: RGBA 4x4 -> 16x16 exact pixels (${bytes.byteLength} B), indexed 4-bit PLTE/tRNS -> 15x9 exact; corrupt + 8 MiB bomb -> 422; node:zlib maxOutputLength enforced`)
+		console.log(`ok png scaler in workerd: RGBA 4x4 -> 16x16 exact pixels (${bytes.byteLength} B), indexed 4-bit PLTE/tRNS -> 15x9 exact; 128x128 RGBA cover x32 -> 200 4096x4096 (${bigBytes.byteLength} B, ${checked} pixels checked); corrupt, 8 MiB bomb and in-headroom overrun -> 422; node:zlib maxOutputLength enforced`)
 
 		const owner = carriers[0].sub
 		const other = carriers[0].tracks.find((track) => track.creator !== owner)?.creator ?? `C${'B'.repeat(55)}`
