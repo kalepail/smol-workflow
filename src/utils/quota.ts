@@ -11,8 +11,8 @@ import {
 } from '../quota-do'
 
 export const DEFAULT_DAILY_LIMIT_CLASSIC = 10
-export const DEFAULT_DAILY_LIMIT_ELEVENLABS = 3
-export const DEFAULT_GLOBAL_DAILY_LIMIT_CLASSIC = 500
+export const DEFAULT_DAILY_LIMIT_ELEVENLABS = 5
+export const DEFAULT_GLOBAL_DAILY_LIMIT_CLASSIC = 100
 export const DEFAULT_GLOBAL_DAILY_LIMIT_ELEVENLABS = 20
 export const DEFAULT_BURST_LIMIT_PER_MINUTE = 0
 
@@ -107,15 +107,71 @@ function parseOptionalGlobalLimit(raw: string | undefined, fallback: number): nu
 	return Math.floor(parsed)
 }
 
-export function getUserQuotaLimits(env: Env): QuotaLimits {
+let cachedUserQuotaOverrides: { raw: string; entries: Map<string, Partial<QuotaLimits>> } | undefined
+let warnedAboutInvalidUserQuotaOverrides = false
+
+function warnInvalidUserQuotaOverrides(): void {
+	if (warnedAboutInvalidUserQuotaOverrides) return
+	warnedAboutInvalidUserQuotaOverrides = true
+	console.warn('Invalid USER_QUOTA_OVERRIDES configuration. Default limits apply to invalid entries or fields.')
+}
+
+function isQuotaOverrideObject(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function parseUserQuotaOverrides(raw: string): Map<string, Partial<QuotaLimits>> {
+	const entries = new Map<string, Partial<QuotaLimits>>()
+	let parsed: unknown
+	try {
+		parsed = JSON.parse(raw)
+	} catch {
+		// Malformed JSON follows the same fallback as a non-object value.
+	}
+	if (!isQuotaOverrideObject(parsed)) {
+		warnInvalidUserQuotaOverrides()
+		return entries
+	}
+
+	for (const [address, entry] of Object.entries(parsed)) {
+		if (!isQuotaOverrideObject(entry)) {
+			warnInvalidUserQuotaOverrides()
+			continue
+		}
+		const overrides: Partial<QuotaLimits> = {}
+		for (const key of ['classic', 'elevenlabs', 'burstPerMinute'] as const) {
+			const value = entry[key]
+			if (value === undefined) continue
+			if (typeof value === 'number' && Number.isInteger(value) && value >= 0) {
+				overrides[key] = value
+			} else {
+				warnInvalidUserQuotaOverrides()
+			}
+		}
+		entries.set(address, overrides)
+	}
+	return entries
+}
+
+function getUserQuotaOverride(raw: string | undefined, address: string): Partial<QuotaLimits> | undefined {
+	if (raw === undefined) return undefined
+	if (cachedUserQuotaOverrides?.raw !== raw) {
+		cachedUserQuotaOverrides = { raw, entries: parseUserQuotaOverrides(raw) }
+	}
+	return cachedUserQuotaOverrides.entries.get(address)
+}
+
+export function getUserQuotaLimits(env: Env, address: string): QuotaLimits {
+	const overrides = getUserQuotaOverride(env.USER_QUOTA_OVERRIDES, address)
 	const burstRaw = env.BURST_LIMIT_PER_MINUTE?.trim().toLowerCase()
-	const burstPerMinute = !burstRaw || burstRaw === 'off' || burstRaw === 'disabled'
+	const defaultBurstPerMinute = !burstRaw || burstRaw === 'off' || burstRaw === 'disabled'
 		? DEFAULT_BURST_LIMIT_PER_MINUTE
 		: parseNonNegativeInt(burstRaw, DEFAULT_BURST_LIMIT_PER_MINUTE)
+	const burstPerMinute = overrides?.burstPerMinute ?? defaultBurstPerMinute
 
 	return {
-		classic: parseNonNegativeInt(env.DAILY_LIMIT_CLASSIC, DEFAULT_DAILY_LIMIT_CLASSIC),
-		elevenlabs: parseNonNegativeInt(env.DAILY_LIMIT_ELEVENLABS, DEFAULT_DAILY_LIMIT_ELEVENLABS),
+		classic: overrides?.classic ?? parseNonNegativeInt(env.DAILY_LIMIT_CLASSIC, DEFAULT_DAILY_LIMIT_CLASSIC),
+		elevenlabs: overrides?.elevenlabs ?? parseNonNegativeInt(env.DAILY_LIMIT_ELEVENLABS, DEFAULT_DAILY_LIMIT_ELEVENLABS),
 		...(burstPerMinute > 0 ? { burstPerMinute } : {}),
 	}
 }
@@ -203,7 +259,7 @@ export async function getUserQuotaSnapshot(
 	nowMs?: number
 ): Promise<QuotaSnapshot> {
 	const stub = getUserQuotaStub(env, address)
-	return await stub.getQuota(getUserQuotaLimits(env), nowMs)
+	return await stub.getQuota(getUserQuotaLimits(env, address), nowMs)
 }
 
 function toGlobalLimitsForProvider(
@@ -397,7 +453,7 @@ export async function reserveGenerationQuota(
 	const initialDayKey = getUtcDayKey(nowMs)
 	const claimId = crypto.randomUUID()
 	const userKey = `user:${params.address}`
-	const userLimits = getUserQuotaLimits(env)
+	const userLimits = getUserQuotaLimits(env, params.address)
 	const globalLimits = toGlobalLimitsForProvider(getGlobalQuotaLimits(env))
 	const userStub = getUserQuotaStub(env, params.address)
 
@@ -723,7 +779,7 @@ export async function transitionFallbackQuota(
 	}
 ): Promise<CoordinatedFallbackTransitionResult> {
 	const nowMs = params.nowMs ?? Date.now()
-	const userLimits = getUserQuotaLimits(env)
+	const userLimits = getUserQuotaLimits(env, params.address)
 	const userStub = getUserQuotaStub(env, params.address)
 	const userResult = await userStub.transitionFallback(
 		params.reservationId,

@@ -52,6 +52,7 @@ function buildQuotaFlowHarness(options: {
 	dailyClassic?: string
 	dailyElevenLabs?: string
 	burstPerMinute?: string
+	userQuotaOverrides?: string
 	globalClassic?: string
 	globalElevenLabs?: string
 	fallbackEnabled?: string
@@ -149,9 +150,10 @@ function buildQuotaFlowHarness(options: {
 		ELEVENLABS_OUTPUT_FORMAT: 'mp3_44100_128',
 		ELEVENLABS_FALLBACK_ENABLED: options.fallbackEnabled ?? 'true',
 		DAILY_LIMIT_CLASSIC: options.dailyClassic ?? '10',
-		DAILY_LIMIT_ELEVENLABS: options.dailyElevenLabs ?? '3',
+		DAILY_LIMIT_ELEVENLABS: options.dailyElevenLabs ?? '5',
 		BURST_LIMIT_PER_MINUTE: options.burstPerMinute ?? '0',
-		GLOBAL_DAILY_LIMIT_CLASSIC: options.globalClassic ?? '500',
+		USER_QUOTA_OVERRIDES: options.userQuotaOverrides,
+		GLOBAL_DAILY_LIMIT_CLASSIC: options.globalClassic ?? '100',
 		GLOBAL_DAILY_LIMIT_ELEVENLABS: options.globalElevenLabs ?? '20',
 		PLAY_COUNT_MODE: options.playCountMode ?? 'server',
 		PLAY_BEACON_RATE_LIMIT_PER_MINUTE: options.playRateLimitPerMinute ?? '30',
@@ -255,6 +257,68 @@ function buildQuotaFlowHarness(options: {
 		getD1TotalCalls: () => d1TotalCalls,
 	}
 }
+
+test('User quota overrides merge with defaults for the matching address', () => {
+	const { getGlobalQuotaLimits, getUserQuotaLimits } = quotaUtilsModule
+	assert.deepEqual(getUserQuotaLimits({} as Env, USER_A), { classic: 10, elevenlabs: 5 })
+	assert.deepEqual(getGlobalQuotaLimits({} as Env), { classic: 100, elevenlabs: 20 })
+
+	const env = {
+		DAILY_LIMIT_CLASSIC: '8',
+		DAILY_LIMIT_ELEVENLABS: '3',
+		BURST_LIMIT_PER_MINUTE: '5',
+		USER_QUOTA_OVERRIDES: JSON.stringify({ [USER_A]: { classic: 20, elevenlabs: 10, burstPerMinute: 7 } }),
+	} as Env
+	assert.deepEqual(getUserQuotaLimits(env, USER_A), { classic: 20, elevenlabs: 10, burstPerMinute: 7 })
+	assert.deepEqual(getUserQuotaLimits(env, USER_B), { classic: 8, elevenlabs: 3, burstPerMinute: 5 })
+
+	env.USER_QUOTA_OVERRIDES = JSON.stringify({ [USER_A]: { elevenlabs: 0, burstPerMinute: 0 } })
+	assert.deepEqual(getUserQuotaLimits(env, USER_A), { classic: 8, elevenlabs: 0 })
+})
+
+test('Invalid user quota overrides fall back per field and log once without addresses', (t) => {
+	const warn = t.mock.method(console, 'warn', () => {})
+	const { getUserQuotaLimits } = quotaUtilsModule
+	const env = { BURST_LIMIT_PER_MINUTE: '5' } as Env
+	const defaults = { classic: 10, elevenlabs: 5, burstPerMinute: 5 }
+
+	for (const invalid of [`{"${USER_A}":`, 'null', '[]', JSON.stringify({ [USER_A]: [] })]) {
+		env.USER_QUOTA_OVERRIDES = invalid
+		assert.deepEqual(getUserQuotaLimits(env, USER_A), defaults)
+	}
+
+	env.USER_QUOTA_OVERRIDES = JSON.stringify({
+		[USER_A]: { classic: -1, elevenlabs: 1.5, burstPerMinute: '2' },
+		[USER_B]: { classic: 17, elevenlabs: null, burstPerMinute: 2 },
+	})
+	assert.deepEqual(getUserQuotaLimits(env, USER_A), defaults)
+	assert.deepEqual(getUserQuotaLimits(env, USER_B), { classic: 17, elevenlabs: 5, burstPerMinute: 2 })
+	assert.equal(warn.mock.callCount(), 1)
+	assert.doesNotMatch(warn.mock.calls[0].arguments.join(' '), new RegExp(`${USER_A}|${USER_B}`))
+})
+
+test('GET /quota shows user overrides while admission enforces the global cap', async () => {
+	const harness = buildQuotaFlowHarness({
+		globalClassic: '1',
+		userQuotaOverrides: JSON.stringify({ [USER_A]: { classic: 12, elevenlabs: 7 } }),
+	})
+	const params = { address: USER_A, provider: 'aisonggenerator' as const }
+	const admitted = await quotaUtilsModule.reserveGenerationQuota(harness.env, { ...params, reservationId: 'override-1' })
+	assert.ok(admitted.ok)
+	assert.equal(admitted.quota.classic.limit, 12)
+	const blocked = await quotaUtilsModule.reserveGenerationQuota(harness.env, { ...params, reservationId: 'override-2' })
+	assert.ok(!blocked.ok && blocked.code === 'quota_exceeded')
+	assert.equal(blocked.payload.scope, 'global')
+	assert.equal(blocked.payload.limit, 1)
+
+	const token = await createAuthToken(USER_A, TEST_SECRET)
+	const response = await harness.send('/quota', { headers: { Authorization: `Bearer ${token}` } })
+	assert.equal(response.status, 200)
+	const snapshot = await response.json() as import('../src/quota-do').QuotaSnapshot
+	assert.equal(snapshot.classic.limit, 12)
+	assert.equal(snapshot.classic.remaining, 11)
+	assert.equal(snapshot.elevenlabs.limit, 7)
+})
 
 test('UserQuotaDO SQLite: reserve/idempotency/commit/refund/ambiguous/fallback/burst/UTC-day-reset invariants', async () => {
 	const quotaNs = createMockUserQuotaNamespace(appModule.UserQuotaDO)
@@ -535,7 +599,7 @@ test('Automatic AISG -> ElevenLabs fallback enforces ElevenLabs cap, respects un
 
 	const harness = buildQuotaFlowHarness({
 		dailyClassic: '5',
-		dailyElevenLabs: '1',
+		userQuotaOverrides: JSON.stringify({ [USER_A]: { elevenlabs: 1 } }),
 		aisgFetch: async (url) => {
 			if (url.endsWith('/api/tasks')) {
 				if (aisgBehavior === 'reject_credits') {

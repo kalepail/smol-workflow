@@ -116,6 +116,7 @@ migrations/
 - `PIXELLAB_KEY` — Pixellab API key
 - `CF_API_TOKEN` / `CF_ZONE_ID` — Cloudflare zone cache tag purge credentials
 - `CF_AIG_TOKEN` — Cloudflare AI Gateway Run token for ElevenLabs BYOK (fail-closed if missing)
+- `USER_QUOTA_OVERRIDES` — Optional JSON object keyed by Stellar address. Each entry can set `classic`, `elevenlabs`, or `burstPerMinute` to a non-negative integer.
 
 ### Variables (`wrangler.jsonc` `vars`)
 - `CF_AI_GATEWAY_ID` — AI Gateway ID configured with ElevenLabs BYOK stored key (`smol`, `byok_only: true`)
@@ -123,8 +124,8 @@ migrations/
 - `ELEVENLABS_MUSIC_LENGTH_MS` — Optional track duration override in ms (`3000..600000`); omitted on instrumentals by default so ElevenLabs chooses length naturally
 - `ELEVENLABS_OUTPUT_FORMAT` — Audio format (default: `mp3_44100_128`)
 - `ELEVENLABS_FALLBACK_ENABLED` — Enable automatic AISG → ElevenLabs fallback (`true` / `false`)
-- `DAILY_LIMIT_CLASSIC` (10), `DAILY_LIMIT_ELEVENLABS` (3), `BURST_LIMIT_PER_MINUTE` (5) — Per-user generation quota
-- `GLOBAL_DAILY_LIMIT_CLASSIC` (500), `GLOBAL_DAILY_LIMIT_ELEVENLABS` (20) — Global per-UTC-day generation ceilings (the ElevenLabs cap bounds worst-case spend at ~$30/day while lengths are uncapped, assuming the global quota Durable Object responds: global quota RPC errors fail open to per-user limits only, so during a global-quota outage spend is bounded by `DAILY_LIMIT_ELEVENLABS` × active users instead)
+- `DAILY_LIMIT_CLASSIC` (10), `DAILY_LIMIT_ELEVENLABS` (5), `BURST_LIMIT_PER_MINUTE` (5) — Default per-user generation quotas
+- `GLOBAL_DAILY_LIMIT_CLASSIC` (100), `GLOBAL_DAILY_LIMIT_ELEVENLABS` (20) — Global generation ceilings per UTC day. The ElevenLabs cap bounds worst-case spend at ~$30/day while the global quota Durable Object responds. During quota RPC outages, the sum of active users' effective ElevenLabs limits bounds usage.
 - `PLAY_COUNT_MODE` — `server` (count on media GET, current) or `beacon` (count via `POST /plays/:musicId`); optional `PLAY_BEACON_COOLDOWN_SECONDS` (30), `PLAY_BEACON_RATE_LIMIT_PER_MINUTE` (30)
 - `MIXTAPE_DEDUPE_AI_ENABLED` — Tier 2 clef-flash mixtape tie-breaker (enabled unless exactly `false`)
 - `RPC_URL`, `NETWORK_PASSPHRASE`, `SMOL_CONTRACT_ID` — Stellar mainnet RPC & contract config

@@ -30,7 +30,8 @@
 ## 2. Generation Quota (`src/utils/quota.ts`, `src/quota-do.ts`)
 
 - Per-user, per-provider daily quotas live in the SQLite Durable Object `UserQuotaDO` (binding `USER_QUOTA`, migration tag `v3`). Days are UTC (`getUtcDayKey`).
-- Limits (`wrangler.jsonc` vars): `DAILY_LIMIT_CLASSIC` (10), `DAILY_LIMIT_ELEVENLABS` (3), `BURST_LIMIT_PER_MINUTE` (5), and global per-day ceilings `GLOBAL_DAILY_LIMIT_CLASSIC` (500) and `GLOBAL_DAILY_LIMIT_ELEVENLABS` (20).
+- `wrangler.jsonc` sets default per-user limits with `DAILY_LIMIT_CLASSIC` (10), `DAILY_LIMIT_ELEVENLABS` (5), and `BURST_LIMIT_PER_MINUTE` (5). It sets global per-day ceilings with `GLOBAL_DAILY_LIMIT_CLASSIC` (100) and `GLOBAL_DAILY_LIMIT_ELEVENLABS` (20).
+- The optional Worker secret `USER_QUOTA_OVERRIDES` maps Stellar addresses to JSON objects with `classic`, `elevenlabs`, or `burstPerMinute` fields. Each field accepts a non-negative integer. Missing or invalid values use the configured defaults. A burst override of `0` disables the burst guard for that address. Reservations still check the global daily ceilings.
 - Lifecycle: `POST /` and any retry that will make a fresh paid call **reserve** a slot on the creator's quota before `WORKFLOW.create` (a retry that resumes a carried attempt reuses its reservation). The workflow **refunds** it on a pre-music failure (`refund quota on pre-music failure`), **moves** it from classic to ElevenLabs on an automatic fallback (`transitionFallbackQuota`, which can itself hit the ElevenLabs cap), marks it **ambiguous** when a paid outcome is unknown, and **commits** it once songs are saved.
 - Over-limit requests get `429` with a `quota_exceeded` payload (`provider`, `limit`, `used`, `resetAt`, `scope: user|global`, `window: day|minute`).
 - `GET /quota` (authenticated, `Cache-Control: no-store`) returns the caller's snapshot for both providers.
