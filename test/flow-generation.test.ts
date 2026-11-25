@@ -1163,3 +1163,74 @@ test('Step 5 NSFW: Clef 27B gets raw lyrics + cover PNG and gates listing; NSFW_
 		globalThis.fetch = originalFetch
 	}
 })
+
+test('Step 5 NSFW on retry: a regenerated cover/description is re-classified; a stored verdict is reused only when every moderated input is reused', async () => {
+	const fakeMp3 = makeAudioBytes(64, 8192)
+	const originalFetch = globalThis.fetch
+	const originalWarn = console.warn
+	console.warn = () => {}
+	globalThis.fetch = (async (input: string | URL | Request) => {
+		const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+		if (url.includes('api.pixellab.ai')) {
+			return new Response(JSON.stringify({ image: { base64: FAKE_IMAGE_B64 } }), { status: 200 })
+		}
+		if (url.includes('/elevenlabs/v1/music')) {
+			return new Response(fakeMp3, { status: 200, headers: { 'Content-Type': 'audio/mpeg', 'Content-Length': String(fakeMp3.byteLength) } })
+		}
+		throw new Error(`Unexpected fetch: ${url}`)
+	}) as typeof fetch
+
+	// The source smol was stored as safe; Clef (if consulted) now says definite S12.
+	const retryFrom = (sourceId: string, seed: Record<string, unknown>) => {
+		const harness = buildMockEnv({ clefRaw: clefNsfwPayload({ S12: 0.9 }) })
+		const storage = harness.doNs.getStorage(sourceId)
+		storage.set('payload', { address: TEST_USER, prompt: 'retry harbor song', public: true, instrumental: false, provider: 'elevenlabs' })
+		storage.set('nsfw', { safe: true, categories: [] })
+		for (const [key, value] of Object.entries(seed)) storage.set(key, value)
+		return harness
+	}
+	const run = async (harness: ReturnType<typeof buildMockEnv>, sourceId: string, instanceId: string) => {
+		const wf = new workflowModule.Workflow({} as ExecutionContext, harness.env)
+		await wf.run(
+			{ payload: { retry_id: sourceId }, instanceId, timestamp: new Date() } as never,
+			createWorkflowStep(new Map()).step as never,
+		)
+		return JSON.parse(harness.kv.get(instanceId)!) as { nsfw: unknown; image_base64: string }
+	}
+	const lyrics = { title: 'Harbor', style: ['dream pop', 'synthwave'], lyrics: '[Verse]\nHold my hand' }
+
+	try {
+		// 1. Oversized stored cover is dropped from the retry snapshot → Step 2 regenerates it →
+		//    Clef judges the REPLACEMENT PNG; the stale safe verdict must not carry over.
+		const regenCover = retryFrom('d1'.repeat(32), { image_base64: 'A'.repeat(1024 * 1024), description: 'Old cover.', lyrics })
+		const regenCoverKv = await run(regenCover, 'd1'.repeat(32), 'e1'.repeat(32))
+		const coverCalls = regenCover.aiCalls.filter((c) => c.model === '@cf/cloudflare/clef')
+		assert.equal(coverCalls.length, 1)
+		assert.deepEqual(coverCalls[0].input.images, [{ content_type: 'image/png', base64: FAKE_IMAGE_B64 }])
+		assert.equal(regenCoverKv.image_base64, FAKE_IMAGE_B64)
+		assert.deepEqual(regenCoverKv.nsfw, { safe: false, categories: ['S12'] })
+		assert.equal(regenCover.d1Smols.get('e1'.repeat(32))?.Public, 0)
+		assert.equal(regenCover.queueMessages.length, 0)
+
+		// 2. Cover reused but description missing → regenerated → re-classified (workflow-level guard,
+		//    independent of the snapshot clearing its verdict).
+		const regenDesc = retryFrom('d2'.repeat(32), { image_base64: FAKE_IMAGE_B64, lyrics })
+		const regenDescKv = await run(regenDesc, 'd2'.repeat(32), 'e2'.repeat(32))
+		assert.equal(regenDesc.aiCalls.filter((c) => c.model === '@cf/cloudflare/clef').length, 1)
+		assert.equal(regenDesc.aiCalls.filter((c) => c.model === '@cf/cloudflare/clef')[0].input.state.description, 'Warm sunset skyline over calm ocean water.')
+		assert.deepEqual(regenDescKv.nsfw, { safe: false, categories: ['S12'] })
+		assert.equal(regenDesc.d1Smols.get('e2'.repeat(32))?.Public, 0)
+		assert.equal(regenDesc.queueMessages.length, 0)
+
+		// 3. Cover, description and lyrics all reused unchanged → cached safe verdict reused, no Clef call.
+		const reuseAll = retryFrom('d3'.repeat(32), { image_base64: FAKE_IMAGE_B64, description: 'A harbor at dusk.', lyrics })
+		const reuseAllKv = await run(reuseAll, 'd3'.repeat(32), 'e3'.repeat(32))
+		assert.equal(reuseAll.aiCalls.some((c) => c.model === '@cf/cloudflare/clef'), false)
+		assert.deepEqual(reuseAllKv.nsfw, { safe: true, categories: [] })
+		assert.equal(reuseAll.d1Smols.get('e3'.repeat(32))?.Public, 1)
+		assert.equal(reuseAll.queueMessages.length, 1)
+	} finally {
+		globalThis.fetch = originalFetch
+		console.warn = originalWarn
+	}
+})

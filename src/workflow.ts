@@ -75,7 +75,9 @@ export function toRetrySnapshot(restored: WorkflowSteps | null | undefined, retr
 
 	if (new TextEncoder().encode(JSON.stringify(snapshot)).byteLength > MAX_RETRY_SNAPSHOT_BYTES) {
 		console.warn('Retry snapshot too large for a step result; regenerating image', retry_id);
+		// A regenerated cover was never moderated: drop the verdict with the image it judged.
 		snapshot.image_base64 = undefined;
+		snapshot.nsfw = undefined;
 	}
 
 	return snapshot;
@@ -347,9 +349,12 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 			await step.do('save generated lyrics', config, () => stub.saveStep('lyrics', lyrics));
 
 			// =====================================================================
-			// STEP 5: Check NSFW (or reuse from retry), always normalized fail-closed
+			// STEP 5: Check NSFW, always normalized fail-closed. A retry reuses the stored verdict
+			// ONLY when every moderated input (cover, description, lyrics) was reused unchanged;
+			// any regenerated input is re-classified so it never inherits a stale safe verdict.
 			// =====================================================================
-			nsfw = retry_steps?.nsfw !== undefined
+			const reusedAllModerationInputs = Boolean(retry_steps?.image_base64 && retry_steps?.description && retry_steps?.lyrics);
+			nsfw = retry_steps?.nsfw !== undefined && reusedAllModerationInputs
 				? normalizeNsfwResult(retry_steps.nsfw)
 				: await step.do('check nsfw', config, async () => {
 					return await checkNSFW(this.env, prompt, description, lyrics.lyrics ?? '', image_base64);

@@ -811,11 +811,8 @@ export function createSqliteD1(db: DatabaseSync) {
 	return { d1: d1 as unknown as D1Database, stats, hooks }
 }
 
-/** Fake cover with a real PNG signature, so the Clef NSFW PNG preflight accepts it. */
-export const FAKE_PNG_B64 = Buffer.concat([
-	Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-	Buffer.from('fake-png-bytes'),
-]).toString('base64')
+/** A real, decodable 1x1 RGBA PNG cover (passes the Clef NSFW PNG preflight and `decodePng`). */
+export const FAKE_PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP438DwHwAGgAJ/EEwb4QAAAABJRU5ErkJggg=='
 
 export const CLEF_NSFW_TEST_CODES = ['S1', 'S2', 'S3', 'S4', 'S5', 'S7', 'S8', 'S9', 'S10', 'S11', 'S12', 'S13'] as const
 

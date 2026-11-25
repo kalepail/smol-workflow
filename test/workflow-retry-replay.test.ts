@@ -285,7 +285,7 @@ test('toRetrySnapshot returns null without a saved payload', async () => {
 	assert.equal(toRetrySnapshot({} as WorkflowSteps, RETRY_ID), null)
 })
 
-test('toRetrySnapshot drops an oversized image so the step result stays under 1 MiB', async () => {
+test('toRetrySnapshot drops an oversized image (and its NSFW verdict) so the step result stays under 1 MiB', async () => {
 	const { toRetrySnapshot } = await loadWorkflow()
 	const originalWarn = console.warn
 	console.warn = () => {}
@@ -294,9 +294,11 @@ test('toRetrySnapshot drops an oversized image so the step result stays under 1 
 			payload: { address: 'G', prompt: 'p' },
 			image_base64: 'A'.repeat(1024 * 1024),
 			description: 'd',
+			nsfw: { safe: true, categories: [] },
 		} as WorkflowSteps, RETRY_ID)
 
 		assert.equal(snapshot?.image_base64, undefined)
+		assert.equal(snapshot?.nsfw, undefined, 'a verdict never outlives the cover it judged')
 		assert.equal(snapshot?.description, 'd')
 		assert.ok(JSON.stringify(snapshot).length < 1024 * 1024)
 	} finally {

@@ -13,6 +13,7 @@ import {
 	normalizeClefPngBase64,
 	normalizeNsfwResult,
 } from '../src/ai/nsfw'
+import { decodePng } from '../src/utils/png-scale'
 
 const SAFE = { safe: true, categories: [] }
 const UNKNOWN = { safe: false, categories: [], unknown: true }
@@ -119,6 +120,9 @@ test('Clef decision: highest definite code wins, exact ties drop the code, revie
 })
 
 test('Clef cover PNG: raw or data URL, strict base64, PNG signature and 4 MiB decoded cap', () => {
+	const fixture = decodePng(Buffer.from(FAKE_PNG_B64, 'base64'))
+	assert.equal(fixture.width, 1)
+	assert.equal(fixture.height, 1)
 	assert.equal(normalizeClefPngBase64(FAKE_PNG_B64), FAKE_PNG_B64)
 	assert.equal(normalizeClefPngBase64(`data:image/png;base64,${FAKE_PNG_B64}`), FAKE_PNG_B64)
 	assert.equal(normalizeClefPngBase64(` DATA:image/PNG;base64,${FAKE_PNG_B64}\n`), FAKE_PNG_B64)
