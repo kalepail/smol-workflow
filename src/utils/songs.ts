@@ -56,7 +56,6 @@ import {
 } from './quota';
 
 export const DEFAULT_MUSIC_PROVIDER: MusicProvider = 'aisonggenerator';
-export const SUPPORTED_MUSIC_PROVIDERS = ['aisonggenerator', 'elevenlabs'] as const;
 
 const EXPECTED_AISG_TRACK_COUNT = 2;
 const MAX_FINGERPRINT_ATTEMPTS = 5;

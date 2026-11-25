@@ -694,9 +694,9 @@ smols.post('/', parseAuth, async (c) => {
 	return c.text(instanceId)
 })
 
-// Retry smol creation (caller-independent, protects published smols, carries attempt state across chain)
-// Auth is optional for the legacy empty-body retry (smol.xyz main sends no credentials), but a
-// provider override can buy a paid call on the creator's quota, so it requires the owner (H5a).
+// Retry smol creation (caller-independent for empty-body retries; protects published smols and
+// carries attempt state across the retry chain). A provider override can buy a paid call on the
+// creator's quota, so it requires the owner's session.
 smols.post('/retry/:id', optionalAuth, async (c) => {
 	const { env, req } = c
 	const id = req.param('id')

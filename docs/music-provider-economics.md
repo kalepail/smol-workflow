@@ -1,6 +1,6 @@
 # SMOL Music Provider Economics, Plan Sizing & XLM Pricing
 
-> **Snapshot date:** 2026-11-23 (updated 2026-11-25 for `75d15c7` quotas, scoped `SMOL` ElevenLabs key, and 25/day gateway cap)
+> **Snapshot date:** 2026-11-23 (updated 2026-11-25 for live quotas, scoped `SMOL` ElevenLabs key, and 60/day gateway cap)
 > **Applies to:** `smol-workflow`, `aisonggenerator-worker`, and `smol-fe` (`smol.xyz`)
 > **Related docs:** [`docs/workflows-and-media.md`](./workflows-and-media.md), `aisonggenerator-worker/docs/aisg-api-notes.md`
 
@@ -95,7 +95,7 @@ Because the per-minute API rate is flat (**$0.15/min**) across Creator and Pro m
 - **~73 ElevenLabs Smols/mo** at ~2 minutes per track, or
 - **~49 ElevenLabs Smols/mo** at 3 minutes per track, or
 - as few as **~14 ElevenLabs Smols/mo** if every track ran to the 10-minute maximum,
-with seamless `$0.15/min` overages during burst weeks or AISG outages. Lengths are no longer pinned (see §1), so size the plan from measured ElevenLabs durations, not from a configured default. At the global cap of 20/day, overages are bounded at ~$30/day while the global quota DO responds (global RPC errors fail open to per-user limits only).
+with seamless `$0.15/min` overages during burst weeks or AISG outages. Lengths are no longer pinned (see §1), so size the plan from measured ElevenLabs durations, not from a configured default. At the global cap of 50/day, overages are bounded at ~$75/day while the global quota DO responds (global RPC errors fail open to per-user limits only).
 
 ---
 

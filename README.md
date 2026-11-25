@@ -10,7 +10,7 @@ smol-native-api (SONG_GENERATOR)    ──┼──► smol-workflow (Hono + Wor
                                            ├─► Pixellab (64x64 pixel art)
                                            ├─► Cloudflare Workers AI (moondream3.1, deepseek-v4.1-flash, glm-5.3, clef, bge-m3)
                                            ├─► aisonggenerator-worker (HTTP Service Binding: lyrics + AISG v6 2-track music)
-                                           ├─► Cloudflare AI Gateway BYOK (`smol`, ElevenLabs-only, 25 req/day) -> ElevenLabs Music v2.5
+                                           ├─► Cloudflare AI Gateway BYOK (`smol`, ElevenLabs-only, 60 req/day) -> ElevenLabs Music v2.5
                                            ├─► kale-worker (RPC Service Binding: Stellar relay submitTransaction + mainnet chain reads)
                                            ├─► UserQuotaDO (generation quota + play-beacon gate shards)
                                            └─► D1 (smol-d1) · KV (SMOL_KV) · R2 (smol-r2) · Vectorize · Queues

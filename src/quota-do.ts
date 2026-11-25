@@ -619,8 +619,8 @@ export class UserQuotaDO extends DurableObject<Env> {
 				// Mint asset-code prefix locks. Only the singleton `mint-prefix-locks` object writes rows;
 				// every other quota object just carries the empty table.
 				// One row per prefix; the prefix is the smol id's first 12 hex, so one row per smol id too.
-				// No deployed object has ever run v7 (WF-0 ships it), so its definition is final here. The
-				// CHECKs pin the lifecycle invariants: a provisional row carries its admission token; any
+				// Schema v7 ships the `mint_prefix_locks` table (live since WF-0); treat its definition as
+				// immutable here. The CHECKs pin the lifecycle invariants: a provisional row carries its admission token; any
 				// row past `reserved` was claimed for signing; a dispatched or ambiguous row records when
 				// dispatch started; `failed` is only ever a once-signed row (a never-signed provisional
 				// row is deleted instead, so it can never block another smol sharing the prefix); and only

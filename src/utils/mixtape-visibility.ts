@@ -15,8 +15,6 @@
  * Keep this file free of Worker/D1 imports so smol-fe can mirror it 1:1.
  */
 
-export type MixtapeVisibility = 'public' | 'owner' | 'deleted'
-
 export type MixtapeHiddenReason =
 	| 'empty'
 	| 'duplicate'

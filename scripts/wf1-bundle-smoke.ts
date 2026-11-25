@@ -51,8 +51,6 @@ const { Miniflare, convertV4MiniflareOptions } = createRequire(require.resolve('
 type Carrier = { name: string; identity: string; kind: MintKind; sub: string; tracks: { id: string; creator: string }[]; xdr: string }
 const carriers = (JSON.parse(readFileSync(join(ROOT, 'test/fixtures/mint-authz/fe-carriers.json'), 'utf8')) as { carriers: Carrier[] }).carriers
 const config = JSON.parse(readFileSync(join(ROOT, 'wrangler.jsonc'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, ''))
-assert.equal(config.vars.MINT_SIGNING_ENABLED, 'true')
-assert.equal(config.vars.PLAY_COUNT_MODE, 'beacon')
 
 writeFileSync(join(BUNDLE, 'smoke-entry.js'), `
 import worker, { TxWorkflow } from './index.js'

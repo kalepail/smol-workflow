@@ -4,7 +4,6 @@ import { ensureVocalistInFirstThree, sanitizeLyrics } from './song-intent';
 
 export const ELEVENLABS_MODEL_ID = 'music_v2_5';
 export const ELEVENLABS_PACING_MODEL = '@cf/zai-org/glm-5.3' as const;
-export const DEFAULT_ELEVENLABS_MUSIC_LENGTH_MS = 120_000;
 export const MIN_ELEVENLABS_CHUNK_MS = 3_000;
 export const MAX_ELEVENLABS_CHUNK_MS = 120_000;
 export const MIN_ELEVENLABS_TOTAL_MS = 3_000;
