@@ -367,9 +367,30 @@ smols.get('/', publicCache, async (c) => {
 	return response
 })
 
-// Get smols created by authenticated user (never shared-cached)
+const MAX_CREATED_QUERY_LENGTH = 100
+
+/**
+ * `LIKE ? ESCAPE '\'` pattern matching `query` literally anywhere in `LOWER(Title)`. Only ASCII is
+ * folded, mirroring SQLite/D1 `LOWER()` (no ICU), so non-ASCII titles still match themselves.
+ */
+function titleContainsPattern(query: string): string {
+	const folded = query.replace(/[A-Z]+/g, (run) => run.toLowerCase())
+	return `%${folded.replace(/[\\%_]/g, '\\$&')}%`
+}
+
+// Get smols created by authenticated user (never shared-cached). Optional `q` filters by title,
+// case-insensitively, before cursor pagination; ownership stays the first condition.
 smols.get('/created', privateNoStore, parseAuth, async (c) => {
-	return c.json(await listSmols(c, 'Smols s', 's."Address" = ?', [c.get('jwtPayload')!.sub]))
+	const sub = c.get('jwtPayload')!.sub
+	const q = (c.req.query('q') ?? '').trim()
+	if (!q) {
+		return c.json(await listSmols(c, 'Smols s', 's."Address" = ?', [sub]))
+	}
+	if (q.length > MAX_CREATED_QUERY_LENGTH) {
+		return c.json({ error: 'Query too long' }, 400)
+	}
+	const conditions = `s."Address" = ? AND LOWER(s.Title) LIKE ? ESCAPE '\\'`
+	return c.json(await listSmols(c, 'Smols s', conditions, [sub, titleContainsPattern(q)]))
 })
 
 // Get smols liked by authenticated user (never shared-cached)

@@ -1,10 +1,10 @@
 import { Hono, type Context } from 'hono'
 import { HTTPException } from 'hono/http-exception'
-import { Jimp, ResizeStrategy } from 'jimp'
 import type { HonoEnv } from '../types'
 import { parseByteRange, type ParsedByteRange } from '../utils'
 import { getPlayCountMode } from './plays'
 import { stripOriginSpecificHeaders } from '../utils/public-cache'
+import { PNG_MAX_INPUT_BYTES, scalePng } from '../utils/png-scale'
 
 // Separate routers so /song serves only MP3s and /image only PNGs (cross-media GET/HEAD is 404).
 export const song = new Hono<HonoEnv>()
@@ -546,13 +546,11 @@ image.get('/:id{.+\\.png}', async (c) => {
 	}
 
 	if (scaleValue) {
-		const jimpImage = await Jimp.fromBuffer(await image.arrayBuffer())
-		jimpImage.resize({
-			w: jimpImage.width * scaleValue,
-			h: jimpImage.height * scaleValue,
-			mode: ResizeStrategy.NEAREST_NEIGHBOR,
-		})
-		const scaledImage = await jimpImage.getBuffer('image/png')
+		if (image.size > PNG_MAX_INPUT_BYTES) {
+			await image.body?.cancel().catch(() => {})
+			throw new HTTPException(422, { message: 'Image too large to scale' })
+		}
+		const scaledImage = scalePng(new Uint8Array(await image.arrayBuffer()), scaleValue)
 		const headers = buildImageHeaders(smolId, image, scaledImage.byteLength)
 		const baseEtag = normalizeEtag(headers.get('ETag'))
 		if (baseEtag) {

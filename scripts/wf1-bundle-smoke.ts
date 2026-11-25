@@ -13,9 +13,16 @@
  * connect, chain reads served by the mocked KALE_WORKER) and `music-metadata` `parseBuffer` (a retry
  * Workflow whose song order can only flip if the bundled parser reads the real MP3 durations; the MP3
  * fixtures are served inside the isolate by the smoke wrapper, so nothing leaves workerd).
+ *
+ * WF-2b/AE-8: `GET /image/:id?scale=` runs the dependency-free PNG scaler (RGBA + indexed PLTE/tRNS,
+ * exact pixels; corrupt and decompression-bomb PNGs -> 422), an in-isolate probe proves workerd's
+ * `node:zlib` honours `maxOutputLength`, and `GET /created?q=` filters owner titles with escaped
+ * wildcards and cursor pagination. The compatibility date comes from wrangler.jsonc; pass
+ * `MINIFLARE_WORKERD_PATH` to run a newer workerd than the one wrangler ships.
  */
 import assert from 'node:assert/strict'
 import { readFileSync, writeFileSync } from 'node:fs'
+import { deflateSync } from 'node:zlib'
 import { createHash, generateKeyPairSync, randomBytes, sign as cryptoSign, type KeyObject } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { join, resolve } from 'node:path'
@@ -25,8 +32,10 @@ import {
 	assertSignedMintEnvelope, assertUnsignedMintEnvelope, buildMintExpectation, decodeMintCarrier, type MintKind,
 } from '../src/chain/mint-authorization'
 import { derivePasskeyKitContractId } from '../src/passkey'
+import { decodePng } from '../src/utils/png-scale'
 import { contractDataKey, storageKey } from '../src/utils/chain'
 import { testIdentity, testIssuerKeypair } from '../test/fixtures/mint-authz/generate'
+import { encodeTestPng, packRows, readChunks } from '../test/helpers/png'
 
 const ROOT = resolve(__dirname, '..')
 const BUNDLE = resolve(process.argv[2] ?? '/tmp/wf1-lean-dry')
@@ -40,11 +49,12 @@ const { Miniflare, convertV4MiniflareOptions } = createRequire(require.resolve('
 type Carrier = { name: string; identity: string; kind: MintKind; sub: string; tracks: { id: string; creator: string }[]; xdr: string }
 const carriers = (JSON.parse(readFileSync(join(ROOT, 'test/fixtures/mint-authz/fe-carriers.json'), 'utf8')) as { carriers: Carrier[] }).carriers
 const config = JSON.parse(readFileSync(join(ROOT, 'wrangler.jsonc'), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, ''))
-assert.equal(config.vars.MINT_SIGNING_ENABLED, 'false')
+assert.equal(config.vars.MINT_SIGNING_ENABLED, 'true')
 assert.equal(config.vars.PLAY_COUNT_MODE, 'beacon')
 
 writeFileSync(join(BUNDLE, 'smoke-entry.js'), `
 import worker, { TxWorkflow } from './index.js'
+import { deflateSync, inflateSync } from 'node:zlib'
 export * from './index.js'
 const puts = []
 const logs = []
@@ -85,6 +95,12 @@ export default {
 		if (url.pathname === '/__smoke/cache-puts') return Response.json(puts)
 		if (url.pathname === '/__smoke/logs') return Response.json(logs)
 		if (url.pathname === '/__smoke/audio') return Response.json(audioServed)
+		if (url.pathname === '/__smoke/zlib') {
+			const bomb = deflateSync(new Uint8Array(1 << 20))
+			let capped = 'not thrown'
+			try { inflateSync(bomb, { maxOutputLength: 16 }) } catch (error) { capped = error.code ?? error.name }
+			return Response.json({ capped, exact: inflateSync(bomb, { maxOutputLength: 1 << 20 }).length })
+		}
 		if (url.pathname === '/__smoke/generate') {
 			const id = env.DURABLE_OBJECT.newUniqueId().toString()
 			await env.WORKFLOW.create({ id, params: await request.json() })
@@ -225,7 +241,7 @@ const trackRows = (identity: string) => carriers.filter((c) => c.identity === id
 
 async function pausedAndCache() {
 	const owner = carriers[0].sub
-	const { mf, db } = await start({}, [['a'.repeat(64), owner, 1], ['b'.repeat(64), owner, 0], ...trackRows('mainnet')])
+	const { mf, db } = await start({ MINT_SIGNING_ENABLED: 'false' }, [['a'.repeat(64), owner, 1], ['b'.repeat(64), owner, 0], ...trackRows('mainnet')])
 	try {
 		const mainnet = carriers.filter((c) => c.identity === 'mainnet')
 		for (const carrier of mainnet) {
@@ -469,7 +485,91 @@ async function webauthnAndAudio() {
 	}
 }
 
+// --- WF-2b PNG scaler + AE-8 owner title filter --------------------------------------------------
+
+async function imagesAndCreatedSearch() {
+	const { mf, db } = await start({}, [])
+	try {
+		const zlib = JSON.parse((await call(mf, '/__smoke/zlib')).text)
+		assert.deepEqual(zlib, { capped: 'ERR_BUFFER_TOO_LARGE', exact: 1 << 20 }, 'workerd node:zlib inflateSync honours maxOutputLength')
+
+		const bucket = await mf.getR2Bucket('SMOL_BUCKET')
+		const put = (key: string, bytes: Uint8Array) => bucket.put(key, bytes, { httpMetadata: { contentType: 'image/png' } })
+		const rgba = Array.from({ length: 16 }, (_, i) => [i * 16, 255 - i * 16, (i * 37) & 0xff, i % 2 ? 255 : 128])
+		await put('rgba.png', encodeTestPng({ width: 4, height: 4, bitDepth: 8, colorType: 6, pixels: rgba, filters: [0, 1, 2, 3, 4] }))
+		const plte = Uint8Array.of(255, 0, 0, 0, 255, 0, 0, 0, 255)
+		const trns = Uint8Array.of(255, 0)
+		const indexed = Array.from({ length: 15 }, (_, i) => [i % 3])
+		await put('indexed.png', encodeTestPng({ width: 5, height: 3, bitDepth: 4, colorType: 3, pixels: indexed, filters: [4, 3, 1], before: [['PLTE', plte], ['tRNS', trns]] }))
+		await put('broken.png', Uint8Array.of(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13))
+		await put('bomb.png', encodeTestPng({ width: 1, height: 1, bitDepth: 8, colorType: 0, pixels: [], idat: deflateSync(Buffer.alloc(8 << 20)) }))
+
+		const scaled = await mf.dispatchFetch('https://api.smol.xyz/image/rgba.png?scale=4')
+		const bytes = new Uint8Array(await scaled.arrayBuffer())
+		assert.equal(scaled.status, 200)
+		assert.equal(scaled.headers.get('Content-Type'), 'image/png')
+		assert.equal(Number(scaled.headers.get('Content-Length')), bytes.byteLength)
+		assert.match(scaled.headers.get('ETag') ?? '', /-s4"$/)
+		const decoded = decodePng(bytes)
+		assert.deepEqual([decoded.width, decoded.height, decoded.colorType, decoded.bitDepth], [16, 16, 6, 8])
+		for (let y = 0; y < 16; y++) {
+			for (let x = 0; x < 16; x++) {
+				assert.deepEqual([...decoded.pixels.subarray((y * 16 + x) * 4, (y * 16 + x) * 4 + 4)], rgba[(y >> 2) * 4 + (x >> 2)], `pixel ${x},${y}`)
+			}
+		}
+
+		const pal = new Uint8Array(await (await mf.dispatchFetch('https://api.smol.xyz/image/indexed.png?scale=3')).arrayBuffer())
+		const palDecoded = decodePng(pal)
+		const expected = Array.from({ length: 15 * 9 }, (_, i) => indexed[Math.floor(Math.floor(i / 15) / 3) * 5 + Math.floor((i % 15) / 3)])
+		assert.deepEqual([palDecoded.width, palDecoded.height, palDecoded.colorType, palDecoded.bitDepth], [15, 9, 3, 4])
+		assert.deepEqual(palDecoded.pixels, new Uint8Array(Buffer.concat(packRows(15, 9, 4, 3, expected))))
+		assert.deepEqual(readChunks(pal).filter((c) => c.type === 'PLTE' || c.type === 'tRNS').map((c) => [c.type, [...c.data]]), [['PLTE', [...plte]], ['tRNS', [...trns]]])
+
+		const head = await mf.dispatchFetch('https://api.smol.xyz/image/rgba.png?scale=4', { method: 'HEAD' })
+		assert.equal(head.status, 200)
+		await head.arrayBuffer()
+		for (const key of ['broken.png', 'bomb.png']) {
+			const rejected = await mf.dispatchFetch(`https://api.smol.xyz/image/${key}?scale=2`)
+			assert.equal(rejected.status, 422, key)
+			assert.match(await rejected.text(), /Unsupported or malformed PNG/)
+		}
+		assert.equal((await mf.dispatchFetch('https://api.smol.xyz/image/rgba.png?scale=33')).status, 400)
+		console.log(`ok png scaler in workerd: RGBA 4x4 -> 16x16 exact pixels (${bytes.byteLength} B), indexed 4-bit PLTE/tRNS -> 15x9 exact; corrupt + 8 MiB bomb -> 422; node:zlib maxOutputLength enforced`)
+
+		const owner = carriers[0].sub
+		const other = carriers[0].tracks.find((track) => track.creator !== owner)?.creator ?? `C${'B'.repeat(55)}`
+		const rows: Array<[string, string, string, number]> = [
+			['s1', 'Midnight Drive', owner, 0], ['s2', '100% MIDNIGHT_mix', owner, 1], ['s3', 'Sunrise', owner, 1], ['s4', 'midnight elsewhere', other, 1],
+		]
+		await db.batch(rows.map(([id, title, address, isPublic], index) => db.prepare(
+			`INSERT INTO Smols (Id, Title, Song_1, "Address", Public, Created_At) VALUES (?1, ?2, ?1, ?3, ?4, datetime('now', ?5))`,
+		).bind(id, title, address, isPublic, `-${10 - index} minutes`)))
+		const created = async (query: string) => {
+			const { response, text } = await call(mf, `/created${query}`, { sub: owner })
+			assert.equal(response.headers.get('Cache-Control'), 'private, no-store', query)
+			assert.equal(response.headers.get('CDN-Cache-Control'), 'no-store', query)
+			return { status: response.status, body: JSON.parse(text) }
+		}
+		const ids = (body: { smols: Array<{ Id: string }> }) => body.smols.map((smol) => smol.Id)
+		assert.deepEqual(ids((await created('?q=%20midNIGHT%20')).body), ['s2', 's1'], 'case-insensitive, trimmed, private + public, owner only')
+		assert.deepEqual(ids((await created('?q=%25')).body), ['s2'], '% is literal')
+		assert.deepEqual(ids((await created('?q=_')).body), ['s2'], '_ is literal')
+		assert.deepEqual(ids((await created('?q=%5C')).body), [], 'backslash is literal')
+		assert.deepEqual(ids((await created('?q=%20')).body), ['s3', 's2', 's1'], 'blank q is unfiltered')
+		const page1 = (await created('?q=midnight&limit=1')).body
+		assert.deepEqual([ids(page1), page1.pagination.hasMore], [['s2'], true])
+		const page2 = (await created(`?q=midnight&limit=1&cursor=${encodeURIComponent(page1.pagination.nextCursor)}`)).body
+		assert.deepEqual([ids(page2), page2.pagination], [['s1'], { nextCursor: null, hasMore: false }])
+		assert.deepEqual(await created(`?q=${'x'.repeat(101)}`), { status: 400, body: { error: 'Query too long' } })
+		console.log('ok GET /created?q= in workerd/D1: case-insensitive owner-only (private+public), escaped %/_/\\, cursor pages, blank q unfiltered, >100 -> 400')
+	} finally {
+		await mf.dispose()
+	}
+}
+
 async function main() {
+	console.log(`compatibility_date ${config.compatibility_date}`)
+	await imagesAndCreatedSearch()
 	await pausedAndCache()
 	await mainnetAdmission()
 	await testIdentitySigning()

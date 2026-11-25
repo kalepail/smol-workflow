@@ -19,7 +19,6 @@
 		"@simplewebauthn/server": "^14.1.0",
 		"@stellar/stellar-sdk": "16.4.1",
 		"hono": "^4.13.21",
-		"jimp": "^1.6.0",
 		"music-metadata": "^12.8.1"
 	}
 }

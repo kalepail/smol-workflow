@@ -450,7 +450,7 @@ test('platform: smol-sdk and dead helpers removed, Wrangler/compat bumped, kill 
 	assert.equal(pkg.dependencies['smol-sdk'] ?? pkg.devDependencies['@cloudflare/workers-types'] ?? pkg.scripts['build:sdk'] ?? pkg.scripts['start:remote'], undefined)
 	assert.equal(pkg.dependencies.hono, '^4.13.21')
 	assert.equal(pkg.devDependencies.wrangler, '^4.167.0')
-	assert.equal(wrangler.compatibility_date, '2026-11-16')
+	assert.equal(wrangler.compatibility_date, '2026-11-24')
 	assert.equal(wrangler.vars.MINT_SIGNING_ENABLED, 'true')
 	assert.equal(wrangler.vars.PLAY_COUNT_MODE, 'beacon')
 	assert.equal(wrangler.r2_buckets[0].preview_bucket_name ?? wrangler.kv_namespaces[0].preview_id, undefined)

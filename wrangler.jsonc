@@ -6,7 +6,7 @@
     "$schema": "node_modules/wrangler/config-schema.json",
     "name": "smol-workflow",
     "main": "src/index.ts",
-    "compatibility_date": "2026-11-16",
+    "compatibility_date": "2026-11-24",
     "minify": true,
     "workers_dev": false,
     "routes": [

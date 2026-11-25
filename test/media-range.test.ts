@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict'
 import test, { after, before } from 'node:test'
-import { Jimp } from 'jimp'
 import {
 	createMockEdgeCache,
 	createMockExecutionContext,
@@ -9,6 +8,8 @@ import {
 	type CloudflareStubHandle,
 } from './helpers/harness'
 import { parseByteRange } from '../src/utils'
+import { decodePng } from '../src/utils/png-scale'
+import { encodeTestPng } from './helpers/png'
 
 let stubs: CloudflareStubHandle
 let appModule: typeof import('../src/index')
@@ -48,8 +49,7 @@ async function createMediaTestHarness(audioBytes = buildSampleBytes(1024)) {
 	})
 
 	// Real 4x4 PNG for image scaling tests
-	const pngImage = new Jimp({ width: 4, height: 4, color: 0xff0088ff })
-	const pngBuffer = await pngImage.getBuffer('image/png')
+	const pngBuffer = encodeTestPng({ width: 4, height: 4, bitDepth: 8, colorType: 6, pixels: Array(16).fill([0xff, 0x00, 0x88, 0xff]) })
 	await r2.bucket.put('smol-img.png', pngBuffer, {
 		httpMetadata: { contentType: 'image/png' },
 	})
@@ -455,10 +455,21 @@ test('image serving supports HEAD without R2 GET, scale validation, and separate
 	assert.equal(scaledImg.status, 200)
 	const scaledBytes = new Uint8Array(await scaledImg.arrayBuffer())
 	assert.notDeepEqual(scaledBytes, baseBytes)
+	assert.equal(scaledImg.headers.get('Content-Type'), 'image/png')
+	assert.equal(Number(scaledImg.headers.get('Content-Length')), scaledBytes.byteLength)
+	const decoded = decodePng(scaledBytes)
+	assert.deepEqual([decoded.width, decoded.height, decoded.colorType, decoded.bitDepth], [8, 8, 6, 8])
+	assert.deepEqual(decoded.pixels, new Uint8Array(8 * 8 * 4).map((_, i) => [0xff, 0x00, 0x88, 0xff][i % 4]))
 
 	const getsAfterCold = r2.stats.getCalls
 	const warmScaled = await send('/image/smol-img.png?scale=2')
 	assert.equal(warmScaled.status, 200)
 	assert.deepEqual(new Uint8Array(await warmScaled.arrayBuffer()), scaledBytes)
-	assert.equal(r2.stats.getCalls, getsAfterCold, 'Warm scaled image must serve from cache without re-running Jimp')
+	assert.equal(r2.stats.getCalls, getsAfterCold, 'Warm scaled image must serve from cache without re-scaling')
+
+	await r2.bucket.put('broken.png', new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]), { httpMetadata: { contentType: 'image/png' } })
+	const broken = await send('/image/broken.png?scale=4')
+	assert.equal(broken.status, 422)
+	assert.equal((await send('/image/broken.png?scale=4')).status, 422, 'a rejected scale is never cached')
+	assert.equal((await send('/image/broken.png')).status, 200, 'unscaled bytes are still served as stored')
 })
