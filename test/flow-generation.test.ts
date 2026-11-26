@@ -386,7 +386,7 @@ test('Gate 1a: default AISG v6 flow uses split /api/tasks submit + discovery, co
 			['f', 'male vocals, drums', 1, ['dream pop', 'female vocals', 'synth pads']],
 		)
 		assert.deepEqual(harness.lyricsBodies.map((b) => b.user_prompt), ['dreamy harbor night'])
-		assert.ok(String(harness.lyricsBodies[0].prompt).includes('# Description'), 'short vocal prompt includes cover description')
+		assert.ok(!String(harness.lyricsBodies[0].prompt).includes('# Description'), 'vocal prompt omits cover description so lyrics never narrate cover art')
 		assert.equal('service' in submitted, false, 'lyrics metadata must not leak into AISG submit spread')
 		assert.equal('pipeline_meta' in submitted, false)
 		assert.equal(taskDiscoverCalls, 2)
@@ -402,7 +402,7 @@ test('Gate 1a: default AISG v6 flow uses split /api/tasks submit + discovery, co
 		assert.equal(rawKv.pipeline_meta?.v, 1)
 		assert.equal(rawKv.pipeline_meta?.lyrics?.service, 'aisonggenerator.io')
 		assert.equal(rawKv.pipeline_meta?.lyrics?.model, 'openrouter/auto')
-		assert.equal(rawKv.pipeline_meta?.lyrics?.used_description, true)
+		assert.equal(rawKv.pipeline_meta?.lyrics?.used_description, false)
 		assert.equal(rawKv.pipeline_meta?.lyrics?.aisg_attempts, 1)
 		assert.equal(rawKv.pipeline_meta?.intent?.source, 'model')
 		assert.equal(rawKv.pipeline_meta?.intent?.mode, 'write')

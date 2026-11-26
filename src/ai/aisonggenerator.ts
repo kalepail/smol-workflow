@@ -264,21 +264,21 @@ export interface GenerateLyricsOptions {
 	smolId?: string;
 }
 
+/**
+ * Cover-art captions are kept in Step 3 for UI details, Vectorize visual search, and NSFW,
+ * but are NOT fed into vocal lyrics generation (otherwise the songwriter narrates literal
+ * cover-art objects into the verses).
+ */
 export function shouldIncludeDescriptionInLyrics(
-	prompt: string,
-	description?: string,
-	instrumental = false
+	_prompt: string,
+	_description?: string,
+	_instrumental = false
 ): boolean {
-	return (
-		!instrumental
-		&& Boolean(description?.trim())
-		&& prompt.trim().length <= SHORT_PROMPT_DESCRIPTION_MAX_CHARS
-	);
+	return false;
 }
 
 // Generate lyrics from a prompt (Cloudflare AI Fable 5.2 -> Opus 5.5 -> DeepSeek V4.1 -> GLM-5.3 primary,
 // with AISG emergency fallback inside aisonggenerator-worker).
-// Cover caption is included ONLY for short vocal prompts (<= 160 chars) as optional visual flavor.
 export async function generateLyrics(
 	env: Env,
 	prompt: string,

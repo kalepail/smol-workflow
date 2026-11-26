@@ -218,7 +218,7 @@ test('AISG wire: old lyrics give byte-identical submit/replay/legacy bodies; new
 	const instBody = JSON.parse(await send(inst, true))
 	assert.deepEqual([instBody.description, instBody.lyrics, instBody.intent_v, 'vocalGender' in instBody], ['', '', 1, false])
 
-	// Short vocal prompt (<= 160 chars) with description includes # Description as optional flavor and X-Smol-Id.
+	// Short vocal prompt with description omits # Description (cover captions stay for UI/search/NSFW, not lyrics) and sends X-Smol-Id.
 	await generateLyrics(env, 'soft romantic rock song with female voice', {
 		description: 'Warm lantern light over a misty pier.',
 		instrumental: false,
@@ -226,8 +226,8 @@ test('AISG wire: old lyrics give byte-identical submit/replay/legacy bodies; new
 	})
 	const shortVocalBody = JSON.parse(bodies['/api/lyrics'])
 	assert.equal(shortVocalBody.user_prompt, 'soft romantic rock song with female voice')
-	assert.match(shortVocalBody.prompt, /^# Prompt\nsoft romantic rock song with female voice\n\n# Description\nWarm lantern light over a misty pier\./)
-	assert.match(shortVocalBody.prompt, /never mention pixels/i)
+	assert.ok(!shortVocalBody.prompt.includes('# Description'))
+	assert.ok(!shortVocalBody.prompt.includes('Warm lantern light'))
 	assert.equal(headersByPath['/api/lyrics'].get('x-smol-id'), 'smol-short-1')
 
 	// Short instrumental prompt and long (> 160 chars) vocal prompt omit # Description.
