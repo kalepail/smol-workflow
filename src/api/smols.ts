@@ -425,7 +425,22 @@ smols.get(
 				liked = !!likedRow
 			}
 
-			let smol_kv: Record<string, any> | null = await env.SMOL_KV.get(id, 'json')
+			let smol_kv: Record<string, any> | null = null
+			let username: string | null = null
+
+			const [kvResult, userRow] = await Promise.all([
+				env.SMOL_KV.get(id, 'json') as Promise<Record<string, any> | null>,
+				smol_d1.Address
+					? env.SMOL_D1.prepare(`SELECT Username FROM Users WHERE "Address" = ?1`)
+						.bind(smol_d1.Address)
+						.first<{ Username?: string | null }>()
+						.catch(() => null)
+					: Promise.resolve(null),
+			])
+			smol_kv = kvResult
+			if (typeof userRow?.Username === 'string' && userRow.Username.trim()) {
+				username = userRow.Username.trim()
+			}
 
 			// Allow for KV propagation lag immediately after publish by consulting completed DO state
 			if (!smol_kv && isDurableObjectId(id)) {
@@ -441,19 +456,22 @@ smols.get(
 				}
 			}
 
-			// Increment views non-blockingly
-			runBackground(
-				c,
-				env.SMOL_D1.prepare('UPDATE Smols SET Views = Views + 1 WHERE Id = ?')
-					.bind(id)
-					.run()
-			)
+			// Increment views non-blockingly unless caller explicitly opts out (e.g. oEmbed / embed player)
+			if (req.query('no_view') !== '1') {
+				runBackground(
+					c,
+					env.SMOL_D1.prepare('UPDATE Smols SET Views = Views + 1 WHERE Id = ?')
+						.bind(id)
+						.run()
+				)
+			}
 
 			const kv_do = sanitizeKvDoForDetail(smol_kv)
+			const normalizedD1 = normalizeD1DetailRow(smol_d1)
 
 			const response = c.json({
 				kv_do,
-				d1: normalizeD1DetailRow(smol_d1),
+				d1: username ? { ...normalizedD1, Username: username } : normalizedD1,
 				liked,
 			})
 
