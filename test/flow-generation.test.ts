@@ -51,6 +51,7 @@ function buildMockEnv(options: {
 	coverPromptText?: string
 	coverPromptMode?: string
 	pixellabKey?: string | null
+	adminSecret?: string
 } = {}) {
 	const r2 = createMockR2Bucket()
 	const doNs = createMockDoNamespace(r2.bucket)
@@ -138,6 +139,9 @@ function buildMockEnv(options: {
 								if (row && row.Address === args[1]) return { Public: row.Public }
 								return null
 							}
+							if (sql.includes('SELECT Address FROM Users WHERE Address = ?1')) {
+								return String(args[0]) === TEST_USER ? { Address: TEST_USER } : null
+							}
 							if (sql.includes('FROM Likes')) return null
 							return null
 						},
@@ -157,6 +161,7 @@ function buildMockEnv(options: {
 
 	const env = {
 		SECRET: TEST_SECRET,
+		...(options.adminSecret !== undefined ? { ADMIN_SECRET: options.adminSecret } : {}),
 		PIXELLAB_KEY: options.pixellabKey === null ? '' : (options.pixellabKey ?? 'pixellab-test-key'),
 		CF_AI_GATEWAY_ID: options.cfGatewayId ?? 'smol',
 		CF_AIG_TOKEN: options.cfAigToken ?? 'aig-test-token',
@@ -1614,4 +1619,65 @@ test('LYR-2 & LYR-3 workflow integration: intent-first bypass skips /api/lyrics 
 	} finally {
 		globalThis.fetch = originalFetch
 	}
+})
+
+test('POST /admin/generate enforces ADMIN_SECRET fail-closed auth, privateNoStore, and known Users address', async () => {
+	const ctx = createMockExecutionContext()
+
+	// Unset ADMIN_SECRET fails closed with 404
+	const hUnset = buildMockEnv()
+	const res404 = await appModule.app.fetch(
+		new Request('https://api.smol.xyz/admin/generate', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', Authorization: 'Bearer anything' },
+			body: JSON.stringify({ address: TEST_USER, prompt: 'test song' }),
+		}),
+		hUnset.env,
+		ctx.ctx,
+	)
+	assert.equal(res404.status, 404)
+	assert.equal(res404.headers.get('Cache-Control'), 'private, no-store')
+
+	// Wrong secret -> 401
+	const hAdmin = buildMockEnv({ adminSecret: 'dedicated-admin-secret-value-1234' })
+	const res401 = await appModule.app.fetch(
+		new Request('https://api.smol.xyz/admin/generate', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', Authorization: 'Bearer wrong' },
+			body: JSON.stringify({ address: TEST_USER, prompt: 'test song' }),
+		}),
+		hAdmin.env,
+		ctx.ctx,
+	)
+	assert.equal(res401.status, 401)
+
+	// Unknown address -> 400
+	const resUnknown = await appModule.app.fetch(
+		new Request('https://api.smol.xyz/admin/generate', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', Authorization: 'Bearer dedicated-admin-secret-value-1234' },
+			body: JSON.stringify({ address: 'CUNKNOWNUSER', prompt: 'test song' }),
+		}),
+		hAdmin.env,
+		ctx.ctx,
+	)
+	assert.equal(resUnknown.status, 400)
+
+	// Valid ADMIN_SECRET + known user -> 200 and starts workflow cleanly
+	const resOk = await appModule.app.fetch(
+		new Request('https://api.smol.xyz/admin/generate', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', Authorization: 'Bearer dedicated-admin-secret-value-1234' },
+			body: JSON.stringify({ address: TEST_USER, prompt: 'admin showcase track', public: true }),
+		}),
+		hAdmin.env,
+		ctx.ctx,
+	)
+	assert.equal(resOk.status, 200)
+	assert.equal(resOk.headers.get('Cache-Control'), 'private, no-store')
+	const id = await resOk.text()
+	assert.equal(hAdmin.createdWorkflows.length, 1)
+	assert.equal(hAdmin.createdWorkflows[0].id, id)
+	assert.equal(hAdmin.createdWorkflows[0].params.address, TEST_USER)
+	assert.equal(hAdmin.createdWorkflows[0].params.public, true)
 })

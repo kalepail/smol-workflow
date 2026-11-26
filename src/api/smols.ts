@@ -546,25 +546,21 @@ smols.get(
 	}
 )
 
-// Create new smol
-smols.post('/', parseAuth, async (c) => {
-	const { env, req } = c
-	const payload = c.get('jwtPayload')
-	if (!payload?.sub) {
-		throw new HTTPException(401, { message: 'User authentication required' })
-	}
-	let body: {
-		prompt?: unknown
-		public?: unknown
-		instrumental?: unknown
-		playlist?: unknown
-		provider?: unknown
-	}
-	try {
-		body = await req.json()
-	} catch {
-		throw new HTTPException(400, { message: 'Invalid JSON body' })
-	}
+interface CreateSmolBody {
+	prompt?: unknown
+	public?: unknown
+	instrumental?: unknown
+	playlist?: unknown
+	provider?: unknown
+	address?: unknown
+}
+
+async function createSmolGeneration(
+	c: Context<HonoEnv>,
+	ownerAddress: string,
+	body: CreateSmolBody
+) {
+	const { env } = c
 
 	if (!body?.prompt || typeof body.prompt !== 'string') {
 		throw new HTTPException(400, { message: 'Missing prompt' })
@@ -595,7 +591,7 @@ smols.post('/', parseAuth, async (c) => {
 	let reserveResult: Awaited<ReturnType<typeof reserveGenerationQuota>>
 	try {
 		reserveResult = await reserveGenerationQuota(env, {
-			address: payload.sub,
+			address: ownerAddress,
 			reservationId: instanceId,
 			provider,
 		})
@@ -611,7 +607,7 @@ smols.post('/', parseAuth, async (c) => {
 	}
 
 	const workflowParams: WorkflowParams = {
-		address: payload.sub,
+		address: ownerAddress,
 		prompt: body.prompt,
 		public: typeof body.public === 'boolean' ? body.public : true,
 		instrumental: isInstrumental,
@@ -662,7 +658,7 @@ smols.post('/', parseAuth, async (c) => {
 	} catch (err) {
 		// WORKFLOW.create was never called -> confirmed unstarted, safe to refund unshared reservation
 		await refundGenerationQuota(env, {
-			address: payload.sub,
+			address: ownerAddress,
 			reservationId: instanceId,
 			dayKey: reserveResult.dayKey,
 			reason: 'do_seed_failed',
@@ -700,7 +696,7 @@ smols.post('/', parseAuth, async (c) => {
 
 				if (state === 'missing') {
 					await refundGenerationQuota(env, {
-						address: payload.sub,
+						address: ownerAddress,
 						reservationId: instanceId,
 						dayKey: reserveResult.dayKey,
 						reason: 'workflow_create_confirmed_missing',
@@ -733,6 +729,44 @@ smols.post('/', parseAuth, async (c) => {
 	console.log('Workflow started', { instanceId, status: wfStatusText })
 
 	return c.text(instanceId)
+}
+
+// Create new smol
+smols.post('/', parseAuth, async (c) => {
+	const { req } = c
+	const payload = c.get('jwtPayload')
+	if (!payload?.sub) {
+		throw new HTTPException(401, { message: 'User authentication required' })
+	}
+	let body: CreateSmolBody
+	try {
+		body = await req.json()
+	} catch {
+		throw new HTTPException(400, { message: 'Invalid JSON body' })
+	}
+	return await createSmolGeneration(c, payload.sub, body)
+})
+
+// Admin-triggered generation for ops/evals (gated behind dedicated ADMIN_SECRET; enforces same quota & workflow invariants)
+smols.post('/admin/generate', privateNoStore, requireAdmin, async (c) => {
+	const { env, req } = c
+	let body: CreateSmolBody
+	try {
+		body = await req.json()
+	} catch {
+		throw new HTTPException(400, { message: 'Invalid JSON body' })
+	}
+	const address = typeof body?.address === 'string' ? body.address.trim() : ''
+	if (!address || address.length > 128) {
+		throw new HTTPException(400, { message: 'Missing or invalid address' })
+	}
+	const userRow = await env.SMOL_D1.prepare('SELECT Address FROM Users WHERE Address = ?1 LIMIT 1')
+		.bind(address)
+		.first<{ Address: string }>()
+	if (!userRow?.Address) {
+		throw new HTTPException(400, { message: 'Unknown user address' })
+	}
+	return await createSmolGeneration(c, userRow.Address, body)
 })
 
 // Retry smol creation (caller-independent for empty-body retries; protects published smols and
