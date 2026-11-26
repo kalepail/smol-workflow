@@ -476,11 +476,45 @@ export function finalizeSongText(
 	};
 }
 
+export interface SongIntentResolution {
+	merged: MergedIntent;
+	source: 'model' | 'det';
+	ms: number;
+	rawStyles?: string[];
+}
+
 /** The model call with its timing and one log line (no prompt text). Never throws. */
-export async function resolveSongIntent(env: Pick<Env, 'AI'>, prompt: string, isInstrumental: boolean): Promise<MergedIntent> {
+export async function resolveSongIntentWithMeta(
+	env: Pick<Env, 'AI'>,
+	prompt: string,
+	isInstrumental: boolean,
+	smolId?: string
+): Promise<SongIntentResolution> {
 	const t0 = Date.now();
 	const model = await analyzePromptWithModel(env, prompt, isInstrumental);
 	const merged = mergeSongIntent(model, prompt, isInstrumental);
-	console.log(JSON.stringify({ event: 'song_intent', source: model ? 'model' : 'det', mode: merged.mode, ms: Date.now() - t0 }));
-	return merged;
+	const ms = Date.now() - t0;
+	const source = model ? 'model' : 'det';
+	console.log(JSON.stringify({
+		event: 'song_intent',
+		...(smolId ? { smol_id: smolId } : {}),
+		source,
+		mode: merged.mode,
+		ms,
+	}));
+	return {
+		merged,
+		source,
+		ms,
+		...(model?.styles?.length ? { rawStyles: model.styles } : {}),
+	};
+}
+
+export async function resolveSongIntent(
+	env: Pick<Env, 'AI'>,
+	prompt: string,
+	isInstrumental: boolean,
+	smolId?: string
+): Promise<MergedIntent> {
+	return (await resolveSongIntentWithMeta(env, prompt, isInstrumental, smolId)).merged;
 }

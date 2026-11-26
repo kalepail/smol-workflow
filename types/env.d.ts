@@ -103,6 +103,68 @@ interface GenerationMeta {
 	fallback_reason?: string
 }
 
+interface PipelineLyricsFallback {
+	service: string
+	model?: string
+	reason: string
+	upstream_status?: number
+}
+
+interface PipelineLyricsMeta {
+	service?: string
+	model?: string
+	aisg_attempts?: number
+	cf_attempts?: number
+	fallbacks?: PipelineLyricsFallback[]
+	used_description: boolean
+	prompt_chars: number
+	songwriter_style?: string[]
+	ms: number
+}
+
+interface PipelineIntentMeta {
+	source: 'model' | 'det'
+	mode: 'write' | 'user_lyrics' | 'instrumental'
+	vocal_gender: 'f' | 'm' | null
+	exclusions: string[]
+	styles_source: 'model' | 'clauses' | 'songwriter'
+	raw_styles?: string[]
+	ms: number
+}
+
+interface PipelineNsfwMeta {
+	provider: 'clef' | 'llama-guard'
+	reused?: boolean
+	ms?: number
+}
+
+interface PipelineMusicMeta {
+	provider: MusicProvider | null
+	reused?: boolean
+	task_id?: string
+	workspace_id?: string
+	gateway_log_id?: string
+	upstream_song_id?: string
+	el_pacing_source?: 'model' | 'empirical' | 'configured'
+	swapped?: boolean
+	ms?: number
+}
+
+interface PipelineMeta {
+	v: 1
+	steps_ms?: {
+		image?: number
+		describe?: number
+		lyrics?: number
+		nsfw?: number
+		music?: number
+	}
+	lyrics?: PipelineLyricsMeta
+	intent?: PipelineIntentMeta
+	nsfw?: PipelineNsfwMeta
+	music?: PipelineMusicMeta
+}
+
 interface ProviderAttemptState {
 	provider: MusicProvider
 	status: 'claimed' | 'submitted' | 'committed' | 'failed' | 'ambiguous'
@@ -204,6 +266,7 @@ interface WorkflowSteps {
 	fallback_from?: MusicProvider
 	fallback_reason?: string
 	generation_meta?: GenerationMeta
+	pipeline_meta?: PipelineMeta
 	provider_attempt?: ProviderAttemptState
 	retry_successor_id?: string
 	retry_reservation?: RetryReservation

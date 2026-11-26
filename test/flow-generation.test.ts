@@ -229,6 +229,15 @@ function buildMockEnv(options: {
 						title: 'Sunset Harbor',
 						style: ['dream pop', 'synthwave'],
 						lyrics: '[Verse 1]\nGolden waves drift by the pier\n[Chorus]\nStay until the stars appear',
+						service: 'aisonggenerator.io',
+						model: 'openrouter/auto',
+						meta: {
+							service: 'aisonggenerator.io',
+							model: 'openrouter/auto',
+							aisg_attempts: 1,
+							cf_attempts: 0,
+							ms: 420,
+						},
 					}), { status: 200, headers: { 'Content-Type': 'application/json' } })
 				}
 				if (options.aisgFetch) {
@@ -362,7 +371,9 @@ test('Gate 1a: default AISG v6 flow uses split /api/tasks submit + discovery, co
 			['f', 'male vocals, drums', 1, ['dream pop', 'female vocals', 'synth pads']],
 		)
 		assert.deepEqual(harness.lyricsBodies.map((b) => b.user_prompt), ['dreamy harbor night'])
-		assert.ok(!String(harness.lyricsBodies[0].prompt).includes('# Description'))
+		assert.ok(String(harness.lyricsBodies[0].prompt).includes('# Description'), 'short vocal prompt includes cover description')
+		assert.equal('service' in submitted, false, 'lyrics metadata must not leak into AISG submit spread')
+		assert.equal('pipeline_meta' in submitted, false)
 		assert.equal(taskDiscoverCalls, 2)
 		assert.equal(songPollCalls, 2)
 
@@ -370,6 +381,21 @@ test('Gate 1a: default AISG v6 flow uses split /api/tasks submit + discovery, co
 		assert.deepEqual(harness.r2.store.get('aisg-1.mp3')?.bytes, audioA)
 		assert.deepEqual(harness.r2.store.get('aisg-2.mp3')?.bytes, audioB)
 		assert.equal(harness.r2.store.get('aisg-1.mp3')?.httpMetadata?.contentType, 'audio/mpeg')
+
+		// Verify KV persists compact pipeline_meta for debugging while GET /:id strips it
+		const rawKv = JSON.parse(harness.kv.get(instanceId)!)
+		assert.equal(rawKv.pipeline_meta?.v, 1)
+		assert.equal(rawKv.pipeline_meta?.lyrics?.service, 'aisonggenerator.io')
+		assert.equal(rawKv.pipeline_meta?.lyrics?.model, 'openrouter/auto')
+		assert.equal(rawKv.pipeline_meta?.lyrics?.used_description, true)
+		assert.equal(rawKv.pipeline_meta?.lyrics?.aisg_attempts, 1)
+		assert.equal(rawKv.pipeline_meta?.intent?.source, 'model')
+		assert.equal(rawKv.pipeline_meta?.intent?.mode, 'write')
+		assert.equal(rawKv.pipeline_meta?.intent?.styles_source, 'model')
+		assert.equal(rawKv.pipeline_meta?.nsfw?.provider, 'clef')
+		assert.equal(rawKv.pipeline_meta?.music?.task_id, 'task-123')
+		assert.equal(rawKv.pipeline_meta?.music?.workspace_id, 'ws-9')
+		assert.equal(rawKv.pipeline_meta?.music?.swapped, true)
 
 		// Verify D1 & detail endpoint
 		const d1Row = harness.d1Smols.get(instanceId)
@@ -392,6 +418,7 @@ test('Gate 1a: default AISG v6 flow uses split /api/tasks submit + discovery, co
 		assert.equal(detail.kv_do.actual_provider, 'aisonggenerator')
 		assert.equal(detail.kv_do.generation_meta.actual_provider, 'aisonggenerator')
 		assert.equal('provider_attempt' in detail.kv_do, false)
+		assert.equal('pipeline_meta' in detail.kv_do, false)
 	} finally {
 		globalThis.fetch = originalFetch
 	}

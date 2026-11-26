@@ -242,10 +242,63 @@ export function aisgSubmitDescription(description: string, lyrics: AiSongGenerat
 	return is_instrumental && lyrics.intent_v ? '' : description;
 }
 
+/** Max trimmed prompt length for including cover `# Description` as optional visual flavor on vocal songs. */
+export const SHORT_PROMPT_DESCRIPTION_MAX_CHARS = 160;
+
+export interface GeneratedLyricsResponse extends AiSongGeneratorLyrics {
+	service?: string;
+	model?: string;
+	meta?: {
+		service?: string;
+		model?: string;
+		aisg_attempts?: number;
+		cf_attempts?: number;
+		ms?: number;
+		fallbacks?: PipelineLyricsFallback[];
+	};
+}
+
+export interface GenerateLyricsOptions {
+	description?: string;
+	instrumental?: boolean;
+	smolId?: string;
+}
+
+export function shouldIncludeDescriptionInLyrics(
+	prompt: string,
+	description?: string,
+	instrumental = false
+): boolean {
+	return (
+		!instrumental
+		&& Boolean(description?.trim())
+		&& prompt.trim().length <= SHORT_PROMPT_DESCRIPTION_MAX_CHARS
+	);
+}
+
 // Generate lyrics from a prompt (AISG primary with Workers AI fallback inside aisonggenerator-worker).
-// The cover caption is not sent: it is a description of pixel art, not of the song.
-export async function generateLyrics(env: Env, prompt: string): Promise<AiSongGeneratorLyrics> {
-	const finalPrompt = `# Prompt
+// Cover caption is included ONLY for short vocal prompts (<= 160 chars) as optional visual flavor.
+export async function generateLyrics(
+	env: Env,
+	prompt: string,
+	options: GenerateLyricsOptions = {}
+): Promise<GeneratedLyricsResponse> {
+	const includeDescription = shouldIncludeDescriptionInLyrics(prompt, options.description, options.instrumental);
+	const trimmedDescription = includeDescription ? options.description!.trim() : '';
+	const finalPrompt = includeDescription
+		? `# Prompt
+${prompt}
+
+# Description
+${trimmedDescription}
+
+# NOTES
+Write the title, lyrics, and style tags in the exact language of # Prompt unless another language is explicitly requested.
+Stay faithful to # Prompt for genre, mood, vocalist, and subject; if it contains lyrics, keep them.
+Treat # Description only as optional visual mood/imagery flavor — ignore anything that clashes with # Prompt, and never mention pixels, pixel art, 8-bit, or images.
+Put [Section] headings on their own lines. Never write stage directions or instrument cues in parentheses.
+`
+		: `# Prompt
 ${prompt}
 
 # NOTES
@@ -254,11 +307,16 @@ Stay faithful to # Prompt for genre, mood, vocalist, and subject; if it contains
 Put [Section] headings on their own lines. Never write stage directions or instrument cues in parentheses.
 `;
 
+	const headers: Record<string, string> = {
+		'Content-Type': 'application/json',
+	};
+	if (options.smolId) {
+		headers['X-Smol-Id'] = options.smolId;
+	}
+
 	const res = await env.AISONGGENERATOR.fetch('http://aisonggenerator-worker/api/lyrics', {
 		method: 'POST',
-		headers: {
-			'Content-Type': 'application/json',
-		},
+		headers,
 		// `user_prompt` (raw) lets the worker's language guard ignore the wrapper; older workers ignore it.
 		body: JSON.stringify({
 			prompt: finalPrompt,
@@ -272,7 +330,7 @@ Put [Section] headings on their own lines. Never write stage directions or instr
 		throw new Error(`Lyrics generation failed (${res.status}): ${errText.slice(0, 300)}`);
 	}
 
-	return await res.json() as AiSongGeneratorLyrics;
+	return await res.json() as GeneratedLyricsResponse;
 }
 
 /**
@@ -287,7 +345,8 @@ export async function submitAisgTask(
 	lyrics: AiSongGeneratorLyrics,
 	is_public = true,
 	is_instrumental = false,
-	attemptId?: string
+	attemptId?: string,
+	smolId?: string
 ): Promise<AisgTaskSubmitResult> {
 	const requestPayload = JSON.stringify({
 		...lyrics,
@@ -303,6 +362,9 @@ export async function submitAisgTask(
 	};
 	if (attemptId) {
 		headers['Idempotency-Key'] = attemptId;
+	}
+	if (smolId) {
+		headers['X-Smol-Id'] = smolId;
 	}
 
 	let res: Response;
@@ -325,7 +387,7 @@ export async function submitAisgTask(
 
 	// Staged rollout fallback: if aisonggenerator-worker does not expose /api/tasks yet, use POST /api/songs.
 	if (res.status === 404) {
-		const songIds = await generateSongs(env, prompt, description, lyrics, is_public, is_instrumental, attemptId);
+		const songIds = await generateSongs(env, prompt, description, lyrics, is_public, is_instrumental, attemptId, smolId);
 		return {
 			kind: 'song_ids',
 			song_ids: normalizeDistinctSongIds(songIds),
@@ -384,16 +446,21 @@ export async function replayAisgTaskSubmit(
 	lyrics: AiSongGeneratorLyrics,
 	is_public: boolean,
 	is_instrumental: boolean,
-	attemptId: string
+	attemptId: string,
+	smolId?: string
 ): Promise<AisgAttemptReplayResult> {
 	let res: Response;
 	try {
+		const headers: Record<string, string> = {
+			'Content-Type': 'application/json',
+			'Idempotency-Key': attemptId,
+		};
+		if (smolId) {
+			headers['X-Smol-Id'] = smolId;
+		}
 		res = await env.AISONGGENERATOR.fetch('http://aisonggenerator-worker/api/tasks', {
 			method: 'POST',
-			headers: {
-				'Content-Type': 'application/json',
-				'Idempotency-Key': attemptId,
-			},
+			headers,
 			body: JSON.stringify({
 				...lyrics,
 				prompt,
@@ -436,7 +503,8 @@ export async function discoverAisgTaskSongs(
 	env: Env,
 	taskId: string,
 	workspaceId?: string,
-	page?: number
+	page?: number,
+	smolId?: string
 ): Promise<AisgTaskDiscoveryResult> {
 	const params = new URLSearchParams();
 	if (workspaceId) {
@@ -450,6 +518,7 @@ export async function discoverAisgTaskSongs(
 		`http://aisonggenerator-worker/api/tasks/${encodeURIComponent(taskId)}${query}`,
 		{
 			method: 'GET',
+			...(smolId ? { headers: { 'X-Smol-Id': smolId } } : {}),
 			signal: AbortSignal.timeout(15_000),
 		}
 	);
@@ -479,13 +548,17 @@ export async function generateSongs(
 	lyrics: AiSongGeneratorLyrics,
 	is_public = true,
 	is_instrumental = false,
-	attemptId?: string
+	attemptId?: string,
+	smolId?: string
 ): Promise<string[]> {
 	const headers: Record<string, string> = {
 		'Content-Type': 'application/json',
 	};
 	if (attemptId) {
 		headers['Idempotency-Key'] = attemptId;
+	}
+	if (smolId) {
+		headers['X-Smol-Id'] = smolId;
 	}
 
 	let res: Response;
@@ -524,7 +597,8 @@ export async function generateSongs(
 // Read-only AISG song status snapshot
 export async function getSongs(
 	env: Env,
-	ids: Array<number | string>
+	ids: Array<number | string>,
+	smolId?: string
 ): Promise<AiSongGeneratorSong[]> {
 	const cleanedIds = normalizeDistinctSongIds(ids);
 	if (cleanedIds.length === 0) {
@@ -535,6 +609,7 @@ export async function getSongs(
 		`http://aisonggenerator-worker/api/songs?ids=${encodeURIComponent(cleanedIds.join(','))}`,
 		{
 			method: 'GET',
+			...(smolId ? { headers: { 'X-Smol-Id': smolId } } : {}),
 			signal: AbortSignal.timeout(20_000),
 		}
 	);

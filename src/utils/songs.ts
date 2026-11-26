@@ -87,6 +87,7 @@ export interface SongGenerationOutcome {
 	fallback_from?: MusicProvider;
 	fallback_reason?: string;
 	generation_meta: GenerationMeta;
+	music_meta?: PipelineMusicMeta;
 	reused_songs: boolean;
 }
 
@@ -1011,6 +1012,12 @@ async function runElevenLabsGeneration(params: {
 			fallback_from,
 			fallback_reason,
 			generation_meta,
+			music_meta: {
+				provider: 'elevenlabs',
+				reused: true,
+				...(existingR2Meta.gatewayLogId ? { gateway_log_id: existingR2Meta.gatewayLogId } : {}),
+				...(existingR2Meta.upstreamSongId ? { upstream_song_id: existingR2Meta.upstreamSongId } : {}),
+			},
 			reused_songs: true,
 		};
 	}
@@ -1199,6 +1206,14 @@ async function runElevenLabsGeneration(params: {
 		});
 	});
 
+	const elPacingSource: PipelineMusicMeta['el_pacing_source'] = is_instrumental
+		? undefined
+		: resolveOptionalElevenLabsMusicLengthMs(env) !== undefined
+			? 'configured'
+			: plannedChunkDurationsMs
+				? 'model'
+				: 'empirical';
+
 	return {
 		songs,
 		song_ids,
@@ -1208,6 +1223,13 @@ async function runElevenLabsGeneration(params: {
 		fallback_from,
 		fallback_reason,
 		generation_meta,
+		music_meta: {
+			provider: 'elevenlabs',
+			reused: reusedFromR2,
+			...(result.receipt.gateway_log_id ? { gateway_log_id: result.receipt.gateway_log_id } : {}),
+			...(result.receipt.upstream_song_id ? { upstream_song_id: result.receipt.upstream_song_id } : {}),
+			...(elPacingSource ? { el_pacing_source: elPacingSource } : {}),
+		},
 		reused_songs: reusedFromR2,
 	};
 }
@@ -1223,12 +1245,13 @@ async function discoverAisgSongIds(params: {
 	stub: DurableObjectStub<SmolDurableObject>;
 	step: WorkflowStep;
 	config: WorkflowStepConfig;
+	smolId?: string;
 	taskId: string;
 	workspaceId?: string;
 	attemptId?: string;
 	initialSongIds?: string[];
 }): Promise<string[]> {
-	const { env, stub, step, config, taskId, workspaceId, attemptId } = params;
+	const { env, stub, step, config, smolId, taskId, workspaceId, attemptId } = params;
 	const collected = new Set<string>(toDistinctStringIds(params.initialSongIds));
 	let nextPageCursor: number | undefined;
 
@@ -1246,7 +1269,7 @@ async function discoverAisgSongIds(params: {
 				// Always check page 1 so newly indexed items on page 1 are discovered promptly
 				let page1: Awaited<ReturnType<typeof discoverAisgTaskSongs>>;
 				try {
-					page1 = await discoverAisgTaskSongs(env, taskId, workspaceId, 1);
+					page1 = await discoverAisgTaskSongs(env, taskId, workspaceId, 1, smolId);
 				} catch (err) {
 					if (err instanceof AisgProviderError && !err.retryable) {
 						throw new NonRetryableError(`AISG discovery failed (${err.code}): ${err.message}`);
@@ -1267,7 +1290,7 @@ async function discoverAisgSongIds(params: {
 					const deeperPage = cursorForStep && cursorForStep > 1 ? cursorForStep : page1.next_page;
 					if (deeperPage && deeperPage > 1) {
 						try {
-							const deeper = await discoverAisgTaskSongs(env, taskId, workspaceId, deeperPage);
+							const deeper = await discoverAisgTaskSongs(env, taskId, workspaceId, deeperPage, smolId);
 							for (const id of deeper.music_ids) {
 								foundThisStep.add(id);
 							}
@@ -1496,7 +1519,8 @@ async function reconcileCarriedAttempt(params: {
 					lyrics,
 					is_public,
 					is_instrumental,
-					attempt.attempt_id!
+					attempt.attempt_id!,
+					smolId
 				)
 			);
 
@@ -1563,6 +1587,8 @@ async function reconcileCarriedAttempt(params: {
 				quotaReservationId,
 				quotaDayKey,
 				songIds: resolvedSongIds,
+				taskId: resolvedTaskId,
+				workspaceId: resolvedWorkspaceId,
 				prompt,
 				description,
 				lyrics,
@@ -1578,6 +1604,7 @@ async function reconcileCarriedAttempt(params: {
 				stub,
 				step,
 				config,
+				smolId,
 				taskId: resolvedTaskId,
 				workspaceId: resolvedWorkspaceId,
 				attemptId: attempt.attempt_id,
@@ -1601,6 +1628,8 @@ async function reconcileCarriedAttempt(params: {
 				quotaReservationId,
 				quotaDayKey,
 				songIds: discoveredIds,
+				taskId: resolvedTaskId,
+				workspaceId: resolvedWorkspaceId,
 				prompt,
 				description,
 				lyrics,
@@ -1756,6 +1785,14 @@ export async function generateOrReuseSongs(params: {
 				...(fallbackFrom ? { fallback_from: fallbackFrom } : {}),
 				...(fallbackReason ? { fallback_reason: fallbackReason } : {}),
 			},
+			music_meta: {
+				provider: actualProvider,
+				reused: true,
+				...(retry_steps?.provider_attempt?.task_id ? { task_id: retry_steps.provider_attempt.task_id } : {}),
+				...(retry_steps?.provider_attempt?.workspace_id ? { workspace_id: retry_steps.provider_attempt.workspace_id } : {}),
+				...(retry_steps?.provider_attempt?.gateway_log_id ? { gateway_log_id: retry_steps.provider_attempt.gateway_log_id } : {}),
+				...(retry_steps?.provider_attempt?.upstream_song_id ? { upstream_song_id: retry_steps.provider_attempt.upstream_song_id } : {}),
+			},
 			reused_songs: true,
 		};
 	}
@@ -1847,7 +1884,7 @@ export async function generateOrReuseSongs(params: {
 				retries: { limit: 2, delay: '5 second', backoff: 'exponential' },
 			},
 			async () => {
-				const currentSongs = await getSongs(env, targetIds);
+				const currentSongs = await getSongs(env, targetIds, smolId);
 				const matchedSongs = currentSongs.filter((s) => Boolean(s?.music_id && targetIdSet.has(s.music_id.trim())));
 				const distinctMatchedIds = toDistinctStringIds(matchedSongs.map((s) => s.music_id));
 				const failedSong = matchedSongs.find((s) => s.status < 0);
@@ -1924,6 +1961,13 @@ export async function generateOrReuseSongs(params: {
 				generation_meta: {
 					requested_provider,
 					actual_provider: 'aisonggenerator',
+				},
+				music_meta: {
+					provider: 'aisonggenerator',
+					reused: true,
+					...(retry_steps.provider_attempt?.task_id ? { task_id: retry_steps.provider_attempt.task_id } : {}),
+					...(retry_steps.provider_attempt?.workspace_id ? { workspace_id: retry_steps.provider_attempt.workspace_id } : {}),
+					...(swapped ? { swapped: true } : {}),
 				},
 				reused_songs: true,
 			};
@@ -2163,7 +2207,8 @@ export async function generateOrReuseSongs(params: {
 					lyrics,
 					is_public,
 					is_instrumental,
-					aisgAttemptId
+					aisgAttemptId,
+					smolId
 				);
 
 				await updateAttemptIfSupported(stub, {
@@ -2311,12 +2356,17 @@ export async function generateOrReuseSongs(params: {
 	// An accepted AISG task with < 2 discovered IDs is STILL PENDING — retain the receipt
 	// for retry resumption and NEVER buy a second song via ElevenLabs or publish a singleton.
 	let songIds: string[];
+	let submittedTaskId: string | undefined;
+	let submittedWorkspaceId: string | undefined;
 	if (submitOutcome.result.kind === 'task') {
+		submittedTaskId = submitOutcome.result.task_id;
+		submittedWorkspaceId = submitOutcome.result.workspace_id;
 		songIds = await discoverAisgSongIds({
 			env,
 			stub,
 			step,
 			config,
+			smolId,
 			taskId: submitOutcome.result.task_id,
 			workspaceId: submitOutcome.result.workspace_id,
 			attemptId: aisgAttemptId,
@@ -2347,6 +2397,8 @@ export async function generateOrReuseSongs(params: {
 		quotaReservationId: activeAisgReservationId,
 		quotaDayKey: activeAisgDayKey,
 		songIds,
+		taskId: submittedTaskId,
+		workspaceId: submittedWorkspaceId,
 		prompt,
 		description,
 		lyrics,
@@ -2417,6 +2469,8 @@ async function pollAndCommitAisgOrFallback(params: {
 	quotaReservationId?: string;
 	quotaDayKey?: string;
 	songIds: string[];
+	taskId?: string;
+	workspaceId?: string;
 	prompt: string;
 	description: string;
 	lyrics: AiSongGeneratorLyrics;
@@ -2434,6 +2488,8 @@ async function pollAndCommitAisgOrFallback(params: {
 		quotaReservationId,
 		quotaDayKey,
 		songIds,
+		taskId,
+		workspaceId,
 		prompt,
 		description,
 		lyrics,
@@ -2460,7 +2516,7 @@ async function pollAndCommitAisgOrFallback(params: {
 			async (): Promise<BoundedPollStepResult> => {
 				const targetIds = toDistinctStringIds(songIds);
 				const targetIdSet = new Set(targetIds);
-				const fetched = await getSongs(env, targetIds);
+				const fetched = await getSongs(env, targetIds, smolId);
 				const matched = fetched.filter((s) => Boolean(s?.music_id && targetIdSet.has(s.music_id.trim())));
 
 				for (const song of matched) {
@@ -2663,6 +2719,13 @@ async function pollAndCommitAisgOrFallback(params: {
 		generation_meta: {
 			requested_provider,
 			actual_provider: 'aisonggenerator',
+		},
+		music_meta: {
+			provider: 'aisonggenerator',
+			reused: false,
+			...(taskId ? { task_id: taskId } : {}),
+			...(workspaceId ? { workspace_id: workspaceId } : {}),
+			...(anySwapDetected ? { swapped: true } : {}),
 		},
 		reused_songs: false,
 	};

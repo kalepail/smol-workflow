@@ -158,34 +158,41 @@ test('model call: no gateway option, json_object, null on 429 / junk / timeout, 
 	try {
 		const merged = await resolveSongIntent(rateLimited as never, 'secret prompt words', false)
 		assert.equal(merged.mode, 'write')
+		await resolveSongIntent(rateLimited as never, 'secret prompt words', false, 'smol-trace-1')
 	} finally {
 		console.log = log
 	}
-	assert.equal(logs.length, 1)
+	assert.equal(logs.length, 2)
 	const event = JSON.parse(logs[0])
 	assert.deepEqual(Object.keys(event).sort(), ['event', 'mode', 'ms', 'source'])
 	assert.deepEqual([event.event, event.source, event.mode], ['song_intent', 'det', 'write'])
-	assert.ok(!logs[0].includes('secret'))
+	const tracedEvent = JSON.parse(logs[1])
+	assert.deepEqual(Object.keys(tracedEvent).sort(), ['event', 'mode', 'ms', 'smol_id', 'source'])
+	assert.equal(tracedEvent.smol_id, 'smol-trace-1')
+	assert.ok(!logs[0].includes('secret') && !logs[1].includes('secret'))
 })
 
 test('AISG wire: old lyrics give byte-identical submit/replay/legacy bodies; new lyrics add vocalGender + string negativeTags and an empty instrumental caption', async () => {
 	const bodies: Record<string, string> = {}
+	const headersByPath: Record<string, Headers> = {}
 	const env = {
 		AISONGGENERATOR: {
 			fetch: async (url: string, init: RequestInit) => {
 				const path = new URL(url).pathname
 				bodies[path] = String(init.body)
-				if (path === '/api/lyrics') return Response.json({ title: 't', style: ['a', 'b'], lyrics: 'l' })
+				headersByPath[path] = new Headers(init.headers)
+				if (path === '/api/lyrics') return Response.json({ title: 't', style: ['a', 'b'], lyrics: 'l', service: 'aisonggenerator.io', model: 'openrouter/auto' })
 				return Response.json(path === '/api/songs' ? ['s1', 's2'] : { task_id: 'task-1' })
 			},
 		},
 	} as unknown as Env
 	const send = async (lyrics: AiSongGeneratorLyrics, instrumental: boolean) => {
-		await submitAisgTask(env, 'raw prompt', 'pixel caption', lyrics, true, instrumental, 'key-1')
+		await submitAisgTask(env, 'raw prompt', 'pixel caption', lyrics, true, instrumental, 'key-1', 'smol-wire-1')
 		const submit = bodies['/api/tasks']
-		await replayAisgTaskSubmit(env, 'raw prompt', 'pixel caption', lyrics, true, instrumental, 'key-1')
+		assert.equal(headersByPath['/api/tasks'].get('x-smol-id'), 'smol-wire-1')
+		await replayAisgTaskSubmit(env, 'raw prompt', 'pixel caption', lyrics, true, instrumental, 'key-1', 'smol-wire-1')
 		assert.equal(bodies['/api/tasks'], submit, 'replay body === submit body')
-		await generateSongs(env, 'raw prompt', 'pixel caption', lyrics, true, instrumental, 'key-1')
+		await generateSongs(env, 'raw prompt', 'pixel caption', lyrics, true, instrumental, 'key-1', 'smol-wire-1')
 		assert.equal(bodies['/api/songs'], submit, 'legacy body === submit body')
 		return submit
 	}
@@ -208,12 +215,35 @@ test('AISG wire: old lyrics give byte-identical submit/replay/legacy bodies; new
 	const instBody = JSON.parse(await send(inst, true))
 	assert.deepEqual([instBody.description, instBody.lyrics, instBody.intent_v, 'vocalGender' in instBody], ['', '', 1, false])
 
-	// The lyric LLM gets the raw prompt alongside the wrapper, and no cover caption.
+	// Short vocal prompt (<= 160 chars) with description includes # Description as optional flavor and X-Smol-Id.
+	await generateLyrics(env, 'soft romantic rock song with female voice', {
+		description: 'Warm lantern light over a misty pier.',
+		instrumental: false,
+		smolId: 'smol-short-1',
+	})
+	const shortVocalBody = JSON.parse(bodies['/api/lyrics'])
+	assert.equal(shortVocalBody.user_prompt, 'soft romantic rock song with female voice')
+	assert.match(shortVocalBody.prompt, /^# Prompt\nsoft romantic rock song with female voice\n\n# Description\nWarm lantern light over a misty pier\./)
+	assert.match(shortVocalBody.prompt, /never mention pixels/i)
+	assert.equal(headersByPath['/api/lyrics'].get('x-smol-id'), 'smol-short-1')
+
+	// Short instrumental prompt and long (> 160 chars) vocal prompt omit # Description.
+	await generateLyrics(env, 'soft piano', {
+		description: 'Warm lantern light over a misty pier.',
+		instrumental: true,
+	})
+	assert.ok(!JSON.parse(bodies['/api/lyrics']).prompt.includes('# Description'))
+
+	const longPrompt = 'a'.repeat(161)
+	await generateLyrics(env, longPrompt, {
+		description: 'Warm lantern light over a misty pier.',
+		instrumental: false,
+	})
+	assert.ok(!JSON.parse(bodies['/api/lyrics']).prompt.includes('# Description'))
+
+	// Calling without description still omits # Description.
 	await generateLyrics(env, 'soft romantic rock song with female voice')
-	const lyricsBody = JSON.parse(bodies['/api/lyrics'])
-	assert.equal(lyricsBody.user_prompt, 'soft romantic rock song with female voice')
-	assert.match(lyricsBody.prompt, /^# Prompt\nsoft romantic rock song with female voice\n/)
-	assert.ok(!lyricsBody.prompt.includes('# Description'))
+	assert.ok(!JSON.parse(bodies['/api/lyrics']).prompt.includes('# Description'))
 })
 
 test('pass-1 #2: styles never fail a complete song (refill from songwriter, then neutral defaults)', () => {

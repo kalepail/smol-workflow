@@ -1,9 +1,9 @@
 import { WorkflowEntrypoint, WorkflowStep, WorkflowEvent, WorkflowStepConfig } from 'cloudflare:workers';
 import type { SmolDurableObject } from './do';
 import { pixellab } from './ai/pixellab';
-import { imageDescribe } from './ai/cf';
-import { generateLyrics } from './ai/aisonggenerator';
-import { finalizeSongText, resolveSongIntent } from './ai/song-intent';
+import { IMAGE_DESCRIBE_MODEL, imageDescribe } from './ai/cf';
+import { generateLyrics, shouldIncludeDescriptionInLyrics } from './ai/aisonggenerator';
+import { finalizeSongText, resolveSongIntentWithMeta } from './ai/song-intent';
 import { checkNSFW, isNsfwBlocked, normalizeNsfwResult } from './ai/nsfw';
 import { NonRetryableError } from 'cloudflare:workflows';
 import { purgeCacheByTags } from './utils/cache';
@@ -67,6 +67,7 @@ export function toRetrySnapshot(restored: WorkflowSteps | null | undefined, retr
 		fallback_from: restored.fallback_from,
 		fallback_reason: restored.fallback_reason,
 		generation_meta: restored.generation_meta,
+		pipeline_meta: restored.pipeline_meta,
 		provider_attempt: restored.provider_attempt,
 		original_fingerprints: restored.original_fingerprints,
 		quota_reservation_id: restored.quota_reservation_id,
@@ -290,11 +291,29 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 		let description: string;
 		let lyrics: AiSongGeneratorLyrics;
 		let nsfw: NormalizedNsfwResult;
+		const pipeline_meta: PipelineMeta = {
+			...(retry_steps?.pipeline_meta ?? {}),
+			v: 1,
+			steps_ms: { ...(retry_steps?.pipeline_meta?.steps_ms ?? {}) },
+		};
+		const persistPipelineMeta = async () => {
+			const doStub = stub as unknown as {
+				saveSteps?: (entries: Record<string, unknown>) => Promise<void>;
+				saveStep: (step: string, data: unknown, options?: { persistMedia?: boolean }) => Promise<void>;
+			};
+			if (typeof doStub.saveSteps === 'function') {
+				await doStub.saveSteps({ pipeline_meta });
+			} else {
+				await doStub.saveStep('pipeline_meta', pipeline_meta, { persistMedia: false });
+			}
+		};
 
 		try {
 			// =====================================================================
 			// STEP 2: Generate image (or reuse from retry)
 			// =====================================================================
+			const imageReused = Boolean(retry_steps?.image_base64);
+			const imageStart = Date.now();
 			image_base64 = retry_steps?.image_base64 || await step.do(
 				'generate image',
 				{
@@ -308,15 +327,38 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 					return await pixellab(this.env, prompt, 'pixflux');
 				}
 			);
+			const imageMs = Date.now() - imageStart;
+			if (!imageReused) {
+				pipeline_meta.steps_ms!.image = imageMs;
+			}
+			console.log(JSON.stringify({
+				event: 'workflow_step_image',
+				smol_id: event.instanceId,
+				reused: imageReused,
+				ms: imageMs,
+			}));
 
 			await step.do('save generated image', config, () => stub.saveStep('image_base64', image_base64));
 
 			// =====================================================================
 			// STEP 3: Describe image (or reuse from retry)
 			// =====================================================================
+			const describeReused = Boolean(retry_steps?.description);
+			const describeStart = Date.now();
 			description = retry_steps?.description || await step.do('describe image', config, async () => {
 				return await imageDescribe(this.env, image_base64, prompt);
 			});
+			const describeMs = Date.now() - describeStart;
+			if (!describeReused) {
+				pipeline_meta.steps_ms!.describe = describeMs;
+			}
+			console.log(JSON.stringify({
+				event: 'workflow_step_describe',
+				smol_id: event.instanceId,
+				reused: describeReused,
+				model: IMAGE_DESCRIBE_MODEL,
+				ms: describeMs,
+			}));
 
 			await step.do('save image description', config, () => stub.saveStep('description', description));
 
@@ -325,27 +367,96 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 			// =====================================================================
 			// The song-intent call runs beside the songwriter and never throws (null -> deterministic).
 			// The completeness check runs on the FINAL object that is stored and sent to the providers.
-			lyrics = retry_steps?.lyrics || await step.do('generate lyrics', config, async () => {
-				const [generated, intent] = await Promise.all([
-					generateLyrics(this.env, prompt),
-					resolveSongIntent(this.env, prompt, is_instrumental),
-				]);
-				const final = finalizeSongText(generated, intent, prompt, is_instrumental);
+			const lyricsReused = Boolean(retry_steps?.lyrics);
+			const lyricsStepStart = Date.now();
+			if (retry_steps?.lyrics) {
+				lyrics = retry_steps.lyrics;
+			} else {
+				const lyricsStepResult = await step.do('generate lyrics', config, async () => {
+					const usedDescription = shouldIncludeDescriptionInLyrics(prompt, description, is_instrumental);
+					const lyricsStart = Date.now();
+					const [generated, intentRes] = await Promise.all([
+						generateLyrics(this.env, prompt, {
+							description,
+							instrumental: is_instrumental,
+							smolId: event.instanceId,
+						}).then((res) => ({ res, ms: Date.now() - lyricsStart })),
+						resolveSongIntentWithMeta(this.env, prompt, is_instrumental, event.instanceId),
+					]);
+					const intent = intentRes.merged;
+					const final = finalizeSongText(generated.res, intent, prompt, is_instrumental);
 
-				const missingLyrics = !is_instrumental && !final.lyrics.trim();
-				if (!final.title || missingLyrics || final.style.length < 2) {
-					const missing = [
-						!final.title && 'title',
-						missingLyrics && 'lyrics',
-						final.style.length < 2 && 'style',
-					].filter(Boolean).join(', ');
-					throw new Error(`Lyrics generation incomplete (missing: ${missing}). Try a different prompt.`);
+					const missingLyrics = !is_instrumental && !final.lyrics.trim();
+					if (!final.title || missingLyrics || final.style.length < 2) {
+						const missing = [
+							!final.title && 'title',
+							missingLyrics && 'lyrics',
+							final.style.length < 2 && 'style',
+						].filter(Boolean).join(', ');
+						throw new Error(`Lyrics generation incomplete (missing: ${missing}). Try a different prompt.`);
+					}
+
+					const rawLyricsMeta = generated.res.meta;
+					const lyricsMeta: PipelineLyricsMeta = {
+						...(rawLyricsMeta?.service ?? generated.res.service ? { service: rawLyricsMeta?.service ?? generated.res.service } : {}),
+						...(rawLyricsMeta?.model ?? generated.res.model ? { model: rawLyricsMeta?.model ?? generated.res.model } : {}),
+						...(rawLyricsMeta?.aisg_attempts !== undefined ? { aisg_attempts: rawLyricsMeta.aisg_attempts } : {}),
+						...(rawLyricsMeta?.cf_attempts !== undefined ? { cf_attempts: rawLyricsMeta.cf_attempts } : {}),
+						...(rawLyricsMeta?.fallbacks?.length ? { fallbacks: rawLyricsMeta.fallbacks } : {}),
+						used_description: usedDescription,
+						prompt_chars: prompt.trim().length,
+						...(Array.isArray(generated.res.style) && generated.res.style.length ? { songwriter_style: generated.res.style } : {}),
+						ms: rawLyricsMeta?.ms ?? generated.ms,
+					};
+					const intentMeta: PipelineIntentMeta = {
+						source: intentRes.source,
+						mode: intent.mode,
+						vocal_gender: intent.vocal_gender,
+						exclusions: intent.exclusions,
+						styles_source: intent.styles ? 'model' : intent.clauses.length ? 'clauses' : 'songwriter',
+						...(intentRes.rawStyles?.length ? { raw_styles: intentRes.rawStyles } : {}),
+						ms: intentRes.ms,
+					};
+
+					return {
+						lyrics: final,
+						lyrics_meta: lyricsMeta,
+						intent_meta: intentMeta,
+					};
+				});
+
+				// Backward-compatible with pre-deploy cached workflow checkpoints that stored AiSongGeneratorLyrics directly.
+				if ('lyrics_meta' in lyricsStepResult && lyricsStepResult.lyrics) {
+					lyrics = lyricsStepResult.lyrics;
+					pipeline_meta.lyrics = lyricsStepResult.lyrics_meta;
+					pipeline_meta.intent = lyricsStepResult.intent_meta;
+				} else {
+					lyrics = lyricsStepResult as unknown as AiSongGeneratorLyrics;
 				}
+			}
+			const lyricsStepMs = Date.now() - lyricsStepStart;
+			if (!lyricsReused) {
+				pipeline_meta.steps_ms!.lyrics = lyricsStepMs;
+			}
+			console.log(JSON.stringify({
+				event: 'workflow_step_lyrics',
+				smol_id: event.instanceId,
+				reused: lyricsReused,
+				...(pipeline_meta.lyrics?.service ? { service: pipeline_meta.lyrics.service } : {}),
+				...(pipeline_meta.lyrics?.model ? { model: pipeline_meta.lyrics.model } : {}),
+				...(pipeline_meta.lyrics?.aisg_attempts !== undefined ? { aisg_attempts: pipeline_meta.lyrics.aisg_attempts } : {}),
+				...(pipeline_meta.lyrics?.cf_attempts !== undefined ? { cf_attempts: pipeline_meta.lyrics.cf_attempts } : {}),
+				fallback_count: pipeline_meta.lyrics?.fallbacks?.length ?? 0,
+				used_description: pipeline_meta.lyrics?.used_description ?? false,
+				...(pipeline_meta.intent?.source ? { intent_source: pipeline_meta.intent.source } : {}),
+				...(pipeline_meta.intent?.mode ? { intent_mode: pipeline_meta.intent.mode } : {}),
+				ms: lyricsStepMs,
+			}));
 
-				return final;
+			await step.do('save generated lyrics', config, async () => {
+				await stub.saveStep('lyrics', lyrics);
+				await persistPipelineMeta();
 			});
-
-			await step.do('save generated lyrics', config, () => stub.saveStep('lyrics', lyrics));
 
 			// =====================================================================
 			// STEP 5: Check NSFW, always normalized fail-closed. A retry reuses the stored verdict
@@ -353,13 +464,38 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 			// any regenerated input is re-classified so it never inherits a stale safe verdict.
 			// =====================================================================
 			const reusedAllModerationInputs = Boolean(retry_steps?.image_base64 && retry_steps?.description && retry_steps?.lyrics);
-			nsfw = retry_steps?.nsfw !== undefined && reusedAllModerationInputs
-				? normalizeNsfwResult(retry_steps.nsfw)
+			const nsfwReused = retry_steps?.nsfw !== undefined && reusedAllModerationInputs;
+			const nsfwProvider: 'clef' | 'llama-guard' = this.env.NSFW_PROVIDER === 'llama-guard' ? 'llama-guard' : 'clef';
+			const nsfwStart = Date.now();
+			nsfw = nsfwReused
+				? normalizeNsfwResult(retry_steps!.nsfw)
 				: await step.do('check nsfw', config, async () => {
 					return await checkNSFW(this.env, prompt, description, lyrics.lyrics ?? '', image_base64);
 				});
+			const nsfwMs = Date.now() - nsfwStart;
+			pipeline_meta.nsfw = {
+				provider: nsfwReused && pipeline_meta.nsfw?.provider ? pipeline_meta.nsfw.provider : nsfwProvider,
+				reused: nsfwReused,
+				ms: nsfwReused && pipeline_meta.nsfw?.ms !== undefined ? pipeline_meta.nsfw.ms : nsfwMs,
+			};
+			if (!nsfwReused) {
+				pipeline_meta.steps_ms!.nsfw = nsfwMs;
+			}
+			console.log(JSON.stringify({
+				event: 'workflow_step_nsfw',
+				smol_id: event.instanceId,
+				reused: nsfwReused,
+				provider: pipeline_meta.nsfw.provider,
+				safe: nsfw.safe,
+				categories: nsfw.categories,
+				...(nsfw.unknown ? { unknown: true } : {}),
+				ms: nsfwMs,
+			}));
 
-			await step.do('save nsfw check', config, () => stub.saveStep('nsfw', nsfw));
+			await step.do('save nsfw check', config, async () => {
+				await stub.saveStep('nsfw', nsfw);
+				await persistPipelineMeta();
+			});
 		} catch (err) {
 			// Refund a fresh reservation ONLY if a pre-music step failed permanently before
 			// any music provider call was dispatched (never on test SuspendSignal or inherited claims).
@@ -379,6 +515,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 		// =====================================================================
 		// STEP 6: Generate or reuse songs (AISG v6 2-track / ElevenLabs 1-track)
 		// =====================================================================
+		const musicStart = Date.now();
 		const musicOutcome = await generateOrReuseSongs({
 			env: this.env,
 			stub,
@@ -400,6 +537,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 			requested_provider,
 			override_provider,
 		});
+		const musicMs = Date.now() - musicStart;
 
 		const {
 			songs,
@@ -409,7 +547,28 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 			fallback_from,
 			fallback_reason,
 			generation_meta,
+			music_meta,
 		} = musicOutcome;
+
+		pipeline_meta.steps_ms!.music = musicMs;
+		pipeline_meta.music = {
+			...(music_meta ?? { provider: actual_provider, reused: musicOutcome.reused_songs }),
+			ms: musicMs,
+		};
+		console.log(JSON.stringify({
+			event: 'workflow_step_music',
+			smol_id: event.instanceId,
+			requested_provider,
+			actual_provider,
+			...(fallback_from ? { fallback_from } : {}),
+			...(fallback_reason ? { fallback_reason } : {}),
+			reused: musicOutcome.reused_songs,
+			...(pipeline_meta.music.task_id ? { task_id: pipeline_meta.music.task_id } : {}),
+			...(pipeline_meta.music.gateway_log_id ? { gateway_log_id: pipeline_meta.music.gateway_log_id } : {}),
+			...(pipeline_meta.music.el_pacing_source ? { el_pacing_source: pipeline_meta.music.el_pacing_source } : {}),
+			...(pipeline_meta.music.swapped ? { swapped: true } : {}),
+			ms: musicMs,
+		}));
 
 		if (songs.length < 1 || !songs[0]?.music_id) {
 			throw new NonRetryableError('Workflow produced no playable songs');
@@ -445,8 +604,10 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 				...(fallback_from ? { fallback_from } : {}),
 				...(fallback_reason ? { fallback_reason } : {}),
 				generation_meta,
+				pipeline_meta,
 				search: preservedSearch,
 			}));
+			await persistPipelineMeta();
 
 			// Write D1 Smols row + conflict-safe Playlist insert in one batch (pre- and post-migration safe)
 			await persistSmolAndPlaylistD1({
