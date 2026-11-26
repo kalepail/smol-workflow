@@ -15,7 +15,7 @@ import playlists from './api/playlists'
 import mixtapes from './api/mixtapes'
 import mint from './api/mint'
 import chain from './api/chain'
-import { image, song } from './api/media'
+import { image, song, video } from './api/media'
 import search from './api/search'
 import artists from './api/artists'
 import quota from './api/quota'
@@ -44,6 +44,7 @@ app.route('/mint', mint)
 app.route('/chain', chain)
 app.route('/song', song)
 app.route('/image', image)
+app.route('/video', video)
 app.route('/search', search)
 app.route('/artists', artists)
 app.route('/quota', quota)

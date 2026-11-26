@@ -5,15 +5,23 @@ import { parseByteRange, type ParsedByteRange } from '../utils'
 import { getPlayCountMode } from './plays'
 import { stripOriginSpecificHeaders } from '../utils/public-cache'
 import { PNG_MAX_INPUT_BYTES, scalePng } from '../utils/png-scale'
+import {
+	VIDEO_MAX_MP3_BYTES,
+	VIDEO_MAX_PNG_BYTES,
+	VIDEO_MUX_VERSION,
+	muxCoverAndMp3ToMp4,
+} from '../utils/mp4-mux'
 
-// Separate routers so /song serves only MP3s and /image only PNGs (cross-media GET/HEAD is 404).
+// Separate routers so /song serves only MP3s, /image only PNGs, and /video only muxed MP4s.
 export const song = new Hono<HonoEnv>()
 export const image = new Hono<HonoEnv>()
+export const video = new Hono<HonoEnv>()
 export const MEDIA_CACHE_CONTROL = 'public, max-age=2592000, stale-while-revalidate=86400'
 const CANONICAL_MEDIA_ORIGIN = 'https://api.smol.xyz'
 const MAX_PROBE_BYTES = 2
 const MAX_RANGE_WARM_BYTES = 16 * 1024 * 1024
 const songCacheWarms = new Map<string, Promise<void>>()
+const videoMuxInFlight = new Map<string, Promise<{ meta: R2Object; bytes?: Uint8Array }>>()
 
 function getEdgeCache(): Cache | undefined {
 	if (typeof caches === 'undefined') {
@@ -599,4 +607,242 @@ image.get('/:id{.+\\.png}', async (c) => {
 	}
 
 	return new Response(responseBody, { status: 200, headers })
+})
+
+const SMOL_ID_RE = /^[0-9a-f]{64}$/i
+const MUSIC_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/
+
+export function isRestrictedNsfw(nsfw: { safe?: boolean | null; unknown?: boolean | null } | null | undefined): boolean {
+	if (!nsfw) return false
+	return Boolean(nsfw.unknown) || nsfw.safe === false
+}
+
+export function videoR2Key(smolId: string, musicId: string): string {
+	return `video/${VIDEO_MUX_VERSION}/${smolId}/${musicId}.mp4`
+}
+
+function buildVideoHeaders(
+	smolId: string,
+	musicId: string,
+	meta: Pick<R2Object, 'httpEtag' | 'uploaded'> & { writeHttpMetadata?: (h: Headers) => void }
+): Headers {
+	const headers = new Headers()
+	meta.writeHttpMetadata?.(headers)
+	headers.set('Content-Type', 'video/mp4')
+	headers.set('Accept-Ranges', 'bytes')
+	headers.set('Cache-Control', MEDIA_CACHE_CONTROL)
+	headers.set('X-Robots-Tag', 'noindex, nofollow')
+	headers.set(
+		'Cache-Tag',
+		`video-mux,video-mux:${VIDEO_MUX_VERSION},smol:${smolId}:media,song:${musicId}:media`
+	)
+
+	const etag = normalizeEtag(meta.httpEtag)
+	if (etag) {
+		headers.set('ETag', etag)
+	}
+	if (meta.uploaded instanceof Date && !Number.isNaN(meta.uploaded.getTime())) {
+		headers.set('Last-Modified', meta.uploaded.toUTCString())
+	}
+	return headers
+}
+
+async function ensureVideoObjectInR2(
+	env: Env,
+	r2Key: string,
+	smolId: string,
+	musicId: string
+): Promise<{ meta: Pick<R2Object, 'size' | 'httpEtag' | 'uploaded'> & { writeHttpMetadata?: (h: Headers) => void }; bytes?: Uint8Array }> {
+	const inflight = videoMuxInFlight.get(r2Key)
+	if (inflight) return inflight
+
+	const job = (async () => {
+		const imageKey = `${smolId}.png`
+		const songKey = `${musicId}.mp3`
+		const [imageHead, songHead] = await Promise.all([
+			env.SMOL_BUCKET.head(imageKey),
+			env.SMOL_BUCKET.head(songKey),
+		])
+		if (!imageHead || !songHead) {
+			throw new HTTPException(404, { message: 'Source media not found' })
+		}
+		if (imageHead.size === 0 || imageHead.size > VIDEO_MAX_PNG_BYTES) {
+			throw new HTTPException(422, { message: 'Cover image size not eligible for video preview' })
+		}
+		if (songHead.size === 0 || songHead.size > VIDEO_MAX_MP3_BYTES) {
+			throw new HTTPException(422, { message: 'Audio size exceeds video preview budget' })
+		}
+
+		const [imageObj, songObj] = await Promise.all([
+			env.SMOL_BUCKET.get(imageKey),
+			env.SMOL_BUCKET.get(songKey),
+		])
+		if (!imageObj || !songObj) {
+			await imageObj?.body?.cancel().catch(() => {})
+			await songObj?.body?.cancel().catch(() => {})
+			throw new HTTPException(404, { message: 'Source media not found' })
+		}
+
+		const [pngBuf, mp3Buf] = await Promise.all([imageObj.arrayBuffer(), songObj.arrayBuffer()])
+		const muxed = muxCoverAndMp3ToMp4(new Uint8Array(pngBuf), new Uint8Array(mp3Buf))
+
+		const putResult = await env.SMOL_BUCKET.put(r2Key, muxed.mp4, {
+			httpMetadata: { contentType: 'video/mp4' },
+			customMetadata: { smolId, musicId, muxVersion: VIDEO_MUX_VERSION },
+		})
+
+		const meta: Pick<R2Object, 'size' | 'httpEtag' | 'uploaded'> & { writeHttpMetadata?: (h: Headers) => void } =
+			putResult ?? {
+				size: muxed.mp4.byteLength,
+				httpEtag: `"${VIDEO_MUX_VERSION}-${smolId.slice(0, 12)}-${musicId.slice(0, 12)}-${muxed.mp4.byteLength}"`,
+				uploaded: new Date(),
+			}
+
+		return { meta: meta as R2Object, bytes: muxed.mp4 }
+	})().finally(() => {
+		videoMuxInFlight.delete(r2Key)
+	})
+
+	videoMuxInFlight.set(r2Key, job)
+	return job
+}
+
+// Serve R2-persisted H.264 + .mp3-fourcc interleaved MP4 previews (handles GET and HEAD via Hono)
+video.get(`/${VIDEO_MUX_VERSION}/:smolId/:musicFile{.+\\.mp4}`, async (c) => {
+	const { env, req } = c
+	if ((env as unknown as Record<string, string | undefined>).DISABLE_VIDEO_MUX === 'true') {
+		throw new HTTPException(404, { message: 'Video previews disabled' })
+	}
+
+	const smolId = req.param('smolId')
+	const musicFile = req.param('musicFile')
+	const musicId = musicFile.replace(/\.mp4$/, '')
+	if (!SMOL_ID_RE.test(smolId) || !MUSIC_ID_RE.test(musicId)) {
+		throw new HTTPException(404, { message: 'Video not found' })
+	}
+
+	// Gate EVERY request (warm or cold) on published D1 row, authorized take, and safety policy.
+	let smolKv: Record<string, any> | null = null
+	let smolD1: { Id: string; Public: number; Song_1?: string | null; Song_2?: string | null } | null = null
+	try {
+		const [d1Row, kvRow] = await Promise.all([
+			env.SMOL_D1.prepare(`SELECT Id, Public, Song_1, Song_2 FROM Smols WHERE Id = ?1`)
+				.bind(smolId)
+				.first<{ Id: string; Public: number; Song_1?: string | null; Song_2?: string | null }>(),
+			env.SMOL_KV.get(smolId, 'json') as Promise<Record<string, any> | null>,
+		])
+		smolD1 = d1Row
+		smolKv = kvRow
+	} catch {
+		return new Response('Temporarily unavailable', {
+			status: 503,
+			headers: { 'Cache-Control': 'no-store' },
+		})
+	}
+
+	if (!smolD1 || (smolD1.Song_1 !== musicId && smolD1.Song_2 !== musicId)) {
+		throw new HTTPException(404, { message: 'Video not found' })
+	}
+	if (isRestrictedNsfw(smolKv?.nsfw)) {
+		throw new HTTPException(404, { message: 'Video not available' })
+	}
+
+	const isHead = req.method === 'HEAD'
+	const rangeHeader = isHead ? undefined : req.header('range')
+	const ifNoneMatch = req.header('if-none-match')
+	const ifRange = req.header('if-range')
+	const r2Key = videoR2Key(smolId, musicId)
+
+	// 1. Warm path: stream directly from R2 in O(1) memory
+	const existing = await env.SMOL_BUCKET.head(r2Key)
+	if (existing) {
+		const headers = buildVideoHeaders(smolId, musicId, existing)
+		const etag = normalizeEtag(headers.get('ETag'))
+		const lastModified = headers.get('Last-Modified')
+		const size = existing.size
+
+		if (matchesIfNoneMatch(ifNoneMatch, etag)) {
+			return notModifiedResponse(headers)
+		}
+		if (isHead) {
+			headers.set('Content-Length', String(size))
+			return new Response(null, { status: 200, headers })
+		}
+
+		const effectiveRangeHeader = rangeHeader && matchesIfRange(ifRange, etag, lastModified)
+			? rangeHeader
+			: undefined
+
+		if (effectiveRangeHeader) {
+			const parsed = parseByteRange(effectiveRangeHeader, size)
+			if (parsed.kind === 'unsatisfiable') {
+				return unsatisfiableRangeResponse(headers, size)
+			}
+			if (parsed.kind === 'range') {
+				const object = await env.SMOL_BUCKET.get(r2Key, {
+					range: { offset: parsed.offset, length: parsed.length },
+				})
+				if (!object) {
+					throw new HTTPException(404, { message: 'Video not found' })
+				}
+				const resolved = resolveR2Range(object, parsed, size)
+				headers.set('Content-Range', `bytes ${resolved.offset}-${resolved.end}/${size}`)
+				headers.set('Content-Length', String(resolved.length))
+				return new Response(object.body, { status: 206, headers })
+			}
+		}
+
+		const object = await env.SMOL_BUCKET.get(r2Key)
+		if (!object) {
+			throw new HTTPException(404, { message: 'Video not found' })
+		}
+		headers.set('Content-Length', String(object.size))
+		return new Response(object.body, { status: 200, headers })
+	}
+
+	// 2. Cold path: single-flight mux once, persist to R2, answer current request directly
+	const created = await ensureVideoObjectInR2(env, r2Key, smolId, musicId)
+	const headers = buildVideoHeaders(smolId, musicId, created.meta)
+	const etag = normalizeEtag(headers.get('ETag'))
+	const lastModified = headers.get('Last-Modified')
+	const size = created.bytes ? created.bytes.byteLength : created.meta.size
+
+	if (matchesIfNoneMatch(ifNoneMatch, etag)) {
+		return notModifiedResponse(headers)
+	}
+	if (isHead) {
+		headers.set('Content-Length', String(size))
+		return new Response(null, { status: 200, headers })
+	}
+
+	const effectiveRangeHeader = rangeHeader && matchesIfRange(ifRange, etag, lastModified)
+		? rangeHeader
+		: undefined
+
+	if (effectiveRangeHeader) {
+		const parsed = parseByteRange(effectiveRangeHeader, size)
+		if (parsed.kind === 'unsatisfiable') {
+			return unsatisfiableRangeResponse(headers, size)
+		}
+		if (parsed.kind === 'range') {
+			headers.set('Content-Range', `bytes ${parsed.offset}-${parsed.end}/${size}`)
+			headers.set('Content-Length', String(parsed.length))
+			if (created.bytes) {
+				return new Response(created.bytes.subarray(parsed.offset, parsed.end + 1), { status: 206, headers })
+			}
+			const object = await env.SMOL_BUCKET.get(r2Key, {
+				range: { offset: parsed.offset, length: parsed.length },
+			})
+			if (!object) throw new HTTPException(404, { message: 'Video not found' })
+			return new Response(object.body, { status: 206, headers })
+		}
+	}
+
+	headers.set('Content-Length', String(size))
+	if (created.bytes) {
+		return new Response(created.bytes, { status: 200, headers })
+	}
+	const object = await env.SMOL_BUCKET.get(r2Key)
+	if (!object) throw new HTTPException(404, { message: 'Video not found' })
+	return new Response(object.body, { status: 200, headers })
 })

@@ -10,6 +10,8 @@ import { privateNoStore, readJsonBody, runBackground } from '../utils/http'
 import { publicCache } from '../utils/public-cache'
 import { assertNoUnresolvedMintReceipt, MintIneligible } from '../utils/mint-eligibility'
 import { isDurableObjectId } from '../utils/durable-object-id'
+import { VIDEO_MAX_MP3_BYTES, VIDEO_MAX_PNG_BYTES } from '../utils/mp4-mux'
+import { isRestrictedNsfw, videoR2Key } from './media'
 import { queueSearchDeletionById } from '../utils/search'
 import { requireOwnedVisibilityToggle, syncSearchVisibilityAfterToggle } from '../utils/search-visibility'
 import { isNsfwBlocked, normalizeNsfwResult } from '../ai/nsfw'
@@ -428,13 +430,20 @@ smols.get(
 			let smol_kv: Record<string, any> | null = null
 			let username: string | null = null
 
-			const [kvResult, userRow] = await Promise.all([
+			const primaryMusicId = typeof smol_d1.Song_1 === 'string' && smol_d1.Song_1.trim() ? smol_d1.Song_1.trim() : null
+			const [kvResult, userRow, songHead, imageHead] = await Promise.all([
 				env.SMOL_KV.get(id, 'json') as Promise<Record<string, any> | null>,
 				smol_d1.Address
 					? env.SMOL_D1.prepare(`SELECT Username FROM Users WHERE "Address" = ?1`)
 						.bind(smol_d1.Address)
 						.first<{ Username?: string | null }>()
 						.catch(() => null)
+					: Promise.resolve(null),
+				primaryMusicId && env.SMOL_BUCKET?.head
+					? env.SMOL_BUCKET.head(`${primaryMusicId}.mp3`).catch(() => null)
+					: Promise.resolve(null),
+				primaryMusicId && env.SMOL_BUCKET?.head
+					? env.SMOL_BUCKET.head(`${id}.png`).catch(() => null)
 					: Promise.resolve(null),
 			])
 			smol_kv = kvResult
@@ -468,11 +477,23 @@ smols.get(
 
 			const kv_do = sanitizeKvDoForDetail(smol_kv)
 			const normalizedD1 = normalizeD1DetailRow(smol_d1)
+			const videoEligible = Boolean(
+				primaryMusicId &&
+				!isRestrictedNsfw(kv_do?.nsfw) &&
+				(env as unknown as Record<string, string | undefined>).DISABLE_VIDEO_MUX !== 'true' &&
+				songHead &&
+				songHead.size > 0 &&
+				songHead.size <= VIDEO_MAX_MP3_BYTES &&
+				imageHead &&
+				imageHead.size > 0 &&
+				imageHead.size <= VIDEO_MAX_PNG_BYTES
+			)
 
 			const response = c.json({
 				kv_do,
 				d1: username ? { ...normalizedD1, Username: username } : normalizedD1,
 				liked,
+				video_eligible: videoEligible,
 			})
 
 			if (payload?.sub) {
@@ -1670,6 +1691,7 @@ async function deleteSmolGuarded(env: Env, smol: DeletableSmol, extraGuard = '',
 		...musicIds.map(async (musicId) => {
 			if (await checkSongReferenceStatus(env, musicId) === 'unreferenced') await env.SMOL_BUCKET.delete(`${musicId}.mp3`)
 		}),
+		...musicIds.map((musicId) => env.SMOL_BUCKET.delete(videoR2Key(smol.Id, musicId))),
 	])
 	for (const outcome of cleanup) {
 		if (outcome.status === 'rejected') console.warn('Smol deletion cleanup failed:', smol.Id, outcome.reason)
