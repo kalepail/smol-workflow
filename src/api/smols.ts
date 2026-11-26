@@ -11,7 +11,7 @@ import { publicCache } from '../utils/public-cache'
 import { assertNoUnresolvedMintReceipt, MintIneligible } from '../utils/mint-eligibility'
 import { isDurableObjectId } from '../utils/durable-object-id'
 import { VIDEO_MAX_MP3_BYTES, VIDEO_MAX_PNG_BYTES } from '../utils/mp4-mux'
-import { isRestrictedNsfw, videoR2Key } from './media'
+import { isRestrictedNsfw, videoPublicPath, videoR2Key } from './media'
 import { queueSearchDeletionById } from '../utils/search'
 import { requireOwnedVisibilityToggle, syncSearchVisibilityAfterToggle } from '../utils/search-visibility'
 import { isNsfwBlocked, normalizeNsfwResult } from '../ai/nsfw'
@@ -479,7 +479,8 @@ smols.get(
 			const normalizedD1 = normalizeD1DetailRow(smol_d1)
 			const videoEligible = Boolean(
 				primaryMusicId &&
-				!isRestrictedNsfw(kv_do?.nsfw) &&
+				smol_kv &&
+				!isRestrictedNsfw(smol_kv.nsfw) &&
 				(env as unknown as Record<string, string | undefined>).DISABLE_VIDEO_MUX !== 'true' &&
 				songHead &&
 				songHead.size > 0 &&
@@ -494,6 +495,7 @@ smols.get(
 				d1: username ? { ...normalizedD1, Username: username } : normalizedD1,
 				liked,
 				video_eligible: videoEligible,
+				...(videoEligible && primaryMusicId ? { video_path: videoPublicPath(id, primaryMusicId) } : {}),
 			})
 
 			if (payload?.sub) {

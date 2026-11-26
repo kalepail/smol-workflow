@@ -10,12 +10,12 @@
  *   audio sample entry, verified natively across Apple iOS/macOS AVFoundation, Chrome/Electron,
  *   Firefox (`mp4parse-rust`), Android Media3/ExoPlayer (`TYPE__mp3`), and FFmpeg.
  * - Interleaving: 1-second interleaved video + audio chunks inside `mdat` (max video/audio offset
- *   gap ~25 KB, well under Android's 500 KB progressive-streaming limit).
+ *   gap ~25 KB for smooth progressive streaming and seeking).
  */
 import { HTTPException } from 'hono/http-exception'
 import { decodePng, type DecodedPng } from './png-scale'
 
-export const VIDEO_MUX_VERSION = 'v1'
+export const VIDEO_MUX_VERSION = 'v2'
 export const VIDEO_WIDTH = 1024
 export const VIDEO_HEIGHT = 1024
 /** 9 MiB MP3 cap keeps MP4 + cover + HTML safely under Apple iMessage's 10 MB total budget. */
@@ -385,9 +385,10 @@ function writeSingleDcCavlc(w: BitWriter, val: number, isChroma: boolean): void 
 		} else {
 			w.writeBits(0b000101, 6) // 0<=nC<2: TC=1, T1=0 -> "000101"
 		}
-		// Level encoding with suffixLength = 0 (first non-T1 coefficient when T1 == 0):
-		// levelCode = 2*(|val|-1) + sign (since T1 < 3 and i === 0, no -2 adjustment)
-		const levelCode = 2 * (absVal - 1) + sign
+		// Level encoding with suffixLength = 0 (ITU-T H.264 §9.2.2):
+		// When i == TrailingOnes and TrailingOnes < 3 (here i=0, T1=0), the decoder adds +2 to
+		// levelCode before converting to signed level, so the encoder subtracts 2 (absVal >= 2).
+		const levelCode = 2 * (absVal - 2) + sign
 		if (levelCode < 14) {
 			// level_prefix = levelCode (0..13), 0-bit suffix
 			for (let i = 0; i < levelCode; i++) w.writeBit(0)

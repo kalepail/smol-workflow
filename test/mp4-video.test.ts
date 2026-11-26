@@ -257,6 +257,8 @@ test('GET/HEAD /video/v1/:smolId/:musicId.mp4 persists to R2, coalesces cold hit
 	assert.equal(r2.status, 200)
 	assert.equal(r3.status, 200)
 	assert.equal(r3.headers.get('Content-Type'), 'video/mp4')
+	assert.equal(r3.headers.get('CDN-Cache-Control'), 'no-store')
+	assert.equal(r3.headers.get('Cache-Control'), 'public, max-age=300, stale-while-revalidate=60')
 	assert.equal(r3.headers.get('X-Robots-Tag'), 'noindex, nofollow')
 	assert.ok(r3.headers.get('Cache-Tag')?.includes(`video-mux:${VIDEO_MUX_VERSION}`))
 	assert.equal(bucket.counts.put.get(`video/${VIDEO_MUX_VERSION}/${smolId}/${song1}.mp4`), 1, 'must mux & put only once')
@@ -304,14 +306,37 @@ test('GET/HEAD /video/v1/:smolId/:musicId.mp4 persists to R2, coalesces cold hit
 	)
 	assert.equal(badTakeRes.status, 404)
 
-	// 4. Moderation / safety gating blocks ALREADY-WARM R2 objects immediately
+	// 4. Moderation / safety gating blocks ALREADY-WARM R2 objects immediately (current + legacy formats)
 	kvRecord = { nsfw: { safe: false, categories: ['explicit'] } }
 	assert.equal((await appModule.app.fetch(new Request(url), env, ctx1.ctx)).status, 404)
 
 	kvRecord = { nsfw: { safe: true, unknown: true, categories: [] } }
 	assert.equal((await appModule.app.fetch(new Request(url), env, ctx1.ctx)).status, 404)
 
-	// 5. KV outage fails closed with 503 no-store
+	// Legacy plain-text Llama Guard unsafe string, JSON string, and malformed nsfw object must all deny
+	kvRecord = { nsfw: 'unsafe\nS12' }
+	assert.equal((await appModule.app.fetch(new Request(url), env, ctx1.ctx)).status, 404)
+
+	kvRecord = { nsfw: '{"safe":false,"categories":["S12"]}' }
+	assert.equal((await appModule.app.fetch(new Request(url), env, ctx1.ctx)).status, 404)
+
+	kvRecord = { nsfw: { categories: [] } }
+	assert.equal((await appModule.app.fetch(new Request(url), env, ctx1.ctx)).status, 404)
+
+	// Legacy safe plain-text string and confirmed record with no nsfw key remain allowed
+	kvRecord = { nsfw: 'safe' }
+	assert.equal((await appModule.app.fetch(new Request(url, { method: 'HEAD' }), env, ctx1.ctx)).status, 200)
+
+	kvRecord = { lyrics: { title: 'Legacy pre-moderation song' } }
+	assert.equal((await appModule.app.fetch(new Request(url, { method: 'HEAD' }), env, ctx1.ctx)).status, 200)
+
+	// Unresolved KV miss (null in KV and no DO record) fails closed with 503 no-store
+	kvRecord = null
+	const unresolvedRes = await appModule.app.fetch(new Request(url), env, ctx1.ctx)
+	assert.equal(unresolvedRes.status, 503)
+	assert.equal(unresolvedRes.headers.get('Cache-Control'), 'no-store')
+
+	// KV outage fails closed with 503 no-store
 	kvThrows = true
 	const outageRes = await appModule.app.fetch(new Request(url), env, ctx1.ctx)
 	assert.equal(outageRes.status, 503)

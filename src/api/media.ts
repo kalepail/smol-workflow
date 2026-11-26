@@ -5,6 +5,8 @@ import { parseByteRange, type ParsedByteRange } from '../utils'
 import { getPlayCountMode } from './plays'
 import { stripOriginSpecificHeaders } from '../utils/public-cache'
 import { PNG_MAX_INPUT_BYTES, scalePng } from '../utils/png-scale'
+import { isNsfwBlocked } from '../ai/nsfw'
+import { isDurableObjectId } from '../utils/durable-object-id'
 import {
 	VIDEO_MAX_MP3_BYTES,
 	VIDEO_MAX_PNG_BYTES,
@@ -611,14 +613,25 @@ image.get('/:id{.+\\.png}', async (c) => {
 
 const SMOL_ID_RE = /^[0-9a-f]{64}$/i
 const MUSIC_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/
+const VIDEO_CACHE_CONTROL = 'public, max-age=300, stale-while-revalidate=60'
 
-export function isRestrictedNsfw(nsfw: { safe?: boolean | null; unknown?: boolean | null } | null | undefined): boolean {
-	if (!nsfw) return false
-	return Boolean(nsfw.unknown) || nsfw.safe === false
+/**
+ * Shared safety predicate for preview/video derivatives:
+ * - Missing `nsfw` on a confirmed record is allowed (legacy rows predate moderation).
+ * - Any present `nsfw` (object, JSON string, Llama Guard string, or malformed value) is normalized
+ *   through `isNsfwBlocked` so legacy `"unsafe\nS12"` or unknown verdicts are always denied.
+ */
+export function isRestrictedNsfw(nsfw: unknown): boolean {
+	if (nsfw == null) return false
+	return isNsfwBlocked(nsfw)
 }
 
 export function videoR2Key(smolId: string, musicId: string): string {
 	return `video/${VIDEO_MUX_VERSION}/${smolId}/${musicId}.mp4`
+}
+
+export function videoPublicPath(smolId: string, musicId: string): string {
+	return `/video/${VIDEO_MUX_VERSION}/${smolId}/${encodeURIComponent(musicId)}.mp4`
 }
 
 function buildVideoHeaders(
@@ -630,7 +643,9 @@ function buildVideoHeaders(
 	meta.writeHttpMetadata?.(headers)
 	headers.set('Content-Type', 'video/mp4')
 	headers.set('Accept-Ranges', 'bytes')
-	headers.set('Cache-Control', MEDIA_CACHE_CONTROL)
+	headers.set('Cache-Control', VIDEO_CACHE_CONTROL)
+	// Pin the per-request D1+KV moderation/deletion gate even if Cloudflare CDN caching is enabled.
+	headers.set('CDN-Cache-Control', 'no-store')
 	headers.set('X-Robots-Tag', 'noindex, nofollow')
 	headers.set(
 		'Cache-Tag',
@@ -721,7 +736,8 @@ video.get(`/${VIDEO_MUX_VERSION}/:smolId/:musicFile{.+\\.mp4}`, async (c) => {
 		throw new HTTPException(404, { message: 'Video not found' })
 	}
 
-	// Gate EVERY request (warm or cold) on published D1 row, authorized take, and safety policy.
+	// Gate EVERY request (warm or cold) on published D1 row, authorized take, and normalized safety policy.
+	// Consult DO on KV miss (propagation lag after publish) and fail closed (503) if the record is unresolved.
 	let smolKv: Record<string, any> | null = null
 	let smolD1: { Id: string; Public: number; Song_1?: string | null; Song_2?: string | null } | null = null
 	try {
@@ -743,7 +759,32 @@ video.get(`/${VIDEO_MUX_VERSION}/:smolId/:musicFile{.+\\.mp4}`, async (c) => {
 	if (!smolD1 || (smolD1.Song_1 !== musicId && smolD1.Song_2 !== musicId)) {
 		throw new HTTPException(404, { message: 'Video not found' })
 	}
-	if (isRestrictedNsfw(smolKv?.nsfw)) {
+
+	if (!smolKv && isDurableObjectId(smolId) && env.DURABLE_OBJECT?.idFromString) {
+		try {
+			const doid = env.DURABLE_OBJECT.idFromString(smolId)
+			const stub = env.DURABLE_OBJECT.get(doid)
+			const doSteps = (await stub.getSteps()) as Record<string, any> | null
+			if (doSteps && Object.keys(doSteps).length > 0) {
+				smolKv = doSteps
+			}
+		} catch {
+			return new Response('Temporarily unavailable', {
+				status: 503,
+				headers: { 'Cache-Control': 'no-store' },
+			})
+		}
+	}
+
+	if (!smolKv) {
+		// Record is unresolved in both KV and DO (propagation lag or deleted metadata): fail closed without caching.
+		return new Response('Temporarily unavailable', {
+			status: 503,
+			headers: { 'Cache-Control': 'no-store' },
+		})
+	}
+
+	if (isRestrictedNsfw(smolKv.nsfw)) {
 		throw new HTTPException(404, { message: 'Video not available' })
 	}
 
