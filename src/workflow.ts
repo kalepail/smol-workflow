@@ -3,8 +3,15 @@ import type { SmolDurableObject } from './do';
 import { pixellab } from './ai/pixellab';
 import { resolveCoverPrompt } from './ai/cover-prompt';
 import { IMAGE_DESCRIBE_MODEL, imageDescribe } from './ai/cf';
-import { generateLyrics, shouldIncludeDescriptionInLyrics } from './ai/aisonggenerator';
-import { finalizeSongText, resolveSongIntentWithMeta } from './ai/song-intent';
+import { generateLyrics, shouldIncludeDescriptionInLyrics, type GeneratedLyricsResponse } from './ai/aisonggenerator';
+import {
+	canBypassSongwriterWithIntent,
+	finalizeSongText,
+	resolveQuickTitle,
+	resolveSongIntentWithMeta,
+	resolveStylesSource,
+	SONG_INTENT_MODEL,
+} from './ai/song-intent';
 import { checkNSFW, isNsfwBlocked, normalizeNsfwResult } from './ai/nsfw';
 import { NonRetryableError } from 'cloudflare:workflows';
 import { purgeCacheByTags } from './utils/cache';
@@ -421,18 +428,62 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 				lyrics = retry_steps.lyrics;
 			} else {
 				const lyricsStepResult = await step.do('generate lyrics', config, async () => {
-					const usedDescription = shouldIncludeDescriptionInLyrics(prompt, description, is_instrumental);
-					const lyricsStart = Date.now();
-					const [generated, intentRes] = await Promise.all([
-						generateLyrics(this.env, prompt, {
+					// Intent-first routing (~1.7s): skip the paid frontier songwriter on `user_lyrics` and
+					// `instrumental` prompts when intent already supplies validated lyrics + styles (plus
+					// an explicit or quick-generated title).
+					const intentRes = await resolveSongIntentWithMeta(this.env, prompt, is_instrumental, event.instanceId);
+					const intent = intentRes.merged;
+
+					let usedDescription = false;
+					let generated: { res: GeneratedLyricsResponse; ms: number };
+					const canBypass = canBypassSongwriterWithIntent(intent, prompt, is_instrumental);
+					if (canBypass) {
+						const bypassStart = Date.now();
+						const quickTitle = intent.title ? null : await resolveQuickTitle(this.env, prompt, is_instrumental);
+						const effectiveTitle = intent.title ?? quickTitle;
+						if (effectiveTitle) {
+							const bypassMs = Date.now() - bypassStart;
+							const modelId = quickTitle ? SONG_INTENT_MODEL : 'intent-only';
+							generated = {
+								res: {
+									title: effectiveTitle,
+									lyrics: '',
+									style: intent.styles ?? [],
+									service: 'song-intent',
+									model: modelId,
+									meta: {
+										service: 'song-intent',
+										model: modelId,
+										aisg_attempts: 0,
+										cf_attempts: quickTitle ? 1 : 0,
+										ms: bypassMs,
+									},
+								},
+								ms: bypassMs,
+							};
+						} else {
+							usedDescription = shouldIncludeDescriptionInLyrics(prompt, description, is_instrumental);
+							const lyricsStart = Date.now();
+							const res = await generateLyrics(this.env, prompt, {
+								description,
+								instrumental: is_instrumental,
+								smolId: event.instanceId,
+							});
+							generated = { res, ms: Date.now() - lyricsStart };
+						}
+					} else {
+						usedDescription = shouldIncludeDescriptionInLyrics(prompt, description, is_instrumental);
+						const lyricsStart = Date.now();
+						const res = await generateLyrics(this.env, prompt, {
 							description,
 							instrumental: is_instrumental,
 							smolId: event.instanceId,
-						}).then((res) => ({ res, ms: Date.now() - lyricsStart })),
-						resolveSongIntentWithMeta(this.env, prompt, is_instrumental, event.instanceId),
-					]);
-					const intent = intentRes.merged;
-					const final = finalizeSongText(generated.res, intent, prompt, is_instrumental);
+						});
+						generated = { res, ms: Date.now() - lyricsStart };
+					}
+
+					const finalizeOpts = { preferSongwriterStyles: generated.res.service === 'cloudflare-ai' };
+					const final = finalizeSongText(generated.res, intent, prompt, is_instrumental, finalizeOpts);
 
 					const missingLyrics = !is_instrumental && !final.lyrics.trim();
 					if (!final.title || missingLyrics || final.style.length < 2) {
@@ -461,7 +512,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 						mode: intent.mode,
 						vocal_gender: intent.vocal_gender,
 						exclusions: intent.exclusions,
-						styles_source: intent.styles ? 'model' : intent.clauses.length ? 'clauses' : 'songwriter',
+						styles_source: resolveStylesSource(generated.res, intent, is_instrumental, finalizeOpts),
 						...(intentRes.rawStyles?.length ? { raw_styles: intentRes.rawStyles } : {}),
 						ms: intentRes.ms,
 					};

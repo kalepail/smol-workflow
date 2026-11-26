@@ -276,7 +276,8 @@ export function shouldIncludeDescriptionInLyrics(
 	);
 }
 
-// Generate lyrics from a prompt (AISG primary with Workers AI fallback inside aisonggenerator-worker).
+// Generate lyrics from a prompt (Cloudflare AI Fable 5.2 -> Opus 5.5 -> DeepSeek V4.1 -> GLM-5.3 primary,
+// with AISG emergency fallback inside aisonggenerator-worker).
 // Cover caption is included ONLY for short vocal prompts (<= 160 chars) as optional visual flavor.
 export async function generateLyrics(
 	env: Env,
@@ -322,7 +323,7 @@ Put [Section] headings on their own lines. Never write stage directions or instr
 			prompt: finalPrompt,
 			user_prompt: prompt,
 		}),
-		signal: AbortSignal.timeout(45_000),
+		signal: AbortSignal.timeout(55_000),
 	});
 
 	if (!res.ok) {

@@ -4,11 +4,14 @@ import { join } from 'node:path'
 import test from 'node:test'
 import {
 	analyzePromptWithModel,
+	canBypassSongwriterWithIntent,
 	finalizeSongText,
 	mergeSongIntent,
 	parseSongIntent,
 	promptLines,
+	resolveQuickTitle,
 	resolveSongIntent,
+	resolveStylesSource,
 	sanitizeLyrics,
 	SONG_INTENT_MODEL,
 } from '../src/ai/song-intent'
@@ -304,4 +307,83 @@ test('pass-1 #5: vocal lyrics are never empty (1f65e2 with songwriter "(No lyric
 	const chordsOnly = { ...noLyrics, lyrics: '(No lyrics)\nDm....C....G\nAm..F' }
 	assert.equal(finalize('1f65e2', modelOf('1f65e2'), chordsOnly, false).lyrics, 'Dm....C....G\nAm..F', 'raw minus placeholders')
 	assert.equal(finalize('1f65e2', modelOf('1f65e2'), noLyrics, true).lyrics, '', 'instrumental stays empty')
+})
+
+test('LYR-3 smart style merge: prefers upgraded CF songwriter styles on write-mode without [STYLE:], while honoring gender/exclusions/clauses', () => {
+	const richSongwriter: AiSongGeneratorLyrics = {
+		title: 'Passenger Side',
+		lyrics: '[Verse 1]\nLine one\nLine two\nLine three\nLine four',
+		style: [
+			'warm 90s indie soft rock',
+			'smoky female alto, intimate phrasing',
+			'clean chiming telecaster, brushed snare',
+			'slow 74 BPM swaying groove',
+			'dry close-mic warmth, wide chorus lift',
+		],
+	}
+
+	// Open-ended write prompt -> songwriter styles win when preferSongwriterStyles is true
+	const romIntent = mergeSongIntent(modelOf('cd8d41'), fixtures.cd8d41.prompt, false)
+	assert.equal(resolveStylesSource(richSongwriter, romIntent, false, { preferSongwriterStyles: true }), 'songwriter')
+	const romOut = finalizeSongText(richSongwriter, romIntent, fixtures.cd8d41.prompt, false, { preferSongwriterStyles: true })
+	assert.equal(romOut.style[0], 'warm 90s indie soft rock')
+	assert.match(firstThree(romOut.style), /female/i)
+	assert.equal(romOut.vocalGender, 'f')
+	assert.equal(romOut.negativeTags, 'male vocals')
+
+	// Exclusions still filter songwriter tags, and genderless prompts still strip unrequested single-gender tags
+	// (while preserving instruments like "alto sax" / "baritone guitar")
+	const exIntent = mergeSongIntent(
+		{ mode: 'write', lyrics_lines: null, title: null, vocal_gender: null, styles: ['indie rock', 'guitar', 'bass', 'warm'], exclusions: ['snare'] },
+		'indie rock song, no snare',
+		false,
+	)
+	const exOut = finalizeSongText(
+		{ ...richSongwriter, style: [...richSongwriter.style, 'alto sax', 'baritone guitar'] },
+		exIntent,
+		'indie rock song, no snare',
+		false,
+		{ preferSongwriterStyles: true },
+	)
+	assert.ok(!exOut.style.some((s) => /snare/i.test(s)), 'exclusion stripped from songwriter styles')
+	assert.ok(!exOut.style.some((s) => /female/i.test(s)), 'unstated gender drops single-gender songwriter tag')
+	assert.ok(exOut.style.some((s) => /alto sax/i.test(s)), 'instrument "alto sax" is preserved')
+	assert.ok(exOut.style.some((s) => /baritone guitar/i.test(s)), 'instrument "baritone guitar" is preserved')
+
+	// AISG fallback (preferSongwriterStyles: false) still lets intent.styles win over AISG tag soup
+	assert.equal(resolveStylesSource(richSongwriter, romIntent, false, { preferSongwriterStyles: false }), 'model')
+	const aisgOut = finalizeSongText(richSongwriter, romIntent, fixtures.cd8d41.prompt, false, { preferSongwriterStyles: false })
+	assert.equal(aisgOut.style[0], 'soft rock')
+
+	// Explicit [STYLE: ...] clause or user_lyrics or instrumental keeps intent.styles / clauses authoritative
+	const nootIntent = mergeSongIntent(modelOf('34d372'), fixtures['34d372'].prompt, false)
+	assert.equal(resolveStylesSource(richSongwriter, nootIntent, false, { preferSongwriterStyles: true }), 'model')
+	const instIntent = mergeSongIntent(modelOf('1f65e2'), fixtures['1f65e2'].prompt, true)
+	assert.equal(resolveStylesSource(richSongwriter, instIntent, true, { preferSongwriterStyles: true }), 'model')
+})
+
+test('LYR-2 intent-first bypass: user_lyrics and instrumental skip full songwriter; resolveQuickTitle handles untitled prompts cleanly', async () => {
+	// Noot-4 user_lyrics with explicit title + styles -> eligible to bypass full songwriter
+	const nootIntent = mergeSongIntent(modelOf('34d372'), fixtures['34d372'].prompt, false)
+	assert.equal(canBypassSongwriterWithIntent(nootIntent, fixtures['34d372'].prompt, false), true)
+	// Instrumental with styles -> eligible to bypass full songwriter
+	const instIntent = mergeSongIntent(modelOf('1f65e2'), fixtures['1f65e2'].prompt, true)
+	assert.equal(canBypassSongwriterWithIntent(instIntent, fixtures['1f65e2'].prompt, true), true)
+	// Standard write prompt -> NEVER bypasses songwriter
+	const writeIntent = mergeSongIntent(modelOf('cd8d41'), fixtures.cd8d41.prompt, false)
+	assert.equal(canBypassSongwriterWithIntent(writeIntent, fixtures.cd8d41.prompt, false), false)
+
+	// resolveQuickTitle parses valid JSON and returns null safely on errors
+	const titleOk = await resolveQuickTitle(
+		{ AI: { run: async () => ({ response: '{"title":"Rain on Tin"}' }) } } as never,
+		'chill lo-fi rain on a tin roof',
+		true,
+	)
+	assert.equal(titleOk, 'Rain on Tin')
+	const titleFail = await resolveQuickTitle(
+		{ AI: { run: async () => { throw new Error('429') } } } as never,
+		'chill lo-fi rain on a tin roof',
+		true,
+	)
+	assert.equal(titleFail, null)
 })

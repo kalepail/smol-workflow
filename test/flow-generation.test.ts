@@ -46,6 +46,8 @@ function buildMockEnv(options: {
 	cfAigToken?: string
 	fallbackEnabled?: string
 	intentText?: string
+	quickTitleText?: string
+	lyricsResponse?: Record<string, unknown>
 	coverPromptText?: string
 	coverPromptMode?: string
 	pixellabKey?: string | null
@@ -214,6 +216,9 @@ function buildMockEnv(options: {
 					if (sysContent.includes('cover picture') && options.coverPromptText) {
 						return { response: options.coverPromptText }
 					}
+					if (sysContent.includes('release-ready song title') && options.quickTitleText) {
+						return { response: options.quickTitleText }
+					}
 					if (options.intentText) {
 						return { response: options.intentText }
 					}
@@ -235,7 +240,7 @@ function buildMockEnv(options: {
 				const urlStr = typeof url === 'string' ? url : url instanceof URL ? url.toString() : url.url
 				if (urlStr.endsWith('/api/lyrics')) {
 					lyricsBodies.push(JSON.parse(String(init?.body)))
-					return new Response(JSON.stringify({
+					return new Response(JSON.stringify(options.lyricsResponse ?? {
 						title: 'Sunset Harbor',
 						style: ['dream pop', 'synthwave'],
 						lyrics: '[Verse 1]\nGolden waves drift by the pier\n[Chorus]\nStay until the stars appear',
@@ -1463,6 +1468,149 @@ test('Cover distillation: sends clean visual brief and non-sprite PixFlux params
 		const kv5 = JSON.parse(h5.kv.get(id5)!) as { image_base64: string; pipeline_meta?: PipelineMeta }
 		assert.equal(kv5.image_base64, FAKE_IMAGE_B64)
 		assert.equal(kv5.pipeline_meta?.cover, undefined)
+	} finally {
+		globalThis.fetch = originalFetch
+	}
+})
+
+test('LYR-2 & LYR-3 workflow integration: intent-first bypass skips /api/lyrics on user_lyrics/instrumental and prefers cloudflare-ai songwriter styles on write', async () => {
+	const audio = makeAudioBytes(71, 40_000)
+	const submitBodies: Array<Record<string, any>> = []
+	const makeAisg = () => async (url: string, init?: RequestInit) => {
+		if (url.endsWith('/api/tasks')) {
+			submitBodies.push(JSON.parse(String(init?.body ?? '{}')))
+			return Response.json({ task_id: 't-lyr' })
+		}
+		if (url.includes('/api/tasks/t-lyr')) {
+			return Response.json({ task_id: 't-lyr', music_ids: ['s-lyr-1', 's-lyr-2'] })
+		}
+		if (url.includes('/api/songs?ids=')) {
+			return Response.json([
+				{ music_id: 's-lyr-1', status: 4, audio: 'https://cdn.example.com/s-lyr-1.mp3', service: 'aisonggenerator' },
+				{ music_id: 's-lyr-2', status: 4, audio: 'https://cdn.example.com/s-lyr-2.mp3', service: 'aisonggenerator' },
+			])
+		}
+		throw new Error(`Unexpected AISG call: ${url}`)
+	}
+
+	const originalFetch = globalThis.fetch
+	globalThis.fetch = (async (input: string | URL | Request) => {
+		const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+		if (url.includes('api.pixellab.ai')) return new Response(JSON.stringify({ image: { base64: FAKE_IMAGE_B64 } }), { status: 200 })
+		if (url.startsWith('https://cdn.example.com/')) return new Response(audio, { status: 200, headers: { 'Content-Type': 'audio/mpeg' } })
+		throw new Error(`Unexpected fetch: ${url}`)
+	}) as typeof fetch
+
+	try {
+		// 1. user_lyrics with explicit title + styles -> 0 /api/lyrics calls
+		const userLyricsPrompt = [
+			'Title: Neon Free Diner',
+			'[Verse 1]',
+			'Two eggs cracking on a flat top grill',
+			'Coffee steaming by the window sill',
+			'Truckers folding up the morning news',
+			'Counter humming in the silver blues',
+			'[Chorus]',
+			'Keep the pot hot till the highway clears',
+			'Same red vinyl for a dozen years',
+			'Pour another cup and pass the pie',
+			'Every mile looks better in the morning light',
+		].join('\n')
+		const hUser = buildMockEnv({
+			intentText: JSON.stringify({
+				mode: 'user_lyrics',
+				lyrics_lines: [2, 11],
+				title: 'Neon Free Diner',
+				vocal_gender: 'm',
+				styles: ['americana', 'male vocals', 'pedal steel', 'warm acoustic'],
+				exclusions: [],
+			}),
+			aisgFetch: makeAisg(),
+		})
+		const idUser = 'a1'.repeat(32)
+		await new workflowModule.Workflow({} as ExecutionContext, hUser.env).run(
+			{ payload: { address: TEST_USER, prompt: userLyricsPrompt, public: true, instrumental: false, provider: 'aisonggenerator' }, instanceId: idUser, timestamp: new Date() } as never,
+			createWorkflowStep(new Map()).step as never,
+		)
+		assert.equal(hUser.lyricsBodies.length, 0, 'user_lyrics bypass must not call /api/lyrics')
+		const kvUser = JSON.parse(hUser.kv.get(idUser)!) as { pipeline_meta?: PipelineMeta; lyrics?: { title: string; lyrics: string } }
+		assert.equal(kvUser.pipeline_meta?.lyrics?.service, 'song-intent')
+		assert.equal(kvUser.pipeline_meta?.lyrics?.model, 'intent-only')
+		assert.equal(kvUser.lyrics?.title, 'Neon Free Diner')
+		assert.match(kvUser.lyrics?.lyrics ?? '', /Two eggs cracking/)
+
+		// 2. instrumental without title -> 0 /api/lyrics calls, uses resolveQuickTitle
+		const hInst = buildMockEnv({
+			intentText: JSON.stringify({
+				mode: 'instrumental',
+				lyrics_lines: null,
+				title: null,
+				vocal_gender: null,
+				styles: ['ambient synth', 'warm tape pads', 'downtempo', 'instrumental'],
+				exclusions: [],
+			}),
+			quickTitleText: JSON.stringify({ title: 'Rain on Tin' }),
+			aisgFetch: makeAisg(),
+		})
+		const idInst = 'a2'.repeat(32)
+		await new workflowModule.Workflow({} as ExecutionContext, hInst.env).run(
+			{ payload: { address: TEST_USER, prompt: 'warm rainy ambient synth study track', public: true, instrumental: true, provider: 'aisonggenerator' }, instanceId: idInst, timestamp: new Date() } as never,
+			createWorkflowStep(new Map()).step as never,
+		)
+		assert.equal(hInst.lyricsBodies.length, 0, 'instrumental bypass must not call /api/lyrics')
+		const kvInst = JSON.parse(hInst.kv.get(idInst)!) as { pipeline_meta?: PipelineMeta; lyrics?: { title: string; lyrics: string } }
+		assert.equal(kvInst.pipeline_meta?.lyrics?.service, 'song-intent')
+		assert.equal(kvInst.pipeline_meta?.lyrics?.model, '@cf/deepseek-ai/deepseek-v4.1-flash-1017')
+		assert.equal(kvInst.lyrics?.title, 'Rain on Tin')
+		assert.equal(kvInst.lyrics?.lyrics, '')
+
+		// 3. write mode with cloudflare-ai songwriter -> calls /api/lyrics, prefers songwriter styles
+		const hWrite = buildMockEnv({
+			intentText: JSON.stringify({
+				mode: 'write',
+				lyrics_lines: null,
+				title: null,
+				vocal_gender: 'f',
+				styles: ['soft rock', 'female vocals', 'guitar', 'romantic'],
+				exclusions: ['drums'],
+			}),
+			lyricsResponse: {
+				title: 'Passenger Side',
+				style: [
+					'warm 90s indie soft rock',
+					'smoky female alto',
+					'clean chiming telecaster',
+					'slow 74 BPM groove',
+					'dry close-mic mix',
+					'live drums',
+				],
+				lyrics: '[Verse 1]\nLine one\nLine two\nLine three\nLine four',
+				service: 'cloudflare-ai',
+				model: 'anthropic/claude-fable-5.2',
+				meta: {
+					service: 'cloudflare-ai',
+					model: 'anthropic/claude-fable-5.2',
+					aisg_attempts: 0,
+					cf_attempts: 1,
+					ms: 9800,
+				},
+			},
+			aisgFetch: makeAisg(),
+		})
+		const idWrite = 'a3'.repeat(32)
+		await new workflowModule.Workflow({} as ExecutionContext, hWrite.env).run(
+			{ payload: { address: TEST_USER, prompt: 'romantic rock song with female vocals, no drums', public: true, instrumental: false, provider: 'aisonggenerator' }, instanceId: idWrite, timestamp: new Date() } as never,
+			createWorkflowStep(new Map()).step as never,
+		)
+		assert.equal(hWrite.lyricsBodies.length, 1, 'write mode must call /api/lyrics')
+		const kvWrite = JSON.parse(hWrite.kv.get(idWrite)!) as { pipeline_meta?: PipelineMeta }
+		assert.equal(kvWrite.pipeline_meta?.lyrics?.service, 'cloudflare-ai')
+		assert.equal(kvWrite.pipeline_meta?.lyrics?.model, 'anthropic/claude-fable-5.2')
+		assert.equal(kvWrite.pipeline_meta?.intent?.styles_source, 'songwriter')
+		const submittedWrite = submitBodies[2]
+		assert.equal(submittedWrite.style[0], 'warm 90s indie soft rock')
+		assert.ok(!submittedWrite.style.some((s: string) => /drums/i.test(s)), 'exclusion must strip drums from songwriter styles')
+		assert.equal(submittedWrite.vocalGender, 'f')
 	} finally {
 		globalThis.fetch = originalFetch
 	}

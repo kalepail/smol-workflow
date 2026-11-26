@@ -267,9 +267,9 @@ export function countSungLines(text: string): number {
 
 // --- Styles ------------------------------------------------------------------------------------
 
-const FEMALE_WORD = /\b(female|women|woman|girls?|feminine|soprano|mezzo)\b/i;
-const MALE_WORD = /\b(male|men|man|boys?|masculine|baritone|tenor)\b/i;
-const VOCAL_WORD = /\b(vocals?|vocalists?|voices?|singers?|singing|rap|rapper|duo|choir|idols?|screams?)\b/i;
+const FEMALE_WORD = /\b(female|women|woman|girls?|feminine|soprano(?!\s+(?:sax|ukulele))|mezzo|alto(?!\s+(?:sax|flute|clarinet)))\b/i;
+const MALE_WORD = /\b(male|men|man|boys?|masculine|baritone(?!\s+(?:sax|guitar))|tenor(?!\s+(?:sax|guitar|banjo|ukulele)))\b/i;
+const VOCAL_WORD = /\b(vocals?|vocalists?|voices?|singers?|singing|rap|rapper|duo|choir|idols?|screams?|soprano(?!\s+(?:sax|ukulele))|mezzo|alto(?!\s+(?:sax|flute|clarinet))|baritone(?!\s+(?:sax|guitar))|tenor(?!\s+(?:sax|guitar|banjo|ukulele))|lead)\b/i;
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /** The vocalist a tag names ("dual female vocals" -> f). Genre tags like "k-pop girl group" name none. */
@@ -435,11 +435,111 @@ export function mergeSongIntent(model: SongIntent | null, prompt: string, isInst
 	};
 }
 
+export interface FinalizeSongOptions {
+	/**
+	 * When true (upgraded Cloudflare AI songwriter with v2.1 craft prompt), prefer the songwriter's
+	 * rich production `style[]` tags on `mode === 'write'` prompts that have no explicit `[STYLE:]`
+	 * block, while still filtering through `finalizeStyles` (gender placement, exclusions, 8-tag cap).
+	 */
+	preferSongwriterStyles?: boolean;
+}
+
+export function resolveStylesSource(
+	generated: Pick<AiSongGeneratorLyrics, 'style'>,
+	intent: MergedIntent,
+	isInstrumental: boolean,
+	options?: FinalizeSongOptions
+): 'model' | 'clauses' | 'songwriter' {
+	const songwriterTags = Array.isArray(generated.style) ? generated.style : [];
+	const asciiSongwriterCount = songwriterTags.filter(
+		(tag) => typeof tag === 'string' && tag.trim().length > 0 && isAscii(toAscii(tag.trim()))
+	).length;
+	if (
+		options?.preferSongwriterStyles
+		&& !isInstrumental
+		&& intent.mode === 'write'
+		&& intent.clauses.length === 0
+		&& asciiSongwriterCount >= 4
+	) {
+		return 'songwriter';
+	}
+	if (intent.styles) return 'model';
+	if (intent.clauses.length) return 'clauses';
+	return 'songwriter';
+}
+
+/**
+ * True when `intent` already carries everything needed to finalize a `user_lyrics` or `instrumental`
+ * track (valid ≥4-line user lyric block when vocal, plus ≥2 intent style tags), so we can skip the
+ * full frontier songwriter (using `resolveQuickTitle` if only the title is missing).
+ */
+export function canBypassSongwriterWithIntent(
+	intent: MergedIntent,
+	prompt: string,
+	isInstrumental: boolean
+): boolean {
+	if (!intent.styles || intent.styles.length < 2) return false;
+	if (isInstrumental) return true;
+	if (intent.mode !== 'user_lyrics' || !intent.lyrics_lines) return false;
+	const [a, b] = intent.lyrics_lines;
+	const sliced = sanitizeLyrics(promptLines(prompt).slice(a - 1, b).join('\n'));
+	return countSungLines(sliced) >= 4;
+}
+
+const QUICK_TITLE_SYSTEM = `Create one concise, evocative, release-ready song title (2-6 words, max 60 characters) in the exact language of the song request below. Never use generic AI clichés (Neon, Shadows, Echoes, Whispers, Crimson, Symphony) unless the prompt asks for them. Reply with one JSON object only: {"title": string}`;
+
+/** Lightweight (~1s, $0.0002) title generator used when intent-first routing skips the full songwriter. Never throws. */
+export async function resolveQuickTitle(
+	env: Pick<Env, 'AI'>,
+	prompt: string,
+	isInstrumental: boolean,
+	timeoutMs = 4_000
+): Promise<string | null> {
+	if (typeof env.AI?.run !== 'function') return null;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		const call = (env.AI.run as (model: string, input: unknown) => Promise<unknown>)(SONG_INTENT_MODEL, {
+			messages: [
+				{ role: 'system', content: QUICK_TITLE_SYSTEM },
+				{ role: 'user', content: `instrumental: ${!!isInstrumental}\n${prompt.slice(0, 1500)}` },
+			],
+			temperature: 0.5,
+			reasoning_effort: 'none',
+			chat_template_kwargs: { enable_thinking: false },
+			max_completion_tokens: 80,
+			response_format: { type: 'json_object' },
+		});
+		const timeout = new Promise<'timeout'>((resolve) => {
+			timer = setTimeout(() => resolve('timeout'), timeoutMs);
+		});
+		const response = await Promise.race([call, timeout]);
+		if (response === 'timeout') {
+			call.catch(() => {});
+			return null;
+		}
+		const text = extractIntentText(response);
+		if (!text) return null;
+		const cleaned = text.trim().replace(/^```(?:json)?\s*|\s*```$/g, '');
+		const a = cleaned.indexOf('{');
+		const b = cleaned.lastIndexOf('}');
+		if (a < 0 || b < a) return null;
+		const parsed = JSON.parse(cleaned.slice(a, b + 1)) as { title?: unknown };
+		if (typeof parsed?.title !== 'string') return null;
+		const title = Array.from(parsed.title.trim()).slice(0, MAX_TITLE_CHARS).join('').trim();
+		return title || null;
+	} catch {
+		return null;
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
 export function finalizeSongText(
 	generated: AiSongGeneratorLyrics,
 	intent: MergedIntent,
 	prompt: string,
-	isInstrumental: boolean
+	isInstrumental: boolean,
+	options?: FinalizeSongOptions
 ): AiSongGeneratorLyrics {
 	const songwriterLyrics = sanitizeLyrics(generated.lyrics ?? '');
 	let lyrics: string;
@@ -461,9 +561,13 @@ export function finalizeSongText(
 
 	const title = Array.from((intent.title ?? generated.title ?? '').trim()).slice(0, MAX_TITLE_CHARS).join('').trim();
 	const songwriterTags = Array.isArray(generated.style) ? generated.style : [];
-	const candidates = intent.styles
-		?? (intent.clauses.length ? [...intent.clauses, ...songwriterTags.slice(0, 2)] : songwriterTags);
-	const style = finalizeStyles(candidates, songwriterTags, intent.exclusions, intent.vocal_gender, isInstrumental);
+	const stylesSource = resolveStylesSource(generated, intent, isInstrumental, options);
+	const candidates = stylesSource === 'songwriter'
+		? songwriterTags
+		: intent.styles
+			?? (intent.clauses.length ? [...intent.clauses, ...songwriterTags.slice(0, 2)] : songwriterTags);
+	const refillPool = stylesSource === 'songwriter' ? (intent.styles ?? songwriterTags) : songwriterTags;
+	const style = finalizeStyles(candidates, refillPool, intent.exclusions, intent.vocal_gender, isInstrumental);
 	const negativeTags = buildNegativeTags(intent.vocal_gender, intent.exclusions);
 
 	return {
