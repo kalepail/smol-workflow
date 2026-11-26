@@ -50,6 +50,8 @@ interface SmolSecrets {
 	PLAY_BEACON_RATE_LIMIT_PER_MINUTE?: string
 	/** Tier 2 clef-flash mixtape tie-breaker. Enabled unless exactly 'false'. */
 	MIXTAPE_DEDUPE_AI_ENABLED?: string
+	/** Cover-art prompt mode: "distill" (default) or "raw" for byte-identical legacy PixelLab rollback. */
+	COVER_PROMPT_MODE?: string
 }
 
 // Refined bindings are own members so they take precedence over the generated (wider) types:
@@ -150,6 +152,15 @@ interface PipelineMusicMeta {
 	ms?: number
 }
 
+interface PipelineCoverMeta {
+	mode: 'distill' | 'raw'
+	source?: 'model' | 'repaired' | 'det'
+	kind?: 'scene' | 'object' | 'creature' | 'figures'
+	flags?: string[]
+	prompt_chars?: number
+	ms?: number
+}
+
 interface PipelineMeta {
 	v: 1
 	steps_ms?: {
@@ -159,6 +170,7 @@ interface PipelineMeta {
 		nsfw?: number
 		music?: number
 	}
+	cover?: PipelineCoverMeta
 	lyrics?: PipelineLyricsMeta
 	intent?: PipelineIntentMeta
 	nsfw?: PipelineNsfwMeta

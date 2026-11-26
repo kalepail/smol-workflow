@@ -46,6 +46,9 @@ function buildMockEnv(options: {
 	cfAigToken?: string
 	fallbackEnabled?: string
 	intentText?: string
+	coverPromptText?: string
+	coverPromptMode?: string
+	pixellabKey?: string | null
 } = {}) {
 	const r2 = createMockR2Bucket()
 	const doNs = createMockDoNamespace(r2.bucket)
@@ -152,7 +155,7 @@ function buildMockEnv(options: {
 
 	const env = {
 		SECRET: TEST_SECRET,
-		PIXELLAB_KEY: 'pixellab-test-key',
+		PIXELLAB_KEY: options.pixellabKey === null ? '' : (options.pixellabKey ?? 'pixellab-test-key'),
 		CF_AI_GATEWAY_ID: options.cfGatewayId ?? 'smol',
 		CF_AIG_TOKEN: options.cfAigToken ?? 'aig-test-token',
 		CF_AIG_BYOK_ALIAS: 'default',
@@ -161,6 +164,7 @@ function buildMockEnv(options: {
 		DAILY_LIMIT_CLASSIC: '20',
 		DAILY_LIMIT_ELEVENLABS: '10',
 		...(options.nsfwProvider ? { NSFW_PROVIDER: options.nsfwProvider } : {}),
+		...(options.coverPromptMode ? { COVER_PROMPT_MODE: options.coverPromptMode } : {}),
 		DURABLE_OBJECT: doNs.namespace,
 		USER_QUOTA: quotaNs.namespace,
 		SMOL_BUCKET: r2.bucket,
@@ -205,8 +209,14 @@ function buildMockEnv(options: {
 				if (model === '@cf/cloudflare/clef') {
 					return options.clefRaw ?? clefNsfwPayload()
 				}
-				if (model === '@cf/deepseek-ai/deepseek-v4.1-flash-1017' && options.intentText) {
-					return { response: options.intentText }
+				if (model === '@cf/deepseek-ai/deepseek-v4.1-flash-1017') {
+					const sysContent = String((input as { messages?: Array<{ content?: string }> })?.messages?.[0]?.content ?? '')
+					if (sysContent.includes('cover picture') && options.coverPromptText) {
+						return { response: options.coverPromptText }
+					}
+					if (options.intentText) {
+						return { response: options.intentText }
+					}
 				}
 				if (model === '@cf/zai-org/glm-5.3') {
 					return {
@@ -1276,5 +1286,184 @@ test('Step 5 NSFW on retry: a regenerated cover/description is re-classified; a 
 	} finally {
 		globalThis.fetch = originalFetch
 		console.warn = originalWarn
+	}
+})
+
+test('Cover distillation: sends clean visual brief and non-sprite PixFlux params, keeps raw prompt for NSFW, supports raw rollback, and never leaks derived prompt on GET /:id', async () => {
+	const originalFetch = globalThis.fetch
+	const rawPrompt = '1OF1 — OATMEAL & NINE LIVES\n[STYLE: technical acoustic progressive guitar, female Korean vocals]\nPut the kettle on and smile'
+	const derivedSubject = 'a steaming oatmeal bowl with cinnamon beside a copper kettle'
+	const coverJson = JSON.stringify({
+		theme: 'cozy morning oatmeal and kettle',
+		source: 'story',
+		shown_instruments: [],
+		instrument_evidence: null,
+		kind: 'object',
+		subject: derivedSubject,
+		setting: 'sunny kitchen windowsill at sunrise',
+		light: 'warm yellow and peach glow',
+	})
+
+	const pixellabBodies: Array<Record<string, unknown>> = []
+	const audio1 = makeAudioBytes(23, 40_000)
+	const audio2 = makeAudioBytes(89, 40_000)
+
+	const makeAisg = () => async (url: string) => {
+		if (url.endsWith('/api/tasks')) {
+			return Response.json({ task_id: 't-cover' })
+		}
+		if (url.includes('/api/tasks/t-cover')) {
+			return Response.json({ task_id: 't-cover', music_ids: ['m-cov-1', 'm-cov-2'] })
+		}
+		if (url.includes('/api/songs?ids=')) {
+			return Response.json([
+				{ music_id: 'm-cov-1', status: 4, audio: 'https://cdn.aisg.test/cov1.mp3', service: 'aisonggenerator' },
+				{ music_id: 'm-cov-2', status: 4, audio: 'https://cdn.aisg.test/cov2.mp3', service: 'aisonggenerator' },
+			])
+		}
+		throw new Error(`Unexpected AISG URL: ${url}`)
+	}
+
+	globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+		const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+		if (url.includes('api.pixellab.ai')) {
+			pixellabBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>)
+			return Response.json({ image: { base64: `data:image/png;base64,${FAKE_IMAGE_B64}` } })
+		}
+		if (url.endsWith('cov1.mp3')) {
+			return new Response(audio1, { status: 200 })
+		}
+		if (url.endsWith('cov2.mp3')) {
+			return new Response(audio2, { status: 200 })
+		}
+		throw new Error(`Unexpected fetch: ${url}`)
+	}) as typeof fetch
+
+	try {
+		// 1. Default distill mode
+		const id1 = 'f1'.repeat(32)
+		const h1 = buildMockEnv({ coverPromptText: coverJson, aisgFetch: makeAisg() })
+		const wf1 = new workflowModule.Workflow({} as ExecutionContext, h1.env)
+		await wf1.run(
+			{ payload: { address: TEST_USER, prompt: rawPrompt, public: true, instrumental: false, provider: 'aisonggenerator' }, instanceId: id1, timestamp: new Date() } as never,
+			createWorkflowStep(new Map()).step as never,
+		)
+
+		assert.equal(pixellabBodies.length, 1)
+		const b1 = pixellabBodies[0]
+		assert.match(String(b1.description), /steaming oatmeal bowl/)
+		assert.doesNotMatch(String(b1.description), /guitar/i)
+		assert.equal('negative_description' in b1, false)
+		assert.equal('view' in b1, false)
+		assert.equal('direction' in b1, false)
+		assert.equal(typeof b1.seed, 'number')
+
+		// Moondream receives the distilled cover brief (no raw style echo)
+		const moondreamCall = h1.aiCalls.find((c) => c.model === '@cf/moondream/moondream3.1-9B-A2B')
+		assert.match(String(moondreamCall?.input.question), /steaming oatmeal bowl/)
+		assert.doesNotMatch(String(moondreamCall?.input.question), /acoustic progressive guitar/)
+
+		// Step 5 NSFW still receives the exact original raw song prompt + canonical raw PNG base64
+		const clefCall = h1.aiCalls.find((c) => c.model === '@cf/cloudflare/clef')
+		assert.equal(clefCall?.input.state.prompt, rawPrompt)
+		assert.deepEqual(clefCall?.input.images, [{ content_type: 'image/png', base64: FAKE_IMAGE_B64 }])
+
+		// Stored KV holds compact cover metadata (no derived prompt text) and canonical raw base64
+		const kv1 = JSON.parse(h1.kv.get(id1)!) as { image_base64: string; pipeline_meta?: PipelineMeta }
+		assert.equal(kv1.image_base64, FAKE_IMAGE_B64)
+		assert.equal(kv1.pipeline_meta?.cover?.mode, 'distill')
+		assert.equal(kv1.pipeline_meta?.cover?.source, 'model')
+		assert.equal(kv1.pipeline_meta?.cover?.kind, 'object')
+		assert.equal('prompt' in (kv1.pipeline_meta?.cover ?? {}), false)
+
+		// Public GET /:id never leaks derived cover prompt or pipeline_meta
+		const detailRes = await appModule.app.fetch(
+			new Request(`https://api.smol.xyz/${id1}`),
+			h1.env,
+			createMockExecutionContext().ctx
+		)
+		assert.equal(detailRes.status, 200)
+		const detailText = await detailRes.text()
+		assert.equal(detailText.includes(derivedSubject), false)
+		assert.equal(detailText.includes('pipeline_meta'), false)
+
+		// 2. Instant rollback: COVER_PROMPT_MODE === 'raw' skips cover distiller & sends legacy payload
+		const id2 = 'f2'.repeat(32)
+		const h2 = buildMockEnv({ coverPromptMode: 'raw', coverPromptText: coverJson, aisgFetch: makeAisg() })
+		const wf2 = new workflowModule.Workflow({} as ExecutionContext, h2.env)
+		await wf2.run(
+			{ payload: { address: TEST_USER, prompt: rawPrompt, public: true, instrumental: false, provider: 'aisonggenerator' }, instanceId: id2, timestamp: new Date() } as never,
+			createWorkflowStep(new Map()).step as never,
+		)
+
+		assert.equal(pixellabBodies.length, 2)
+		const b2 = pixellabBodies[1]
+		assert.equal(b2.description, rawPrompt)
+		assert.equal(b2.negative_description, 'blurry. dithering. photorealism.')
+		assert.equal(b2.view, 'low top-down')
+		assert.equal(b2.direction, 'south')
+		assert.equal('seed' in b2, false)
+		const coverAiCallsInRaw = h2.aiCalls.filter(
+			(c) => c.model === '@cf/deepseek-ai/deepseek-v4.1-flash-1017'
+				&& String(c.input?.messages?.[0]?.content ?? '').includes('cover picture')
+		)
+		assert.equal(coverAiCallsInRaw.length, 0)
+
+		// 3. Missing PIXELLAB_KEY fails fast BEFORE spending any cover-prompt AI call
+		const id3 = 'f3'.repeat(32)
+		const h3 = buildMockEnv({ pixellabKey: null, coverPromptText: coverJson, aisgFetch: makeAisg() })
+		const wf3 = new workflowModule.Workflow({} as ExecutionContext, h3.env)
+		await assert.rejects(
+			() => wf3.run(
+				{ payload: { address: TEST_USER, prompt: rawPrompt, public: true, instrumental: false, provider: 'aisonggenerator' }, instanceId: id3, timestamp: new Date() } as never,
+				createWorkflowStep(new Map()).step as never,
+			),
+			/Missing Pixellab API key/
+		)
+		assert.equal(h3.aiCalls.length, 0)
+
+		// 4. Replay after generate image (suspension before save generated image):
+		//    zero second PixelLab/distiller calls, Moondream STILL receives distilled brief,
+		//    and pipeline_meta.cover STILL survives to published KV!
+		const id4 = 'f4'.repeat(32)
+		const h4 = buildMockEnv({ coverPromptText: coverJson, aisgFetch: makeAisg() })
+		const sharedCache = new Map<string, unknown>()
+		const wf4a = new workflowModule.Workflow({} as ExecutionContext, h4.env)
+		const suspended = createWorkflowStep(sharedCache, { suspendBefore: 'save generated image' })
+		await assert.rejects(
+			() => wf4a.run(
+				{ payload: { address: TEST_USER, prompt: rawPrompt, public: true, instrumental: false, provider: 'aisonggenerator' }, instanceId: id4, timestamp: new Date() } as never,
+				suspended.step as never,
+			),
+			/Suspended before step: save generated image/
+		)
+		const pixellabCountBeforeResume = pixellabBodies.length
+		const wf4b = new workflowModule.Workflow({} as ExecutionContext, h4.env)
+		await wf4b.run(
+			{ payload: { address: TEST_USER, prompt: rawPrompt, public: true, instrumental: false, provider: 'aisonggenerator' }, instanceId: id4, timestamp: new Date() } as never,
+			createWorkflowStep(sharedCache).step as never,
+		)
+		assert.equal(pixellabBodies.length, pixellabCountBeforeResume, 'replayed workflow must not call PixelLab twice')
+		const md4 = h4.aiCalls.find((c) => c.model === '@cf/moondream/moondream3.1-9B-A2B')
+		assert.match(String(md4?.input.question), /steaming oatmeal bowl/)
+		const kv4 = JSON.parse(h4.kv.get(id4)!) as { pipeline_meta?: PipelineMeta }
+		assert.equal(kv4.pipeline_meta?.cover?.mode, 'distill')
+		assert.equal(kv4.pipeline_meta?.cover?.source, 'model')
+
+		// 5. Legacy pre-deploy cached string checkpoint for generate image#1 replays cleanly with no cover meta invented
+		const id5 = 'f5'.repeat(32)
+		const h5 = buildMockEnv({ coverPromptText: coverJson, aisgFetch: makeAisg() })
+		const legacyCache = new Map<string, unknown>([['generate image#1', FAKE_IMAGE_B64]])
+		const wf5 = new workflowModule.Workflow({} as ExecutionContext, h5.env)
+		await wf5.run(
+			{ payload: { address: TEST_USER, prompt: rawPrompt, public: true, instrumental: false, provider: 'aisonggenerator' }, instanceId: id5, timestamp: new Date() } as never,
+			createWorkflowStep(legacyCache).step as never,
+		)
+		assert.equal(pixellabBodies.length, pixellabCountBeforeResume, 'legacy string checkpoint must not call PixelLab')
+		const kv5 = JSON.parse(h5.kv.get(id5)!) as { image_base64: string; pipeline_meta?: PipelineMeta }
+		assert.equal(kv5.image_base64, FAKE_IMAGE_B64)
+		assert.equal(kv5.pipeline_meta?.cover, undefined)
+	} finally {
+		globalThis.fetch = originalFetch
 	}
 })

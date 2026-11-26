@@ -1,6 +1,7 @@
 import { WorkflowEntrypoint, WorkflowStep, WorkflowEvent, WorkflowStepConfig } from 'cloudflare:workers';
 import type { SmolDurableObject } from './do';
 import { pixellab } from './ai/pixellab';
+import { resolveCoverPrompt } from './ai/cover-prompt';
 import { IMAGE_DESCRIBE_MODEL, imageDescribe } from './ai/cf';
 import { generateLyrics, shouldIncludeDescriptionInLyrics } from './ai/aisonggenerator';
 import { finalizeSongText, resolveSongIntentWithMeta } from './ai/song-intent';
@@ -313,28 +314,75 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 			// STEP 2: Generate image (or reuse from retry)
 			// =====================================================================
 			const imageReused = Boolean(retry_steps?.image_base64);
+			const coverPromptMode: 'distill' | 'raw' = this.env.COVER_PROMPT_MODE === 'raw' ? 'raw' : 'distill';
+			let distilledCoverPrompt: string | undefined;
+			let freshCoverMeta: PipelineCoverMeta | undefined;
 			const imageStart = Date.now();
-			image_base64 = retry_steps?.image_base64 || await step.do(
-				'generate image',
-				{
-					...config,
-					retries: {
-						...config.retries,
-						limit: 6, // ~10 min with exponential backoff
-					},
-				} as WorkflowStepConfig,
-				async () => {
-					return await pixellab(this.env, prompt, 'pixflux');
+			if (retry_steps?.image_base64) {
+				image_base64 = retry_steps.image_base64;
+			} else {
+				const imageStepResult = await step.do(
+					'generate image',
+					{
+						...config,
+						retries: {
+							...config.retries,
+							limit: 6, // ~10 min with exponential backoff
+						},
+					} as WorkflowStepConfig,
+					async () => {
+						if (!this.env.PIXELLAB_KEY) {
+							throw new NonRetryableError('Missing Pixellab API key');
+						}
+						if (coverPromptMode === 'raw') {
+							const b64 = await pixellab(this.env, prompt, 'pixflux', { legacy: true });
+							return {
+								image_base64: b64,
+								cover_meta: { mode: 'raw' as const, prompt_chars: prompt.length },
+							};
+						}
+						const cover = await resolveCoverPrompt(this.env, prompt, is_instrumental, event.instanceId);
+						const b64 = await pixellab(this.env, cover.prompt, 'pixflux', { seed: cover.seed });
+						return {
+							image_base64: b64,
+							cover_prompt: cover.prompt,
+							cover_meta: {
+								mode: 'distill' as const,
+								source: cover.source,
+								kind: cover.kind,
+								...(cover.flags.length ? { flags: cover.flags } : {}),
+								prompt_chars: cover.prompt.length,
+								ms: cover.ms,
+							},
+						};
+					}
+				);
+
+				// Backward-compatible with pre-deploy cached workflow checkpoints that stored image_base64 directly as a string.
+				if (typeof imageStepResult === 'string') {
+					image_base64 = imageStepResult;
+				} else {
+					image_base64 = imageStepResult.image_base64;
+					distilledCoverPrompt = imageStepResult.cover_prompt;
+					freshCoverMeta = imageStepResult.cover_meta;
 				}
-			);
+			}
 			const imageMs = Date.now() - imageStart;
 			if (!imageReused) {
 				pipeline_meta.steps_ms!.image = imageMs;
+				if (freshCoverMeta) {
+					pipeline_meta.cover = freshCoverMeta;
+				}
 			}
 			console.log(JSON.stringify({
 				event: 'workflow_step_image',
 				smol_id: event.instanceId,
 				reused: imageReused,
+				...(freshCoverMeta ? {
+					cover_mode: freshCoverMeta.mode,
+					...(freshCoverMeta.source ? { cover_source: freshCoverMeta.source } : {}),
+					...(freshCoverMeta.kind ? { cover_kind: freshCoverMeta.kind } : {}),
+				} : {}),
 				ms: imageMs,
 			}));
 
@@ -346,7 +394,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 			const describeReused = Boolean(retry_steps?.description);
 			const describeStart = Date.now();
 			description = retry_steps?.description || await step.do('describe image', config, async () => {
-				return await imageDescribe(this.env, image_base64, prompt);
+				return await imageDescribe(this.env, image_base64, distilledCoverPrompt ?? prompt);
 			});
 			const describeMs = Date.now() - describeStart;
 			if (!describeReused) {

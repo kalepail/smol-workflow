@@ -292,7 +292,7 @@ export function ensureVocalistInFirstThree(styles: string[], gender: VocalGender
 	return out;
 }
 
-const toAscii = (s: string) => s.normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[đĐ]/g, (c) => (c === 'đ' ? 'd' : 'D'));
+export const toAscii = (s: string) => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[đĐ]/g, (c) => (c === 'đ' ? 'd' : 'D'));
 
 const isAscii = (tag: string) => /^[\x20-\x7e]+$/.test(tag);
 

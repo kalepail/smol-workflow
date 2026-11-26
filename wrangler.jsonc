@@ -120,6 +120,8 @@
         "MIXTAPE_DEDUPE_AI_ENABLED": "true",
         // Step 5 NSFW classifier: tuned "clef" (27B + cover PNG). "llama-guard" is the instant rollback.
         "NSFW_PROVIDER": "clef",
+        // Step 2 cover-art prompt mode: "distill" (visual rewrite + non-sprite PixFlux params). "raw" is the instant rollback.
+        "COVER_PROMPT_MODE": "distill",
         "SEARCH_BACKFILL_CRON_ENABLED": "true",
         "SEARCH_BACKFILL_CRON_PAGE_LIMIT": "20",
         "SEARCH_BACKFILL_CRON_STALL_RUNS": "6",

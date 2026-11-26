@@ -114,6 +114,33 @@ test('A5: PixelLab errors use fixed copy (no upstream body) and success bodies a
 
 	stubFetch(() => Response.json({ image: { base64: 'iVBORw0KGgo=' } }))
 	assert.equal(await pixellabModule.pixellab(env, 'a frog'), 'iVBORw0KGgo=')
+
+	// Data-URI PNG prefix and unpadded/URL-safe PNG base64 normalize to canonical raw base64.
+	stubFetch(() => Response.json({ image: { base64: 'data:image/png;base64,iVBORw0KGgo=' } }))
+	assert.equal(await pixellabModule.pixellab(env, 'a frog'), 'iVBORw0KGgo=')
+	stubFetch(() => Response.json({ image: { base64: 'iVBORw0KGgo' } }))
+	assert.equal(await pixellabModule.pixellab(env, 'a frog'), 'iVBORw0KGgo=')
+
+	// Non-PNG bytes ("hello"), non-PNG data URI, and unexpected HTTP 202 fail explicitly.
+	stubFetch(() => Response.json({ image: { base64: Buffer.from('hello').toString('base64') } }))
+	await assert.rejects(() => pixellabModule.pixellab(env, 'a frog'), /not a valid PNG/)
+
+	stubFetch(() => Response.json({ image: { base64: 'data:image/svg+xml;base64,PHN2Zz4=' } }))
+	await assert.rejects(() => pixellabModule.pixellab(env, 'a frog'), /unsupported image data URI/)
+
+	stubFetch(() => Response.json({ background_job_id: 'job-1' }, { status: 202 }))
+	await assert.rejects(
+		() => pixellabModule.pixellab(env, 'a frog'),
+		(err: Error) => err.name === 'NonRetryableError' && /unexpected status \(202\)/.test(err.message)
+	)
+
+	// Oversized extracted base64 is rejected as non-retryable before exceeding Workflow's 1 MiB step cap.
+	const hugeB64 = 'iVBORw0KGgoA' + 'A'.repeat(pixellabModule.PIXELLAB_MAX_IMAGE_BASE64_CHARS)
+	stubFetch(() => Response.json({ image: { base64: hugeB64 } }))
+	await assert.rejects(
+		() => pixellabModule.pixellab(env, 'a frog'),
+		(err: Error) => err.name === 'NonRetryableError' && /exceeded maximum allowed base64 length/.test(err.message)
+	)
 })
 
 /** Records url + redirect mode for every fetch and lets the handler answer per URL. */
