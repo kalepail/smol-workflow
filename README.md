@@ -107,18 +107,19 @@ migrations/
 
 ### Quota & Plays
 - `GET /quota` — Authenticated per-provider daily quota snapshot (`no-store`)
+- `POST /admin/quota-override` — Admin (`ADMIN_SECRET`, `private, no-store`): `{ address, action?: 'inspect' | 'set' | 'clear', classic?, elevenlabs?, burstPerMinute? }` inspects, replaces or clears one address's override stored in its `UserQuotaDO` and returns `{ override, limits, source }`
 - `POST /plays/:musicId` — Play beacon. `202 { counted: false }` while `PLAY_COUNT_MODE=server`; deduped, rate-limited `Plays` increment in `beacon` mode
 
 ## Bindings, Vars & Secrets
 
 ### Secrets (`wrangler secret put`)
 - `SECRET` — User JWT signing secret (never valid for admin routes)
-- `ADMIN_SECRET` — Dedicated optional admin token (`x-admin-secret` or `Authorization: Bearer`) for `DELETE /admin/bulk` and `/search/admin/*`; admin routes fail closed with `404` when unset
+- `ADMIN_SECRET` — Dedicated optional admin token (`x-admin-secret` or `Authorization: Bearer`) for `POST /admin/generate`, `POST /admin/quota-override`, `DELETE /admin/bulk` and `/search/admin/*`; admin routes fail closed with `404` when unset
 - `SK` — Stellar secret key for mint auth-entry signing
 - `PIXELLAB_KEY` — Pixellab API key
 - `CF_API_TOKEN` / `CF_ZONE_ID` — Cloudflare zone cache tag purge credentials (tags label cached copies only; `Cache-Tag` is stripped from every client response)
 - `CF_AIG_TOKEN` — Cloudflare AI Gateway Run token for ElevenLabs BYOK (fail-closed if missing)
-- `USER_QUOTA_OVERRIDES` — Optional JSON object keyed by Stellar address. Each entry can set `classic`, `elevenlabs`, or `burstPerMinute` to a non-negative integer.
+- `USER_QUOTA_OVERRIDES` — Legacy per-address limits (JSON keyed by Stellar address: `classic`, `elevenlabs`, `burstPerMinute`). Used only for addresses with no override row in their `UserQuotaDO`; retire it once every entry is imported through `POST /admin/quota-override`.
 
 ### Variables (`wrangler.jsonc` `vars`)
 - `CF_AI_GATEWAY_ID` — AI Gateway ID configured with ElevenLabs BYOK stored key (`smol`, `byok_only: true`, `60 req / 86400 s` sliding). Dedicated to ElevenLabs only — never route Workers AI through `smol`.
@@ -135,7 +136,7 @@ migrations/
 
 ### Bindings
 - **Workflows**: `WORKFLOW` (`Workflow`), `TX_WORKFLOW` (`TxWorkflow`)
-- **Durable Objects**: `DURABLE_OBJECT` (`SmolDurableObject`, v1), `DO_STATE` (`SmolState`, v2 — retained; live namespace contains stored data), and `USER_QUOTA` (`UserQuotaDO`, SQLite, v3 — quota + `play-gate:NN` beacon shards)
+- **Durable Objects**: `DURABLE_OBJECT` (`SmolDurableObject`, v1), `DO_STATE` (`SmolState`, v2 — retained; live namespace contains stored data), and `USER_QUOTA` (`UserQuotaDO`, SQLite, v3 — quota, per-address overrides (internal schema v8), `play-gate:NN` beacon shards, `mint-prefix-locks`)
 - **Storage**: `SMOL_D1` (`smol-d1`), `SMOL_KV`, `SMOL_BUCKET` (`smol-r2`), `SMOL_SEARCH_INDEX` (`smol-search-index`), `SEARCH_QUEUE` (`smol-search-queue` + `smol-search-queue-dlq`)
 - **Services & AI**: `AI`, `AISONGGENERATOR` (`aisonggenerator-worker`), `KALE_WORKER` (`kale-worker`: relay + chain reads)
 - **Cron**: `0 * * * *` — search backfill (a no-op once a full pass completes; see `docs/search-index-setup.md`) and pruning of terminal `MintBatchStatus` rows whose TxWorkflow instance has expired (30-day `default_retention` on `TX_WORKFLOW`)

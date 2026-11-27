@@ -1,6 +1,9 @@
 import {
+	applyQuotaOverride,
 	getUtcDayKey,
 	type QuotaCommitResult,
+	type QuotaOverride,
+	type QuotaOverrideInput,
 	type QuotaLimits,
 	type QuotaProvider,
 	type QuotaRefundOptions,
@@ -160,19 +163,34 @@ function getUserQuotaOverride(raw: string | undefined, address: string): Partial
 	return cachedUserQuotaOverrides.entries.get(address)
 }
 
-export function getUserQuotaLimits(env: Env, address: string): QuotaLimits {
-	const overrides = getUserQuotaOverride(env.USER_QUOTA_OVERRIDES, address)
+/** Configured per-user limits (vars), before any per-address override. */
+export function getDefaultUserQuotaLimits(env: Env): QuotaLimits {
 	const burstRaw = env.BURST_LIMIT_PER_MINUTE?.trim().toLowerCase()
-	const defaultBurstPerMinute = !burstRaw || burstRaw === 'off' || burstRaw === 'disabled'
+	const burstPerMinute = !burstRaw || burstRaw === 'off' || burstRaw === 'disabled'
 		? DEFAULT_BURST_LIMIT_PER_MINUTE
 		: parseNonNegativeInt(burstRaw, DEFAULT_BURST_LIMIT_PER_MINUTE)
-	const burstPerMinute = overrides?.burstPerMinute ?? defaultBurstPerMinute
-
 	return {
-		classic: overrides?.classic ?? parseNonNegativeInt(env.DAILY_LIMIT_CLASSIC, DEFAULT_DAILY_LIMIT_CLASSIC),
-		elevenlabs: overrides?.elevenlabs ?? parseNonNegativeInt(env.DAILY_LIMIT_ELEVENLABS, DEFAULT_DAILY_LIMIT_ELEVENLABS),
+		classic: parseNonNegativeInt(env.DAILY_LIMIT_CLASSIC, DEFAULT_DAILY_LIMIT_CLASSIC),
+		elevenlabs: parseNonNegativeInt(env.DAILY_LIMIT_ELEVENLABS, DEFAULT_DAILY_LIMIT_ELEVENLABS),
 		...(burstPerMinute > 0 ? { burstPerMinute } : {}),
 	}
+}
+
+/**
+ * Defaults merged with the legacy `USER_QUOTA_OVERRIDES` secret. The user's `UserQuotaDO` replaces this
+ * with its stored override row when one exists (see `QuotaOverride`), so the secret only matters for
+ * addresses without a row.
+ */
+export function getUserQuotaLimits(env: Env, address: string): QuotaLimits {
+	const overrides = getUserQuotaOverride(env.USER_QUOTA_OVERRIDES, address)
+	const defaults = getDefaultUserQuotaLimits(env)
+	return overrides
+		? applyQuotaOverride(defaults, {
+			classic: overrides.classic ?? null,
+			elevenlabs: overrides.elevenlabs ?? null,
+			burstPerMinute: overrides.burstPerMinute ?? null,
+		})
+		: defaults
 }
 
 export function getGlobalQuotaLimits(env: Env): { classic: number | null; elevenlabs: number | null } {
@@ -258,7 +276,33 @@ export async function getUserQuotaSnapshot(
 	nowMs?: number
 ): Promise<QuotaSnapshot> {
 	const stub = getUserQuotaStub(env, address)
-	return await stub.getQuota(getUserQuotaLimits(env, address), nowMs)
+	return await stub.getQuota(getUserQuotaLimits(env, address), nowMs, getDefaultUserQuotaLimits(env))
+}
+
+export interface QuotaOverrideView {
+	override: QuotaOverride | null
+	limits: QuotaLimits
+	source: 'durable_object' | 'legacy_secret' | 'default'
+}
+
+/** Admin: the address's stored override (if any) and the limits reserve/getQuota will apply. */
+export async function inspectQuotaOverride(env: Env, address: string): Promise<QuotaOverrideView> {
+	const override = await getUserQuotaStub(env, address).getQuotaOverride()
+	if (override) {
+		return { override, limits: applyQuotaOverride(getDefaultUserQuotaLimits(env), override), source: 'durable_object' }
+	}
+	const legacy = getUserQuotaOverride(env.USER_QUOTA_OVERRIDES, address) !== undefined
+	return { override: null, limits: getUserQuotaLimits(env, address), source: legacy ? 'legacy_secret' : 'default' }
+}
+
+export async function setQuotaOverride(env: Env, address: string, input: QuotaOverrideInput): Promise<QuotaOverrideView> {
+	await getUserQuotaStub(env, address).setQuotaOverride(input)
+	return await inspectQuotaOverride(env, address)
+}
+
+export async function clearQuotaOverride(env: Env, address: string): Promise<QuotaOverrideView> {
+	await getUserQuotaStub(env, address).clearQuotaOverride()
+	return await inspectQuotaOverride(env, address)
 }
 
 function toGlobalLimitsForProvider(
@@ -346,6 +390,7 @@ export async function reserveGenerationQuota(
 	const nowMs = params.nowMs ?? Date.now()
 	const claimId = crypto.randomUUID()
 	const userLimits = getUserQuotaLimits(env, params.address)
+	const userDefaults = getDefaultUserQuotaLimits(env)
 	const globalLimits = toGlobalLimitsForProvider(getGlobalQuotaLimits(env))
 	const freshUserStub = () => getUserQuotaStub(env, params.address)
 	const userStub = freshUserStub()
@@ -353,7 +398,7 @@ export async function reserveGenerationQuota(
 
 	let userResult: Awaited<ReturnType<typeof userStub.reserve>>
 	try {
-		userResult = await userStub.reserve(params.reservationId, params.provider, userLimits, nowMs, undefined, claimId)
+		userResult = await userStub.reserve(params.reservationId, params.provider, userLimits, nowMs, undefined, claimId, userDefaults)
 	} catch (err) {
 		// The reply may have been lost after the DO wrote: release strictly by this caller's claimId.
 		await releaseCallerClaim(freshUserStub, { ...release, generation: null, dayKey: null, reason: 'user_reserve_rpc_failed' })
@@ -492,7 +537,9 @@ export async function transitionFallbackQuota(
 		params.fromProvider,
 		params.toProvider,
 		userLimits,
-		nowMs
+		nowMs,
+		undefined,
+		getDefaultUserQuotaLimits(env)
 	)
 
 	if (!userResult.ok) {

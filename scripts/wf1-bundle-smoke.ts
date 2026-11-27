@@ -306,6 +306,18 @@ async function pausedAndCache() {
 		}
 		assert.equal((await call(mf, '/created', { sub: owner })).response.status, 200)
 		assert.equal((await call(mf, '/chain/balance', { sub: owner })).response.status, 200)
+
+		// UserQuotaDO schema v8 in workerd: an admin override is applied by GET /quota, and clear restores defaults.
+		const admin = { 'x-admin-secret': 'smoke-admin-secret' }
+		const set = await call(mf, '/admin/quota-override', { body: { address: owner, action: 'set', classic: 20, elevenlabs: 10 }, headers: admin })
+		assert.equal(set.response.status, 200, set.text)
+		assert.equal(set.response.headers.get('Cache-Control'), 'private, no-store')
+		assert.deepEqual(JSON.parse(set.text).limits, { classic: 20, elevenlabs: 10, burstPerMinute: 5 })
+		const granted = JSON.parse((await call(mf, '/quota', { sub: owner })).text)
+		assert.deepEqual([granted.classic.limit, granted.elevenlabs.limit], [20, 10])
+		assert.equal(JSON.parse((await call(mf, '/admin/quota-override', { body: { address: owner, action: 'clear' }, headers: admin })).text).source, 'default')
+		const restored = JSON.parse((await call(mf, '/quota', { sub: owner })).text)
+		assert.deepEqual([restored.classic.limit, restored.elevenlabs.limit], [10, 5])
 		const puts = JSON.parse((await call(mf, '/__smoke/cache-puts')).text) as string[]
 		assert.deepEqual(puts.filter((path) => privatePaths.includes(path)), [], 'private routes never reach caches.default.put')
 		assert.equal((await call(mf, '/image/x.mp3')).response.status, 404)

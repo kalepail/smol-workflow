@@ -18,7 +18,7 @@ import chain from './api/chain'
 import { image, song, video } from './api/media'
 import search from './api/search'
 import artists from './api/artists'
-import quota from './api/quota'
+import quota, { quotaAdmin } from './api/quota'
 import plays from './api/plays'
 import { processSearchQueue, processSearchDLQ, runSearchBackfillCron } from './utils/search'
 import { allowedCorsOrigin } from './utils/cors'
@@ -65,6 +65,7 @@ app.route('/video', video)
 app.route('/search', search)
 app.route('/artists', artists)
 app.route('/quota', quota)
+app.route('/admin', quotaAdmin)
 app.route('/plays', plays)
 app.route('/', smols)
 

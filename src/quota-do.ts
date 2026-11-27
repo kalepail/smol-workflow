@@ -11,6 +11,26 @@ export interface QuotaLimits {
 	burstPerMinute?: number
 }
 
+/** Per-address limits stored in that user's `UserQuotaDO` (schema v8). `null` means "use the default". */
+export interface QuotaOverride {
+	classic: number | null
+	elevenlabs: number | null
+	burstPerMinute: number | null
+	updatedAtMs: number
+}
+
+export type QuotaOverrideInput = Pick<QuotaOverride, 'classic' | 'elevenlabs' | 'burstPerMinute'>
+
+/** Apply a stored override over the configured defaults; a burst of 0 disables the burst guard. */
+export function applyQuotaOverride(defaults: QuotaLimits, override: QuotaOverrideInput): QuotaLimits {
+	const burstPerMinute = override.burstPerMinute ?? defaults.burstPerMinute ?? 0
+	return {
+		classic: override.classic ?? defaults.classic,
+		elevenlabs: override.elevenlabs ?? defaults.elevenlabs,
+		...(burstPerMinute > 0 ? { burstPerMinute } : {}),
+	}
+}
+
 export interface ProviderQuotaStatus {
 	limit: number
 	used: number
@@ -652,6 +672,24 @@ export class UserQuotaDO extends DurableObject<Env> {
 			})
 			version = 7
 		}
+
+		if (version < 8) {
+			this.ctx.storage.transactionSync(() => {
+				// Additive: per-address quota overrides for `user:<address>` objects (a singleton row).
+				// Older code never reads it, so a rollback simply falls back to USER_QUOTA_OVERRIDES.
+				this.sql.exec(`
+					CREATE TABLE IF NOT EXISTS quota_overrides (
+						id INTEGER PRIMARY KEY CHECK(id = 1),
+						classic INTEGER CHECK(classic IS NULL OR classic >= 0),
+						elevenlabs INTEGER CHECK(elevenlabs IS NULL OR elevenlabs >= 0),
+						burst_per_minute INTEGER CHECK(burst_per_minute IS NULL OR burst_per_minute >= 0),
+						updated_at_ms INTEGER NOT NULL
+					)
+				`)
+				this.sql.exec(`INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (8)`)
+			})
+			version = 8
+		}
 	}
 
 	private async scheduleCleanupAlarm(targetMs: number): Promise<void> {
@@ -974,12 +1012,71 @@ export class UserQuotaDO extends DurableObject<Env> {
 		}
 	}
 
-	async getQuota(limits: QuotaLimits, nowMs: number = Date.now()): Promise<QuotaSnapshot> {
+	/** Storage errors propagate (fail closed): callers answer 503 rather than guess a limit. */
+	private readQuotaOverride(): QuotaOverride | null {
+		const row = this.sql
+			.exec<{ classic: number | null; elevenlabs: number | null; burst_per_minute: number | null; updated_at_ms: number }>(
+				`SELECT classic, elevenlabs, burst_per_minute, updated_at_ms FROM quota_overrides WHERE id = 1`
+			)
+			.toArray()[0]
+		if (!row) return null
+		const int = (value: number | null) => (value === null || value === undefined ? null : Number(value))
+		return {
+			classic: int(row.classic),
+			elevenlabs: int(row.elevenlabs),
+			burstPerMinute: int(row.burst_per_minute),
+			updatedAtMs: Number(row.updated_at_ms),
+		}
+	}
+
+	/**
+	 * User objects receive `defaults` (configured limits without the legacy secret) next to `limits`
+	 * (defaults merged with USER_QUOTA_OVERRIDES). A stored override row wins over the legacy secret;
+	 * without a row the passed `limits` apply unchanged. Global buckets never pass `defaults`.
+	 */
+	private effectiveLimits(limits: QuotaLimits, defaults?: QuotaLimits): QuotaLimits {
+		if (!defaults) return limits
+		const override = this.readQuotaOverride()
+		return override ? applyQuotaOverride(defaults, override) : limits
+	}
+
+	async getQuotaOverride(): Promise<QuotaOverride | null> {
+		return this.readQuotaOverride()
+	}
+
+	async setQuotaOverride(input: QuotaOverrideInput, nowMs: number = Date.now()): Promise<QuotaOverride> {
+		for (const value of [input.classic, input.elevenlabs, input.burstPerMinute]) {
+			if (value !== null && (!Number.isInteger(value) || value < 0)) {
+				throw new Error('Quota override fields must be null or non-negative integers')
+			}
+		}
+		this.sql.exec(
+			`INSERT INTO quota_overrides (id, classic, elevenlabs, burst_per_minute, updated_at_ms)
+			 VALUES (1, ?, ?, ?, ?)
+			 ON CONFLICT(id) DO UPDATE SET
+			     classic = excluded.classic,
+			     elevenlabs = excluded.elevenlabs,
+			     burst_per_minute = excluded.burst_per_minute,
+			     updated_at_ms = excluded.updated_at_ms`,
+			input.classic,
+			input.elevenlabs,
+			input.burstPerMinute,
+			nowMs
+		)
+		return this.readQuotaOverride()!
+	}
+
+	async clearQuotaOverride(): Promise<boolean> {
+		return this.sql.exec(`DELETE FROM quota_overrides WHERE id = 1`).rowsWritten > 0
+	}
+
+	async getQuota(limits: QuotaLimits, nowMs: number = Date.now(), defaults?: QuotaLimits): Promise<QuotaSnapshot> {
+		const effective = this.effectiveLimits(limits, defaults)
 		if (this.hasPendingUserReleases(nowMs)) {
 			await this.drainPendingUserReleases(nowMs).catch(() => {})
 		}
 		const dayKey = getUtcDayKey(nowMs)
-		return this.buildSnapshot(dayKey, limits)
+		return this.buildSnapshot(dayKey, effective)
 	}
 
 	async getReservation(reservationId: string): Promise<QuotaReservationRecord | null> {
@@ -1051,12 +1148,14 @@ export class UserQuotaDO extends DurableObject<Env> {
 		limits: QuotaLimits,
 		nowMs: number = Date.now(),
 		bucketDayKey?: string,
-		claimId?: string
+		claimId?: string,
+		defaults?: QuotaLimits
 	): Promise<QuotaReserveResult> {
 		const id = reservationId.trim()
 		if (!id) {
 			throw new Error('reservationId must be a non-empty string')
 		}
+		limits = this.effectiveLimits(limits, defaults)
 		const effectiveClaimId = claimId?.trim() || crypto.randomUUID()
 
 		if (this.hasPendingUserReleases(nowMs)) {
@@ -1827,12 +1926,14 @@ export class UserQuotaDO extends DurableObject<Env> {
 		toProvider: QuotaProvider,
 		limits: QuotaLimits,
 		nowMs: number = Date.now(),
-		bucketDayKey?: string
+		bucketDayKey?: string,
+		defaults?: QuotaLimits
 	): Promise<QuotaTransitionResult> {
 		const id = reservationId.trim()
 		if (!id) {
 			throw new Error('reservationId must be a non-empty string')
 		}
+		limits = this.effectiveLimits(limits, defaults)
 
 		const result = this.ctx.storage.transactionSync((): QuotaTransitionResult => {
 			const targetDayKey = bucketDayKey?.trim() || getUtcDayKey(nowMs)

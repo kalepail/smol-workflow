@@ -1149,7 +1149,8 @@ test('UserQuotaDO upgrades a persisted v2 schema in place: admitted/generation b
 	const migratedDo = new appModule.UserQuotaDO(ctx, {} as Env)
 
 	const versionRow = db.prepare(`SELECT MAX(id) AS v FROM _sql_schema_migrations`).get() as { v: number }
-	assert.equal(versionRow.v, 7, 'Internal schema version must advance from 2 to 7')
+	assert.equal(versionRow.v, 8, 'Internal schema version must advance from 2 to 8')
+	assert.ok(db.prepare(`SELECT name FROM sqlite_master WHERE name = 'quota_overrides'`).get(), 'v8 adds the quota override table')
 	assert.ok(db.prepare(`SELECT name FROM sqlite_master WHERE name = 'mint_prefix_locks'`).get(), 'v7 adds the mint prefix lock table')
 
 	const committedRow = await migratedDo.getReservation('legacy-v2-committed')

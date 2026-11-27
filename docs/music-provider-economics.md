@@ -21,7 +21,7 @@ SMOL runs two music providers: **AISongGenerator `v6`** (default, 2 tracks) and 
 ## 2. Spend ceilings (live)
 
 - **Classic (AISG):** `GLOBAL_DAILY_LIMIT_CLASSIC = 100` per UTC day (400 credits max); per-user default 10/day.
-- **ElevenLabs:** `GLOBAL_DAILY_LIMIT_ELEVENLABS = 50` per UTC day (~$75/day worst case at 10 min, ~$15–$22.50 typical); per-user default 5/day. Per-address limits come from `USER_QUOTA_OVERRIDES`.
+- **ElevenLabs:** `GLOBAL_DAILY_LIMIT_ELEVENLABS = 50` per UTC day (~$75/day worst case at 10 min, ~$15–$22.50 typical); per-user default 5/day. Per-address grants are rows in the user's `UserQuotaDO` (`POST /admin/quota-override`); the legacy `USER_QUOTA_OVERRIDES` secret covers addresses without a row.
 - The global cap fails open when the global quota Durable Object is unreachable (per-user limits still apply), so two outer caps back it:
   - the dedicated least-privilege ElevenLabs key `SMOL` (Music Generation + User only, 100,000 credits per refresh period, Auto Top Up off);
   - the AI Gateway `smol` limit of **60 requests per 86,400 s sliding**, ElevenLabs only. Do not route Workers AI through `smol`. Gateway `$` spend limits never fire for ElevenLabs music because its logs report `cost: 0`.

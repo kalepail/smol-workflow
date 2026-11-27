@@ -2315,7 +2315,7 @@ test('DO migration v6 -> v7: a populated v6 object upgrades in place, keeps its 
 		return new UserQuotaDO({ storage, blockConcurrencyWhile: <R>(fn: () => Promise<R>) => fn(), waitUntil: () => {} } as unknown as DurableObjectState, {} as Env)
 	}
 	const quota = open()
-	assert.deepEqual(db.prepare(`SELECT id FROM _sql_schema_migrations ORDER BY id`).all().map(({ id }) => id), [1, 2, 3, 4, 5, 6, 7])
+	assert.deepEqual(db.prepare(`SELECT id FROM _sql_schema_migrations ORDER BY id`).all().map(({ id }) => id), [1, 2, 3, 4, 5, 6, 7, 8])
 	assert.deepEqual(db.prepare(`PRAGMA table_info('mint_prefix_locks')`).all().map(({ name }) => name), [
 		'prefix', 'smol_id', 'workflow_id', 'status', 'claim_token', 'lease_until_ms', 'lease_version', 'reserved_at_ms', 'signed_at_ms',
 		'dispatched_at_ms', 'joined_at_ms', 'updated_at_ms',
@@ -2348,7 +2348,7 @@ test('DO migration v6 -> v7: a populated v6 object upgrades in place, keeps its 
 
 	// Reopening runs no migration again and keeps every row.
 	const reopened = open()
-	assert.equal(db.prepare(`SELECT COUNT(*) AS n FROM _sql_schema_migrations`).get()!.n, 7)
+	assert.equal(db.prepare(`SELECT COUNT(*) AS n FROM _sql_schema_migrations`).get()!.n, 8)
 	assert.equal(status(A), 'ambiguous')
 	assert.equal(status(twinOfN), 'reserved')
 	assert.deepEqual(leaseOf(twinOfN), { lease_until_ms: nowMs + MINT_ADMISSION_LEASE_MS, lease_version: 2 })
