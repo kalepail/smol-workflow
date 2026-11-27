@@ -30,20 +30,21 @@ artists.get('/:address/smols', publicCache, async (c) => {
 	const { limit, cursor } = parsePaginationParams(new URL(req.url))
 	const [where, ...cursorBindings] = buildCursorWhereClause(cursor, 's."Address" = ? AND s.Public = 1', 's.')
 
-	const { results } = await env.SMOL_D1.prepare(`
-		SELECT s.Id, s.Title, s.Song_1, s.Address, s.Plays, s.Views, s.Mint_Token, s.Mint_Amm, s.Created_At, s.Public
-		FROM Smols s
-		WHERE ${where}
-		ORDER BY s.Created_At DESC, s.Id DESC
-		LIMIT ?
-	`).bind(artistAddress, ...cursorBindings, limit + 1).all<ArtistSmol>()
-	const { items, pagination } = paginate(results ?? [], limit)
-
-	const artist = items.length > 0
-		? await env.SMOL_D1.prepare(`SELECT Username, Address FROM Users WHERE Address = ? LIMIT 1`)
+	// Both reads go out together (one D1 round trip of latency); the artist row is only used with smols.
+	const [{ results }, artistRow] = await Promise.all([
+		env.SMOL_D1.prepare(`
+			SELECT s.Id, s.Title, s.Song_1, s.Address, s.Plays, s.Views, s.Mint_Token, s.Mint_Amm, s.Created_At, s.Public
+			FROM Smols s
+			WHERE ${where}
+			ORDER BY s.Created_At DESC, s.Id DESC
+			LIMIT ?
+		`).bind(artistAddress, ...cursorBindings, limit + 1).all<ArtistSmol>(),
+		env.SMOL_D1.prepare(`SELECT Username, Address FROM Users WHERE Address = ? LIMIT 1`)
 			.bind(artistAddress)
-			.first<Artist>()
-		: null
+			.first<Artist>(),
+	])
+	const { items, pagination } = paginate(results ?? [], limit)
+	const artist = items.length > 0 ? artistRow : null
 
 	const response = c.json({
 		artist: artist ?? null,

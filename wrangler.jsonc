@@ -35,7 +35,13 @@
         {
             "name": "smol-tx-workflow",
             "binding": "TX_WORKFLOW",
-            "class_name": "TxWorkflow"
+            "class_name": "TxWorkflow",
+            // Finished mint instances are kept 30 days; the hourly cron prunes terminal MintBatchStatus
+            // rows once their instance is gone (src/utils/mint-status-prune.ts).
+            "default_retention": {
+                "success_retention": "30 days",
+                "error_retention": "30 days"
+            }
         }
     ],
     /**
@@ -122,10 +128,7 @@
         "NSFW_PROVIDER": "clef",
         // Step 2 cover-art prompt mode: "distill" (visual rewrite + non-sprite PixFlux params). "raw" is the instant rollback.
         "COVER_PROMPT_MODE": "distill",
-        "SEARCH_BACKFILL_CRON_ENABLED": "true",
-        "SEARCH_BACKFILL_CRON_PAGE_LIMIT": "20",
-        "SEARCH_BACKFILL_CRON_STALL_RUNS": "6",
-        "SEARCH_BACKFILL_CRON_MAX_WAVES": "5"
+        "SEARCH_BACKFILL_CRON_ENABLED": "true"
     },
     /**
    * Note: Use secrets to store sensitive data.

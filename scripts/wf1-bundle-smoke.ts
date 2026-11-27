@@ -563,6 +563,11 @@ async function imagesAndCreatedSearch() {
 		const head = await mf.dispatchFetch('https://api.smol.xyz/image/rgba.png?scale=4', { method: 'HEAD' })
 		assert.equal(head.status, 200)
 		await head.arrayBuffer()
+		// Cache-Tag labels the cached copy only: never on a cold 200, a warm HIT, or a 304.
+		const notModified = await mf.dispatchFetch('https://api.smol.xyz/image/rgba.png?scale=4', { headers: { 'If-None-Match': scaled.headers.get('ETag')! } })
+		assert.equal(notModified.status, 304)
+		await notModified.arrayBuffer()
+		assert.deepEqual([scaled, head, notModified].map((r) => r.headers.get('Cache-Tag')), [null, null, null], 'client responses never carry Cache-Tag')
 		const big = await mf.dispatchFetch('https://api.smol.xyz/image/cover128.png?scale=32')
 		const bigBytes = new Uint8Array(await big.arrayBuffer())
 		assert.equal(big.status, 200, `128x128 cover x32: ${new TextDecoder().decode(bigBytes.subarray(0, 200))}`)

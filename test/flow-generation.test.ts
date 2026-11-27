@@ -41,7 +41,6 @@ function buildMockEnv(options: {
 	nsfwRaw?: unknown
 	clefRaw?: unknown
 	nsfwProvider?: string
-	preMigrationD1?: boolean
 	cfGatewayId?: string
 	cfAigToken?: string
 	fallbackEnabled?: string
@@ -70,46 +69,23 @@ function buildMockEnv(options: {
 				bind(...args: unknown[]) {
 					const run = async () => {
 						if (sql.includes('INSERT INTO Smols')) {
-							const hasProviderCols = sql.includes('Requested_Provider')
-							if (options.preMigrationD1 && hasProviderCols) {
-								throw new Error('D1_ERROR: table Smols has no column named Requested_Provider')
-							}
 							const id = String(args[0])
 							if (!d1Smols.has(id)) {
-								if (hasProviderCols) {
-									d1Smols.set(id, {
-										Id: id,
-										Title: args[1],
-										Song_1: args[2],
-										Song_2: args[3],
-										Address: args[4],
-										Public: args[5] ? 1 : 0,
-										Instrumental: args[6] ? 1 : 0,
-										Requested_Provider: args[7],
-										Actual_Provider: args[8],
-										Plays: 0,
-										Views: 0,
-										Mint_Token: null,
-										Mint_Amm: null,
-									})
-								} else {
-									if (args[3] === null || args[3] === undefined) {
-										throw new Error('NOT NULL constraint failed: Smols.Song_2')
-									}
-									d1Smols.set(id, {
-										Id: id,
-										Title: args[1],
-										Song_1: args[2],
-										Song_2: args[3],
-										Address: args[4],
-										Public: args[5] ? 1 : 0,
-										Instrumental: args[6] ? 1 : 0,
-										Plays: 0,
-										Views: 0,
-										Mint_Token: null,
-										Mint_Amm: null,
-									})
-								}
+								d1Smols.set(id, {
+									Id: id,
+									Title: args[1],
+									Song_1: args[2],
+									Song_2: args[3],
+									Address: args[4],
+									Public: args[5] ? 1 : 0,
+									Instrumental: args[6] ? 1 : 0,
+									Requested_Provider: args[7],
+									Actual_Provider: args[8],
+									Plays: 0,
+									Views: 0,
+									Mint_Token: null,
+									Mint_Amm: null,
+								})
 							}
 							return { success: true, meta: { changes: 1 } }
 						}
@@ -444,13 +420,12 @@ test('Gate 1a: default AISG v6 flow uses split /api/tasks submit + discovery, co
 	}
 })
 
-test('Gate 1b: explicit ElevenLabs vocal & instrumental use BYOK AI Gateway, 1 track, canonical audio URL, 0 AISG music calls, and pre-migration D1 compat', async () => {
+test('Gate 1b: explicit ElevenLabs vocal & instrumental use BYOK AI Gateway, 1 track, canonical audio URL, and 0 AISG music calls', async () => {
 	let aisgMusicCalls = 0
 	const elevenLabsRequests: Array<{ url: string; headers: Headers; body: Record<string, any> }> = []
 	const fakeMp3 = makeAudioBytes(55, 8192)
 
 	const harness = buildMockEnv({
-		preMigrationD1: true, // Verify Song_2='' fallback works seamlessly on pre-migration D1!
 		aisgFetch: async (url) => {
 			aisgMusicCalls += 1
 			throw new Error(`AISG music route must not be called for explicit ElevenLabs: ${url}`)
@@ -535,6 +510,7 @@ test('Gate 1b: explicit ElevenLabs vocal & instrumental use BYOK AI Gateway, 1 t
 		assert.equal(vocalReq.headers.get('cf-aig-no-wholesale'), 'true')
 		assert.equal(vocalReq.headers.get('cf-aig-skip-cache'), 'true')
 		assert.equal(vocalReq.headers.get('cf-aig-collect-log-payload'), 'false')
+		assert.deepEqual(JSON.parse(vocalReq.headers.get('cf-aig-metadata')!), { source: 'explicit', smol_id: vocalId })
 		assert.equal(vocalReq.headers.get('xi-api-key'), null, 'Must never send xi-api-key in BYOK mode')
 		assert.equal(vocalReq.body.model_id, 'music_v2_5')
 		assert.equal('prompt' in vocalReq.body, false, 'Vocal composition_plan must not include top-level prompt')
@@ -582,11 +558,11 @@ test('Gate 1b: explicit ElevenLabs vocal & instrumental use BYOK AI Gateway, 1 t
 		})
 		assert.equal('music_length_ms' in explicitInstBody && explicitInstBody.music_length_ms, 90_000)
 
-		// Verify R2 storage, canonical audio URL, and normalized Song_2: null even on pre-migration D1!
+		// Verify R2 storage, canonical audio URL, and a 1-track Smol stores Song_2 NULL
 		const expectedMusicId = `el-${vocalId}`
 		assert.deepEqual(harness.r2.store.get(`${expectedMusicId}.mp3`)?.bytes, fakeMp3)
 		assert.equal(harness.d1Smols.get(vocalId)?.Song_1, expectedMusicId)
-		assert.equal(harness.d1Smols.get(vocalId)?.Song_2, '', 'Pre-migration D1 stores empty string fallback')
+		assert.equal(harness.d1Smols.get(vocalId)?.Song_2, null)
 
 		const detailRes = await appModule.app.fetch(
 			new Request(`https://api.smol.xyz/${vocalId}`),
@@ -595,7 +571,7 @@ test('Gate 1b: explicit ElevenLabs vocal & instrumental use BYOK AI Gateway, 1 t
 		)
 		await ctx.flush()
 		const detail = await detailRes.json() as { d1: Record<string, any>; kv_do: Record<string, any> }
-		assert.equal(detail.d1.Song_2, null, 'Detail JSON normalizes empty Song_2 to null')
+		assert.equal(detail.d1.Song_2, null)
 		assert.equal(detail.kv_do.songs.length, 1)
 		assert.equal(detail.kv_do.songs[0].audio, `https://api.smol.xyz/song/${expectedMusicId}.mp3`)
 		assert.equal(detail.kv_do.songs[0].status, 4)
@@ -641,13 +617,15 @@ test('Gate 1c: automatic fallback AISG -> ElevenLabs triggers on submit rejectio
 	})
 
 	const originalFetch = globalThis.fetch
-	globalThis.fetch = (async (input: string | URL | Request) => {
+	const elevenLabsMetadata: unknown[] = []
+	globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
 		const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
 		if (url.includes('api.pixellab.ai')) {
 			return new Response(JSON.stringify({ image: { base64: FAKE_IMAGE_B64 } }), { status: 200 })
 		}
 		if (url.includes('/elevenlabs/v1/music')) {
 			elevenLabsCalls += 1
+			elevenLabsMetadata.push(JSON.parse(new Headers(init?.headers).get('cf-aig-metadata')!))
 			return new Response(fakeMp3, {
 				status: 200,
 				headers: { 'Content-Type': 'audio/mpeg', 'Content-Length': String(fakeMp3.byteLength) },
@@ -672,6 +650,7 @@ test('Gate 1c: automatic fallback AISG -> ElevenLabs triggers on submit rejectio
 		assert.equal(kv1.actual_provider, 'elevenlabs')
 		assert.equal(kv1.fallback_from, 'aisonggenerator')
 		assert.equal(kv1.fallback_reason, 'provider_unavailable')
+		assert.deepEqual(elevenLabsMetadata[0], { source: 'fallback', smol_id: id1 })
 		assert.equal(harness.d1Smols.get(id1)?.Public, 0, 'Original private visibility must be preserved across fallback')
 		assert.equal(harness.d1Smols.get(id1)?.Requested_Provider, 'aisonggenerator')
 		assert.equal(harness.d1Smols.get(id1)?.Actual_Provider, 'elevenlabs')
@@ -839,7 +818,7 @@ test('Gate 1d: negative validation, credential fail-closed, chunked/overflow/tru
 	assert.equal(nsfwModule.isNsfwBlocked({ safe: true, categories: [] }), false)
 })
 
-test('Gate 1e (post-review P1 regressions): paginated AISG discovery accumulates 2 IDs across pages; pending/singleton/untyped-5xx NEVER trigger paid ElevenLabs fallback', async () => {
+test('Gate 1e: paginated AISG discovery accumulates 2 IDs across pages; pending/singleton/untyped-5xx NEVER trigger paid ElevenLabs fallback', async () => {
 	const audio1 = makeAudioBytes(19, 40_000)
 	const audio2 = makeAudioBytes(23, 40_000)
 	let elevenLabsCalls = 0
@@ -1006,7 +985,7 @@ test('Gate 1e (post-review P1 regressions): paginated AISG discovery accumulates
 	}
 })
 
-test('Gate 1f (Pass-2 P1 regressions): ElevenLabs 504, zero-byte 200, oversize 200, and JSON 200 ALL record outcome=unknown (ambiguous) so retries never double-charge', async () => {
+test('Gate 1f: ElevenLabs 504, zero-byte 200, oversize 200, and JSON 200 ALL record outcome=unknown (ambiguous) so retries never double-charge', async () => {
 	const harness = buildMockEnv()
 	const cases: Array<{ name: string; response: () => Response; expectedCode: string }> = [
 		{
@@ -1090,7 +1069,7 @@ test('Gate 1f (Pass-2 P1 regressions): ElevenLabs 504, zero-byte 200, oversize 2
 	}
 })
 
-test('P2 pacing: vocal ElevenLabs reuses the pre-claim R2 check (no second HEAD after quota admission) and a pacing AI failure falls back without stranding the reservation', async () => {
+test('Pacing: vocal ElevenLabs reuses the pre-claim R2 check (no second HEAD after quota admission) and a pacing AI failure falls back without stranding the reservation', async () => {
 	const fakeMp3 = makeAudioBytes(91, 8192)
 	const elevenLabsBodies: Array<Record<string, any>> = []
 	const harness = buildMockEnv()
@@ -1259,7 +1238,7 @@ test('Step 5 NSFW on retry: a regenerated cover/description is re-classified; a 
 			{ payload: { retry_id: sourceId }, instanceId, timestamp: new Date() } as never,
 			createWorkflowStep(new Map()).step as never,
 		)
-		return JSON.parse(harness.kv.get(instanceId)!) as { nsfw: unknown; image_base64: string }
+		return JSON.parse(harness.kv.get(instanceId)!) as { nsfw: unknown; image?: boolean; image_base64?: string }
 	}
 	const lyrics = { title: 'Harbor', style: ['dream pop', 'synthwave'], lyrics: '[Verse]\nHold my hand' }
 
@@ -1271,7 +1250,8 @@ test('Step 5 NSFW on retry: a regenerated cover/description is re-classified; a 
 		const coverCalls = regenCover.aiCalls.filter((c) => c.model === '@cf/cloudflare/clef')
 		assert.equal(coverCalls.length, 1)
 		assert.deepEqual(coverCalls[0].input.images, [{ content_type: 'image/png', base64: FAKE_IMAGE_B64 }])
-		assert.equal(regenCoverKv.image_base64, FAKE_IMAGE_B64)
+		assert.deepEqual([regenCoverKv.image, regenCoverKv.image_base64], [true, undefined], 'KV detail flags the cover; bytes live in R2')
+		assert.equal(Buffer.from(regenCover.r2.store.get(`${'e1'.repeat(32)}.png`)!.bytes).toString('base64'), FAKE_IMAGE_B64)
 		assert.deepEqual(regenCoverKv.nsfw, { safe: false, categories: ['S12'] })
 		assert.equal(regenCover.d1Smols.get('e1'.repeat(32))?.Public, 0)
 		assert.equal(regenCover.queueMessages.length, 0)
@@ -1378,9 +1358,10 @@ test('Cover distillation: sends clean visual brief and non-sprite PixFlux params
 		assert.equal(clefCall?.input.state.prompt, rawPrompt)
 		assert.deepEqual(clefCall?.input.images, [{ content_type: 'image/png', base64: FAKE_IMAGE_B64 }])
 
-		// Stored KV holds compact cover metadata (no derived prompt text) and canonical raw base64
-		const kv1 = JSON.parse(h1.kv.get(id1)!) as { image_base64: string; pipeline_meta?: PipelineMeta }
-		assert.equal(kv1.image_base64, FAKE_IMAGE_B64)
+		// Stored KV holds compact cover metadata (no derived prompt text); the canonical PNG is in R2
+		const kv1 = JSON.parse(h1.kv.get(id1)!) as { image?: boolean; image_base64?: string; pipeline_meta?: PipelineMeta }
+		assert.deepEqual([kv1.image, kv1.image_base64], [true, undefined])
+		assert.equal(Buffer.from(h1.r2.store.get(`${id1}.png`)!.bytes).toString('base64'), FAKE_IMAGE_B64)
 		assert.equal(kv1.pipeline_meta?.cover?.mode, 'distill')
 		assert.equal(kv1.pipeline_meta?.cover?.source, 'model')
 		assert.equal(kv1.pipeline_meta?.cover?.kind, 'object')
@@ -1470,15 +1451,16 @@ test('Cover distillation: sends clean visual brief and non-sprite PixFlux params
 			createWorkflowStep(legacyCache).step as never,
 		)
 		assert.equal(pixellabBodies.length, pixellabCountBeforeResume, 'legacy string checkpoint must not call PixelLab')
-		const kv5 = JSON.parse(h5.kv.get(id5)!) as { image_base64: string; pipeline_meta?: PipelineMeta }
-		assert.equal(kv5.image_base64, FAKE_IMAGE_B64)
+		const kv5 = JSON.parse(h5.kv.get(id5)!) as { image?: boolean; pipeline_meta?: PipelineMeta }
+		assert.equal(kv5.image, true)
+		assert.equal(Buffer.from(h5.r2.store.get(`${id5}.png`)!.bytes).toString('base64'), FAKE_IMAGE_B64)
 		assert.equal(kv5.pipeline_meta?.cover, undefined)
 	} finally {
 		globalThis.fetch = originalFetch
 	}
 })
 
-test('LYR-2 & LYR-3 workflow integration: intent-first bypass skips /api/lyrics on user_lyrics/instrumental and prefers cloudflare-ai songwriter styles on write', async () => {
+test('Lyrics workflow integration: intent-first bypass skips /api/lyrics on user_lyrics/instrumental and prefers cloudflare-ai songwriter styles on write', async () => {
 	const audio = makeAudioBytes(71, 40_000)
 	const submitBodies: Array<Record<string, any>> = []
 	const makeAisg = () => async (url: string, init?: RequestInit) => {

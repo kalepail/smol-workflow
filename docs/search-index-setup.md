@@ -83,18 +83,15 @@ It is intended as a safe maintenance pass, not a high-throughput bulk loader:
 - it uses the same backfill + reconcile helpers as the admin routes
 - it keeps a cursor checkpoint in `SMOL_KV`
 - it does not advance the cursor while the current page still has pending items
-- it records health, recent run history, and Vectorize watermark snapshots for monitoring
+- it records the last run's status, cursor and counts (page size, queued, ready, requeued, pending)
 - once a full pass completes for the current `SEARCH_INDEX_VERSION`, it stops re-scanning
 
-The default production config runs hourly (`0 * * * *`) with a page limit of 20 and up to 5
-stable pages per invocation:
+It runs hourly (`0 * * * *`) with a fixed page size of 20 and up to 5 stable pages per run.
+The only switch is `SEARCH_BACKFILL_CRON_ENABLED`:
 
 ```jsonc
 "vars": {
-  "SEARCH_BACKFILL_CRON_ENABLED": "true",
-  "SEARCH_BACKFILL_CRON_PAGE_LIMIT": "20",
-  "SEARCH_BACKFILL_CRON_STALL_RUNS": "6",
-  "SEARCH_BACKFILL_CRON_MAX_WAVES": "5"
+  "SEARCH_BACKFILL_CRON_ENABLED": "true"
 },
 "triggers": {
   "crons": ["0 * * * *"]
@@ -127,12 +124,11 @@ curl -H "x-admin-secret: $SMOL_ADMIN_SECRET" \
   https://api.smol.xyz/search/admin/backfill/status
 ```
 
-The response includes:
-- current cron `status` and `health`
-- the held or next cursor
-- `consecutiveStalledRuns` against the configured threshold
-- the latest Vectorize watermark snapshot
-- a short `recentRuns` history for debugging
+The response is `{ status, cursor?, updatedAt?, pageSize, queued, ready, requeued, pending, hasMore }`
+for the last run (`status` is `disabled`, `idle`, `waiting` or `complete`). A cursor that keeps
+`waiting` with the same `pending` count means Vectorize has not processed the queued mutations;
+repair with `POST /search/admin/reconcile` or `POST /search/admin/backfill?force=true` for that page,
+and check `GET /search/admin/dlq`.
 
 ## Notes
 

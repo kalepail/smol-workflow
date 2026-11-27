@@ -1,9 +1,5 @@
--- Live smol-d1: apply this file exactly once, using ONLY:
--- npx wrangler d1 execute smol-d1 --remote --file=migrations/0003_storage_query_optimization.sql
--- Precheck: SELECT 1 FROM pragma_table_info('Smols') WHERE name = 'Tags';
--- Proceed only if no row is returned. SQLite has no ADD COLUMN IF NOT EXISTS.
--- Never run wrangler d1 migrations apply on live smol-d1. Its d1_migrations ledger
--- is unseeded. Replaying 0001 clears provider provenance and drops Smols triggers.
+-- Applied on live smol-d1 and recorded in its d1_migrations ledger. SQLite has no
+-- ADD COLUMN IF NOT EXISTS, so this file must never be executed a second time by hand.
 ALTER TABLE Smols ADD COLUMN Tags TEXT DEFAULT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_smols_minted_created

@@ -600,7 +600,9 @@ test('mixtape tags use D1 first and bulk-read only legacy KV rows', async () => 
 		assert.equal(response.status, 200)
 		assert.deepEqual((await response.json() as any).Smols.map(({ Tags }: { Tags: string[] }) => Tags), [['D1 tag'], ['KV tag']])
 		assert.deepEqual(reads, [[SECOND]])
-		assert.deepEqual(response.headers.get('Cache-Tag')?.split(','), [
+		assert.equal(response.headers.get('Cache-Tag'), null)
+		const [stored] = edge.entries.values()
+		assert.deepEqual(stored.headers.find(([name]) => name === 'cache-tag')?.[1].split(','), [
 			'mixtapes', 'mixtape:tags-mix', `smol:${TRACK}:anonymous`, `smol:${SECOND}:anonymous`,
 		])
 	} finally {

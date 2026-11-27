@@ -22,8 +22,25 @@ import quota from './api/quota'
 import plays from './api/plays'
 import { processSearchQueue, processSearchDLQ, runSearchBackfillCron } from './utils/search'
 import { allowedCorsOrigin } from './utils/cors'
+import { pruneExpiredMintBatchStatus } from './utils/mint-status-prune'
 
 export const app = new Hono<HonoEnv>()
+
+// Cache-Tag labels the copies stored with cache.put (they keep their own headers) so tag purges can
+// evict them; it is never sent to clients. Registered first, so it runs after every other middleware.
+app.use('*', async (c, next) => {
+	await next()
+	if (!c.res.headers.has('Cache-Tag')) return
+	try {
+		c.res.headers.delete('Cache-Tag')
+	} catch {
+		const headers = new Headers(c.res.headers)
+		headers.delete('Cache-Tag')
+		const clean = new Response(c.res.body, { status: c.res.status, statusText: c.res.statusText, headers })
+		c.res = undefined // Hono would otherwise merge the old headers back into the replacement
+		c.res = clean
+	}
+})
 
 // Global CORS middleware
 app.use(
@@ -74,6 +91,9 @@ const handler = {
 	},
 	scheduled: (_controller, env, ctx) => {
 		ctx.waitUntil(runSearchBackfillCron(env))
+		ctx.waitUntil(pruneExpiredMintBatchStatus(env).catch((error) => {
+			console.warn('Mint status pruning failed:', error instanceof Error ? error.name : 'UnknownError')
+		}))
 	},
 } satisfies ExportedHandler<Env>
 

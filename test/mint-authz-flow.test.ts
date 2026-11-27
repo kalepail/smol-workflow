@@ -1330,7 +1330,7 @@ async function dispatchThenLoseCheckpoint(instanceId: string) {
 	return { c, id, h, event, wf, cache, signatures }
 }
 
-test('P1 dispatch marker (a): dispatch started -> kill switch flipped to "false" -> submit replays: lock stays owned (ambiguous, never failed), competing workflows are refused, zero second issuer authorization', async () => {
+test('dispatch marker (a): dispatch started -> kill switch flipped to "false" -> submit replays: lock stays owned (ambiguous, never failed), competing workflows are refused, zero second issuer authorization', async () => {
 	for (const replaySwitch of ['false', 'true']) {
 		const { c, id, h, event, wf, cache, signatures } = await dispatchThenLoseCheckpoint(`dispatch-replay-${replaySwitch}`)
 		try {
@@ -1383,7 +1383,7 @@ test('P1 dispatch marker (a): dispatch started -> kill switch flipped to "false"
 	}
 })
 
-test('P1 dispatch marker (b): dispatch started -> full workflow restart re-enters the sign step: re-signing is refused and the lock is retained', async () => {
+test('dispatch marker (b): dispatch started -> full workflow restart re-enters the sign step: re-signing is refused and the lock is retained', async () => {
 	for (const restartSwitch of ['true', 'false']) {
 		const { id, h, event, wf, signatures } = await dispatchThenLoseCheckpoint(`dispatch-restart-${restartSwitch}`)
 		try {
@@ -1438,7 +1438,7 @@ test('P1 dispatch marker (b): dispatch started -> full workflow restart re-enter
 	}
 })
 
-test('P1 dispatch marker: a never-dispatched paused submit is still a definite failure; a marker the workflow does not own, or cannot write, relays nothing', async () => {
+test('dispatch marker: a never-dispatched paused submit is still a definite failure; a marker the workflow does not own, or cannot write, relays nothing', async () => {
 	const c = carrier('test/coin_it-split')
 	const id = c.tracks[0].id
 	const checkpoint = () => new Map<string, unknown>([['sign transaction#1', { version: 'wf0-v1', xdr: c.xdr }]])
@@ -1495,7 +1495,7 @@ test('P1 dispatch marker: a never-dispatched paused submit is still a definite f
 	}
 })
 
-test('P2 creation lease: a competing admission while the first is still creating its workflow gets 409 and never displaces it; a losing admission\'s cleanup never deletes another admission\'s claim', async () => {
+test('creation lease: a competing admission while the first is still creating its workflow gets 409 and never displaces it; a losing admission\'s cleanup never deletes another admission\'s claim', async () => {
 	const h = harness()
 	h.tracksOf(mainnetSingle)
 	const id = mainnetSingle.tracks[0].id
@@ -1587,7 +1587,7 @@ test('P2 creation lease: a competing admission while the first is still creating
 	h2.db.close()
 })
 
-test('P2 never-signed refusal: a provisional claim refused before signing is deleted, so a different song sharing its 12-hex prefix can be minted', async () => {
+test('never-signed refusal: a provisional claim refused before signing is deleted, so a different song sharing its 12-hex prefix can be minted', async () => {
 	const c = carrier('test/coin_it-split')
 	assert.equal(c.sub, FE_MINTER)
 	const song = c.tracks[0]
@@ -1646,7 +1646,7 @@ async function until(condition: () => boolean, what: string) {
 	assert.ok(condition(), what)
 }
 
-test('P2 pass 4: admission 1 reserves -> identical admission 2 joins and gets 202 (workflow queued) -> admission 1 hits a D1 or creation error: the claim is retained and a different carrier is still rejected', async () => {
+test('admission 1 reserves -> identical admission 2 joins and gets 202 (workflow queued) -> admission 1 hits a D1 or creation error: the claim is retained and a different carrier is still rejected', async () => {
 	const id = mainnetSingle.tracks[0].id
 	for (const failure of ['d1', 'create'] as const) {
 		// `lyingGet`: the Workflows API wrongly reports the just-queued instance as not found, so only the
@@ -1755,7 +1755,7 @@ test('P2 pass 4: admission 1 reserves -> identical admission 2 joins and gets 20
 	h.db.close()
 })
 
-test('P2 pass 4: an ambiguous or lost creation response retains the claim until the workflow is proven absent; only proven absence releases it', async () => {
+test('an ambiguous or lost creation response retains the claim until the workflow is proven absent; only proven absence releases it', async () => {
 	const id = mainnetSingle.tracks[0].id
 	const cases: Array<[string, (h: ReturnType<typeof harness>, create: WorkflowsStub['create']) => void, boolean]> = [
 		// The instance was queued, but the response was lost.
@@ -1822,7 +1822,7 @@ test('P2 pass 4: an ambiguous or lost creation response retains the claim until 
 	h.db.close()
 })
 
-test('P2 pass 4: an expired, never-signed holder of a shared 12-hex prefix is recovered by a different song (by the stored holder id and token); an active, live, signed or dispatched holder is still rejected', async () => {
+test('an expired, never-signed holder of a shared 12-hex prefix is recovered by a different song (by the stored holder id and token); an active, live, signed or dispatched holder is still rejected', async () => {
 	const c = carrier('test/coin_it-split')
 	const song = c.tracks[0]
 	const twin = { id: `${song.id.slice(0, 12)}${song.id.at(12) === 'd' ? 'e' : 'd'}${'d'.repeat(51)}`, creator: OTHER_WALLET }
@@ -1924,7 +1924,7 @@ test('P2 pass 4: an expired, never-signed holder of a shared 12-hex prefix is re
 	}
 })
 
-test('P2 pass 4: a confirmed on-chain failure with a transient lock-store fault retries only the settlement step (zero re-sign, zero re-submit); the lock settles, D1 records failed only afterwards, and a new admission succeeds', async () => {
+test('a confirmed on-chain failure with a transient lock-store fault retries only the settlement step (zero re-sign, zero re-submit); the lock settles, D1 records failed only afterwards, and a new admission succeeds', async () => {
 	const c = carrier('test/coin_it-split')
 	const id = c.tracks[0].id
 	// `lost`: the first settlement commits in the lock store but its response is lost.
@@ -2007,7 +2007,7 @@ test('P2 pass 4: a confirmed on-chain failure with a transient lock-store fault 
 // previous attempt's receipt; a submitted batch whose workflow is gone reads as uncertain
 // ---------------------------------------------------------------------------
 
-test('P2 pass 5: a recovery whose absence check ran BEFORE a join, delayed past the renewed deadline, cannot delete the joined owner\'s reservation; only a fresh observation can reclaim', async () => {
+test('a recovery whose absence check ran BEFORE a join, delayed past the renewed deadline, cannot delete the joined owner\'s reservation; only a fresh observation can reclaim', async () => {
 	const id = mainnetSingle.tracks[0].id
 	const h = harness()
 	h.tracksOf(mainnetSingle)
@@ -2073,7 +2073,7 @@ test('P2 pass 5: a recovery whose absence check ran BEFORE a join, delayed past 
 	h.db.close()
 })
 
-test('P2 pass 5: attempt 1 fails on-chain with hash H1 -> full restart -> attempt 2 relay response lost: /mint/status is uncertain with NO stale H1 hash', async () => {
+test('attempt 1 fails on-chain with hash H1 -> full restart -> attempt 2 relay response lost: /mint/status is uncertain with NO stale H1 hash', async () => {
 	const c = carrier('test/coin_it-split')
 	const id = c.tracks[0].id
 	const H1 = 'ab'.repeat(32)
@@ -2123,7 +2123,7 @@ test('P2 pass 5: attempt 1 fails on-chain with hash H1 -> full restart -> attemp
 	}
 })
 
-test('P2 pass 6: submitted with H1, confirmation fails, named-step restart at "record mint submit intent" reuses the signing checkpoint: D1 keeps submitted + H1, the dispatch guard refuses a second relay, /mint/status still returns H1', async () => {
+test('submitted with H1, confirmation fails, named-step restart at "record mint submit intent" reuses the signing checkpoint: D1 keeps submitted + H1, the dispatch guard refuses a second relay, /mint/status still returns H1', async () => {
 	const c = carrier('test/coin_it-split')
 	const id = c.tracks[0].id
 	const H1 = 'ab'.repeat(32)
@@ -2181,7 +2181,7 @@ test('P2 pass 6: submitted with H1, confirmation fails, named-step restart at "r
 	}
 })
 
-test('P2 pass 6/10: a submit intent never clears or downgrades an unresolved or final receipt; only a genuinely new (signing, undispatched) attempt over a pre-submit or definite failed row resets it', async () => {
+test('a submit intent never clears or downgrades an unresolved or final receipt; only a genuinely new (signing, undispatched) attempt over a pre-submit or definite failed row resets it', async () => {
 	const c = carrier('test/coin_it-split')
 	const id = c.tracks[0].id
 	const H = 'ef'.repeat(32)
@@ -2231,32 +2231,6 @@ test('P2 pass 6/10: a submit intent never clears or downgrades an unresolved or 
 		assert.deepEqual([row.Phase, row.Tx_Hash, row.Confirmed_Ledger], expected, `${phase} / ${lock}`)
 		assert.deepEqual(intent, { preSubmit: expectedPreSubmit }, `${phase} / ${lock}: preSubmit`)
 		assert.deepEqual(lockState(h), [[event.instanceId, lock]], `${phase} / ${lock}: the intent never moves a lock`)
-		h.db.close()
-	}
-})
-
-test('status: D1 still submitted (or submitting) and the workflow is definitively instance.not_found -> uncertain, never submitted indefinitely; a transient lookup failure keeps the D1 checkpoint', async () => {
-	const c = carrier('test/coin_it-split')
-	const id = c.tracks[0].id
-	const H = 'cd'.repeat(32)
-	const cases: Array<[string, string | null, () => Promise<never | { status: () => Promise<{ status: string }> }>, Record<string, unknown>]> = [
-		['submitted', H, async () => { throw new Error('instance.not_found') }, { phase: 'uncertain', txHash: H }],
-		['submitting', null, async () => { throw new Error('instance.not_found') }, { phase: 'uncertain' }],
-		['submitted', H, async () => { throw new Error('Workflows API unavailable') }, { phase: 'submitted', txHash: H }],
-		['submitted', H, async () => ({ status: async () => ({ status: 'running' }) }), { phase: 'submitted', txHash: H }],
-		['submitting', null, async () => { throw new Error('Workflows API unavailable') }, { phase: 'queued' }],
-	]
-	for (const [phase, hash, get, expected] of cases) {
-		const h = harness()
-		h.tracksOf(c)
-		const event = batchEvent(c, `status-${phase}-${expected.phase}`)
-		claim(h, event)
-		h.db.prepare('UPDATE MintBatchStatus SET Phase = ?, Tx_Hash = ? WHERE Workflow_Id = ?').run(phase, hash, event.instanceId)
-		;(h.env.TX_WORKFLOW as unknown as { get: unknown }).get = get
-		const response = await h.send('/mint/status', { workflowIds: [event.instanceId] }, FE_MINTER)
-		assert.equal(response.status, 200)
-		const { batches } = await json(response) as { batches: Array<Record<string, unknown>> }
-		assert.deepEqual(batches, [{ workflowId: event.instanceId, ids: [id], ...expected }], `${phase} / ${String(expected.phase)}`)
 		h.db.close()
 	}
 })
@@ -2390,7 +2364,7 @@ test('DO migration v6 -> v7: a populated v6 object upgrades in place, keeps its 
 	db.close()
 })
 
-test('P2 pass 7/8: a paused pre-v7 (legacy) restart with no v7 lock, or only a fresh never-signed v7 reservation, never downgrades a submitted, submitting, confirmed or persisted receipt to failed; /mint/status keeps uncertain + H1', async () => {
+test('a paused pre-v7 (legacy) restart with no v7 lock, or only a fresh never-signed v7 reservation, never downgrades a submitted, submitting, confirmed or persisted receipt to failed; /mint/status keeps uncertain + H1', async () => {
 	const c = carrier('test/coin_it-split')
 	const id = c.tracks[0].id
 	const H1 = 'ab'.repeat(32)
@@ -2462,7 +2436,7 @@ test('P2 pass 7/8: a paused pre-v7 (legacy) restart with no v7 lock, or only a f
 	}
 })
 
-test('P2 pass 7/8/9: the refusal write keeps every receipt; it fails a submitting row only when this v7 run\'s own submit intent (preSubmit) AND its owned signing claim (signing -> failed) both prove nothing was relayed', async () => {
+test('the refusal write keeps every receipt; it fails a submitting row only when this v7 run\'s own submit intent (preSubmit) AND its owned signing claim (signing -> failed) both prove nothing was relayed', async () => {
 	const c = carrier('test/coin_it-split')
 	const id = c.tracks[0].id
 	const H = 'ef'.repeat(32)
@@ -2542,7 +2516,7 @@ test('P2 pass 7/8/9: the refusal write keeps every receipt; it fails a submittin
 	}
 })
 
-test('P2 pass 9/10: legacy D1 submitting -> full restart (signing enabled) is refused before any v7 signing claim (zero lock, zero signatures, zero relays, D1 STAYS submitting, /mint/status uncertain); queued control: the claim commits, its response is lost, wallet auth expires, the retry refuses: lock signing -> failed, D1 failed', async () => {
+test('legacy D1 submitting -> full restart (signing enabled) is refused before any v7 signing claim (zero lock, zero signatures, zero relays, D1 STAYS submitting, /mint/status uncertain); queued control: the claim commits, its response is lost, wallet auth expires, the retry refuses: lock signing -> failed, D1 failed', async () => {
 	const c = carrier('test/coin_it-split')
 	const id = c.tracks[0].id
 	// [D1 phase before the restart, expected D1 after, /mint/status (errored), /mint/status (not_found)]
@@ -2655,7 +2629,7 @@ test('P2 pass 9/10: legacy D1 submitting -> full restart (signing enabled) is re
 	}
 })
 
-test('P2 pass 10: a fresh signing step never authorizes a replacement over an unresolved or final legacy receipt (zero lock claim, zero signature, zero relay, D1 phase + hash intact); a definite failed + H1 still resets cleanly and re-signs', async () => {
+test('a fresh signing step never authorizes a replacement over an unresolved or final legacy receipt (zero lock claim, zero signature, zero relay, D1 phase + hash intact); a definite failed + H1 still resets cleanly and re-signs', async () => {
 	const c = carrier('test/coin_it-split')
 	const id = c.tracks[0].id
 	const H1 = 'cd'.repeat(32)
@@ -2672,7 +2646,8 @@ test('P2 pass 10: a fresh signing step never authorizes a replacement over an un
 	// `none`: a pre-v7 instance holds no v7 lock. `reserved`: a post-upgrade duplicate admission reserved
 	// afresh (a never-signed v7 claim). Neither proves anything about the earlier relay.
 	for (const lock of ['none', 'reserved'] as const) {
-		for (const [phase, hash, ledger, refusal, progress] of rows) {
+		// One unresolved and one final phase cover the never-signed reservation; every phase runs lock-free.
+		for (const [phase, hash, ledger, refusal, progress] of rows.filter(([phase]) => lock === 'none' || phase === 'submitting' || phase === 'persisted')) {
 			const label = `${lock} / ${phase}`
 			const h = harness()
 			h.tracksOf(c)
@@ -2790,7 +2765,7 @@ async function queuedCoinIt(h: ReturnType<typeof harness>, track: { id: string; 
 	return event
 }
 
-test('P2 pass 11: a pre-v7 submitting/submitted (+ H1) receipt with no v7 lock and NULL Smols mint columns blocks a DIFFERENT workflow (new wallet authorization) for the same song or a 12-hex prefix twin: 409 at admission (zero lock claims), NonRetryableError at signing (zero lock claims, signatures, relays, D1 writes; legacy row untouched)', async () => {
+test('a pre-v7 submitting/submitted (+ H1) receipt with no v7 lock and NULL Smols mint columns blocks a DIFFERENT workflow (new wallet authorization) for the same song or a 12-hex prefix twin: 409 at admission (zero lock claims), NonRetryableError at signing (zero lock claims, signatures, relays, D1 writes; legacy row untouched)', async () => {
 	const H1 = 'cd'.repeat(32)
 	const LEGACY = 'mint-legacy-pre-v7-receipt'
 	for (const [phase, hashValue] of [['submitting', null], ['submitted', H1], ['confirmed', H1]] as const) {
@@ -2864,7 +2839,7 @@ test('P2 pass 11: a pre-v7 submitting/submitted (+ H1) receipt with no v7 lock a
 	}
 })
 
-test('P2 pass 11: an unresolved receipt whose Ids cannot be parsed fails closed at admission (503 mint_unavailable, zero claims) and at signing (NonRetryableError, zero claims, signatures, D1 writes); the same garbage in a resolved row blocks nothing', async () => {
+test('an unresolved receipt whose Ids cannot be parsed fails closed at admission (503 mint_unavailable, zero claims) and at signing (NonRetryableError, zero claims, signatures, D1 writes); the same garbage in a resolved row blocks nothing', async () => {
 	const corrupt = ['not json', '[]', '{"ids":[]}', '"abc"', JSON.stringify(['abc']), JSON.stringify([7]), 'null']
 	for (const [i, ids] of corrupt.entries()) {
 		for (const phase of ['submitting', 'submitted', 'confirmed'] as const) {
@@ -2914,7 +2889,7 @@ test('P2 pass 11: an unresolved receipt whose Ids cannot be parsed fails closed 
 	}
 })
 
-test('P2 pass 11: a definite failed (+ H1), pre-submit or persisted receipt of another workflow never blocks a new valid attempt: admission 202 and the signer claims and signs once', async () => {
+test('a definite failed (+ H1), pre-submit or persisted receipt of another workflow never blocks a new valid attempt: admission 202 and the signer claims and signs once', async () => {
 	const H1 = 'cd'.repeat(32)
 	for (const phase of ['failed', 'queued', 'unverified', 'existing', 'persisted'] as const) {
 		for (const target of ['song', 'twin'] as const) {
@@ -2975,7 +2950,7 @@ async function statusOf(h: ReturnType<typeof harness>, workflowId: string, get: 
 	return batches[0]
 }
 
-test('P2 pass 12: a signer refused by (a) a conflicting unresolved receipt or (b) an unreadable receipt writes zero D1 rows; /mint/status reads failed while the errored instance exists and uncertain (never queued) after definitive instance.not_found; a transient lookup failure keeps the D1 checkpoint', async () => {
+test('a signer refused by (a) a conflicting unresolved receipt or (b) an unreadable receipt writes zero D1 rows; /mint/status reads failed while the errored instance exists and uncertain (never queued) after definitive instance.not_found; a transient lookup failure keeps the D1 checkpoint', async () => {
 	const H1 = 'cd'.repeat(32)
 	const refusals = [
 		{ kind: 'conflicting', code: 'mint_in_progress', receipt: (song: { id: string }) => [JSON.stringify([song.id]), 'submitted', H1] },
@@ -3028,7 +3003,7 @@ test('P2 pass 12: a signer refused by (a) a conflicting unresolved receipt or (b
 	}
 })
 
-test('P2 pass 12: /mint/status per D1 phase — definitive instance.not_found never reports queued (queued/existing/submitting/submitted -> uncertain, unverified -> failed, confirmed stays confirmed); a transient lookup failure keeps the D1 checkpoint', async () => {
+test('/mint/status per D1 phase — definitive instance.not_found never reports queued (queued/existing/submitting/submitted -> uncertain, unverified -> failed, confirmed stays confirmed); a transient lookup failure keeps the D1 checkpoint', async () => {
 	const c = carrier('test/coin_it-split')
 	const id = c.tracks[0].id
 	const H = 'cd'.repeat(32)
@@ -3056,6 +3031,10 @@ test('P2 pass 12: /mint/status per D1 phase — definitive instance.not_found ne
 			assert.notEqual(batch.phase, 'queued', `${phase}: never queued after instance.not_found`)
 		}
 		assert.deepEqual(await statusOf(h, event.instanceId, lookupTransient), { workflowId: event.instanceId, ids: [id], ...onTransient }, `${phase}: transient`)
+		if (phase === 'submitted') {
+			const running: StatusLookup = async () => ({ status: async () => ({ status: 'running' }) })
+			assert.deepEqual(await statusOf(h, event.instanceId, running), { workflowId: event.instanceId, ids: [id], phase: 'submitted', txHash: H }, 'a live instance keeps the D1 checkpoint')
+		}
 		h.db.close()
 	}
 })

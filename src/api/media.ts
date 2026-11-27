@@ -266,7 +266,7 @@ function recordSongPlay(c: Context<HonoEnv>, musicId: string): void {
 
 function notModifiedResponse(baseHeaders: Headers): Response {
 	const headers = new Headers()
-	for (const key of ['ETag', 'Last-Modified', 'Cache-Control', 'Accept-Ranges', 'Cache-Tag']) {
+	for (const key of ['ETag', 'Last-Modified', 'Cache-Control', 'Accept-Ranges']) {
 		const value = baseHeaders.get(key)
 		if (value) {
 			headers.set(key, value)

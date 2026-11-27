@@ -320,7 +320,8 @@ test('GET / vs GET /mine vs GET /:id: visibility, caching headers, and live Smol
 	assert.deepEqual(Object.keys(list.body[0]).sort(), ['Address', 'Created_At', 'Desc', 'Id', 'Smols', 'Title', 'Updated_At'])
 	assert.equal(list.res.headers.get('Cache-Control'), 'public, max-age=0, must-revalidate', 'browsers revalidate synchronously (no SWR window)')
 	assert.equal(list.res.headers.get('CDN-Cache-Control'), 'public, s-maxage=60, stale-while-revalidate=120', 'edge policy only')
-	assert.equal(list.res.headers.get('Cache-Tag'), 'mixtapes')
+	assert.equal(list.res.headers.get('Cache-Tag'), null, 'clients never see Cache-Tag')
+	assert.equal(new Headers(h.cache.entries()[0][1].headers).get('Cache-Tag'), 'mixtapes', 'the edge copy keeps its purge tag')
 	assert.ok(openedCacheNames.has('smol-workflow-mixtapes-v2') && !openedCacheNames.has('smol-workflow'), 'fresh v2 namespace')
 	assert.deepEqual(h.cache.keys(), [`https://api.smol.xyz/mixtapes?__mx_epoch=${h.epoch()}`], 'edge key carries the committed epoch')
 	const hit = await h.send('/mixtapes?__mx_epoch=999')
@@ -356,7 +357,8 @@ test('GET / vs GET /mine vs GET /:id: visibility, caching headers, and live Smol
 	assert.deepEqual([detail.body.Visibility, detail.body.Hidden_Reason, detail.body.Related_Mixtape_Id, detail.body.Smols.length], ['owner', 'duplicate', CORDOVA, 3])
 	assert.deepEqual(detail.body.Smols[0].Tags, ['lofi'])
 	assert.equal(detail.res.headers.get('X-Robots-Tag'), 'noindex')
-	assert.match(detail.res.headers.get('Cache-Tag')!, new RegExp(`mixtape:${CORDOVA_RETRY}`))
+	const detailCopy = h.cache.entries().find(([key]) => key.includes(`/mixtapes/${CORDOVA_RETRY}`))
+	assert.match(new Headers(detailCopy![1].headers).get('Cache-Tag')!, new RegExp(`mixtape:${CORDOVA_RETRY}`))
 	assert.equal((await h.send(`/mixtapes/${CORDOVA}`)).headers.get('X-Robots-Tag'), null)
 	assert.equal((await h.send('/mixtapes/doesnotexist')).status, 404)
 
@@ -662,7 +664,7 @@ function assertNoHiddenKeepers(decisions: Map<string, MixtapeDecision>, label: s
 
 const tick = () => new Promise((resolve) => setImmediate(resolve))
 
-test('P1-1 / P2-6: a concurrent target edit makes merge 409 without tombstoning the source; long merge chains stay one hop', async () => {
+test('a concurrent target edit makes merge 409 without tombstoning the source; long merge chains stay one hop', async () => {
 	const h = buildHarness()
 	let injected = false
 	h.hooks.onStatement = (sql) => {
@@ -702,7 +704,7 @@ test('P1-1 / P2-6: a concurrent target edit makes merge 409 without tombstoning 
 	assert.deepEqual([cycle.status, cycle.body.code], [404, undefined])
 })
 
-test('P1-2: a delayed AI verdict can never overwrite a newer edit\'s decision', async () => {
+test('a delayed AI verdict can never overwrite a newer edit\'s decision', async () => {
 	let releaseFirst!: () => void
 	const first = new Promise<void>((resolve) => { releaseFirst = resolve })
 	let calls = 0
@@ -740,7 +742,7 @@ test('P1-2: a delayed AI verdict can never overwrite a newer edit\'s decision', 
 	assert.ok(!(await h.json<Array<{ Id: string }>>('/mixtapes')).body.some((m) => m.Id === a))
 })
 
-test('P1-3: a song turning private invalidates a stored AI verdict immediately, with zero inference', async () => {
+test('a song turning private invalidates a stored AI verdict immediately, with zero inference', async () => {
 	const h = buildHarness({ ai: async () => clefAnswer(0.9) })
 	const A = [1, 2, 3, 4, 5, 6].map(SYN)
 	const B = [1, 2, 3, 4, 7, 8].map(SYN) // J = 4/8 → borderline; equal size keeps the newer B
@@ -763,7 +765,7 @@ test('P1-3: a song turning private invalidates a stored AI verdict immediately, 
 	assert.equal(h.aiCalls.length, 1, 'reads never infer')
 })
 
-test('P1-4: a delayed in-flight GET cannot refill the current cache key; purge runs even when recompute fails', async () => {
+test('a delayed in-flight GET cannot refill the current cache key; purge runs even when recompute fails', async () => {
 	const h = buildHarness()
 	for (const path of ['/mixtapes', `/mixtapes/${CORDOVA}`]) {
 		h.cache.hold()
@@ -801,7 +803,7 @@ test('P1-4: a delayed in-flight GET cannot refill the current cache key; purge r
 	assert.ok(['mixtapes', `mixtape:${CORDOVA_RETRY}`].every((tag) => purgedTagBatches.flat().includes(tag)), 'purge is guaranteed after commit')
 })
 
-test('P2-1: simultaneous identical POSTs claim atomically: zero provisional rows, consistent 201/200 receipts', async () => {
+test('simultaneous identical POSTs claim atomically: zero provisional rows, consistent 201/200 receipts', async () => {
 	const h = buildHarness()
 	h.db.exec(`CREATE TEMP TABLE inserted_log (Id TEXT); CREATE TEMP TRIGGER log_mixtape_insert AFTER INSERT ON main.Mixtapes BEGIN INSERT INTO inserted_log VALUES (NEW.Id); END;`)
 	let arrivals = 0
@@ -836,7 +838,7 @@ test('P2-1: simultaneous identical POSTs claim atomically: zero provisional rows
 	assert.notEqual(afterDelete.body.id, afterEdit.body.id)
 })
 
-test('P2-2 / P2-3: pointers only target listed keepers; 3+ track reorders reach Tier 2', async () => {
+test('pointers only target listed keepers; 3+ track reorders reach Tier 2', async () => {
 	const mk = (id: string, tracks: number[], createdAt: string, title = 'Mix', desc = ''): MixtapeCandidate => ({
 		id, address: NEW_OWNER, title, desc, createdAt, publicTracks: tracks.map(SYN),
 	})
@@ -882,7 +884,7 @@ test('P2-2 / P2-3: pointers only target listed keepers; 3+ track reorders reach 
 	assert.deepEqual([h.row(original)!.Hidden_Reason, h.row(original)!.Related_Mixtape_Id], ['semantic_duplicate', reordered.body.id])
 })
 
-test('P2-4: the clef-flash parser rejects error envelopes and malformed payloads before using a probability', async () => {
+test('the clef-flash parser rejects error envelopes and malformed payloads before using a probability', async () => {
 	const valid = clefAnswer(0.99)
 	assert.equal(parseMixtapeDedupeResponse(valid)?.pDuplicate, 0.99)
 	assert.equal(parseMixtapeDedupeResponse({ success: true, errors: [], result: valid })?.pDuplicate, 0.99)
@@ -921,7 +923,7 @@ test('P2-4: the clef-flash parser rejects error envelopes and malformed payloads
 	assert.equal(JSON.parse(h.row(b.body.id)!.Ai_Verdict).fallback, 'invalid_response')
 })
 
-test('P2-5: owner-route errors (401/400/403/404/409) carry private no-store headers', async () => {
+test('owner-route errors (401/400/403/404/409) carry private no-store headers', async () => {
 	const h = buildHarness()
 	const cases: Array<[string, Parameters<typeof h.send>[1], number]> = [
 		['/mixtapes/mine', {}, 401],
@@ -948,7 +950,7 @@ test('P2-5: owner-route errors (401/400/403/404/409) carry private no-store head
 // Pass-2 regressions (reports/25b-review-mixtape-be.md §Pass 2)
 // ---------------------------------------------------------------------------
 
-test('Pass 2 P1-1: a competing merge returns 409 without touching the winner\'s target', async () => {
+test('a competing merge returns 409 without touching the winner\'s target', async () => {
 	const h = buildHarness()
 	const create = async (title: string, smols: string[]) => (await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title, smols } })).body.id as string
 	const target = await create('Target', [SYN(1), SYN(2)])
@@ -972,7 +974,7 @@ test('Pass 2 P1-1: a competing merge returns 409 without touching the winner\'s 
 	assert.deepEqual([s.Hidden_Reason, s.Related_Mixtape_Id, s.Revision], ['merged', target, 2], 'source tombstoned exactly once')
 })
 
-test('Pass 2 P1-2: a late fail-open evaluation of the same revisions cannot overwrite a committed 0.95 verdict', async () => {
+test('a late fail-open evaluation of the same revisions cannot overwrite a committed 0.95 verdict', async () => {
 	let failFirst!: (error: Error) => void
 	let markFirstCalled!: () => void
 	const firstCalled = new Promise<void>((resolve) => { markFirstCalled = resolve })
@@ -1019,7 +1021,7 @@ test('Pass 2 P1-2: a late fail-open evaluation of the same revisions cannot over
 	assert.ok(!(await h.json<Array<{ Id: string }>>('/mixtapes')).body.some((m) => m.Id === xId))
 })
 
-test('Pass 2 P2-2: a song privacy flip during pending clef inference yields an accurate post-flip receipt', async () => {
+test('a song privacy flip during pending clef inference yields an accurate post-flip receipt', async () => {
 	let resolveAi!: (value: unknown) => void
 	const h = buildHarness({ ai: () => new Promise((resolve) => { resolveAi = resolve }) })
 	const a = (await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title: 'Season', smols: [1, 2, 3, 4, 5, 6].map(SYN) } })).body.id as string
@@ -1039,7 +1041,7 @@ test('Pass 2 P2-2: a song privacy flip during pending clef inference yields an a
 // Pass-3 regressions (reports/25b-review-mixtape-be.md §Pass 3)
 // ---------------------------------------------------------------------------
 
-test('Pass 3 P1: a late verdict cannot contradict a committed adjudication of the same pair stored on the other row', async () => {
+test('a late verdict cannot contradict a committed adjudication of the same pair stored on the other row', async () => {
 	let resolveFirst!: (value: unknown) => void
 	let markFirstCalled!: () => void
 	const firstCalled = new Promise<void>((resolve) => { markFirstCalled = resolve })
@@ -1092,7 +1094,7 @@ test('Pass 3 P1: a late verdict cannot contradict a committed adjudication of th
 	assert.equal(h.aiCalls.length, 3)
 })
 
-test('Pass 3 P2: an identical POST during the winner\'s Clef inference reports the same final visibility', async () => {
+test('an identical POST during the winner\'s Clef inference reports the same final visibility', async () => {
 	let resolveAi!: (value: unknown) => void
 	const h = buildHarness({ ai: () => new Promise((resolve) => { resolveAi = resolve }) })
 	const bigger = (await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title: 'Full set', smols: [1, 2, 3, 4, 6, 7, 8].map(SYN) } })).body.id as string
@@ -1113,7 +1115,7 @@ test('Pass 3 P2: an identical POST during the winner\'s Clef inference reports t
 	assert.equal((h.db.prepare('SELECT Finalized FROM MixtapeRetryClaim').all() as Array<{ Finalized: number }>).filter((r) => r.Finalized === 1).length, 2)
 })
 
-test('Pass 3 P2: a no-op PATCH keeps the 15-minute exact-retry protection', async () => {
+test('a no-op PATCH keeps the 15-minute exact-retry protection', async () => {
 	const h = buildHarness()
 	const body = { title: 'Quiet Hours', smols: [SYN(1), SYN(2)] }
 	const created = await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })
@@ -1124,7 +1126,7 @@ test('Pass 3 P2: a no-op PATCH keeps the 15-minute exact-retry protection', asyn
 	assert.equal((h.db.prepare(`SELECT COUNT(*) AS n FROM Mixtapes WHERE Title = 'Quiet Hours'`).get() as { n: number }).n, 1)
 })
 
-test('Pass 3 P2: non-200 public responses (deleted / merged / unknown 404) are never shareable', async () => {
+test('non-200 public responses (deleted / merged / unknown 404) are never shareable', async () => {
 	const h = buildHarness()
 	assert.equal((await h.send(`/mixtapes/${CORDOVA}`, { method: 'DELETE', as: CORDOVA_OWNER })).status, 200)
 	assert.equal((await h.send(`/mixtapes/${CREASY_V1}/merge`, { method: 'POST', as: CREASY_OWNER, body: { targetId: CREASY_V2 } })).status, 200)
@@ -1155,7 +1157,7 @@ async function seedBiggerSibling(h: ReturnType<typeof buildHarness>) {
 const countTitled = (h: ReturnType<typeof buildHarness>, title: string) => (h.db.prepare('SELECT COUNT(*) AS n FROM Mixtapes WHERE Title = ?').get(title) as { n: number }).n
 const claimState = (h: ReturnType<typeof buildHarness>, id: string) => (h.db.prepare('SELECT Finalized FROM MixtapeRetryClaim WHERE Mixtape_Id = ?').get(id) as { Finalized: number } | undefined)?.Finalized
 
-test('Pass 4 P2-1a: a replay that outlasts an unfinished classification gets a retryable 503, never a premature 200', async () => {
+test('a replay that outlasts an unfinished classification gets a retryable 503, never a premature 200', async () => {
 	const h = buildHarness({ ai: async () => clefAnswer(0.95) })
 	await seedBiggerSibling(h)
 	let release!: () => void
@@ -1186,7 +1188,7 @@ test('Pass 4 P2-1a: a replay that outlasts an unfinished classification gets a r
 	assert.equal(countTitled(h, 'Early set'), 1)
 })
 
-test('Pass 4 P2-1b: a failed or abandoned classification is recovered by a replay on the SAME row', async () => {
+test('a failed or abandoned classification is recovered by a replay on the SAME row', async () => {
 	const h = buildHarness({ ai: async () => clefAnswer(0.95) })
 	await seedBiggerSibling(h)
 	let failed = false
@@ -1221,7 +1223,7 @@ test('Pass 4 P2-1b: a failed or abandoned classification is recovered by a repla
 	assert.equal(countTitled(h, 'Solo pair'), 1)
 })
 
-test('Pass 4 P2-2: a delete or edit between replay reads never yields a 500 or a false 200', async () => {
+test('a delete or edit between replay reads never yields a 500 or a false 200', async () => {
 	for (const change of ['delete', 'edit'] as const) {
 		const h = buildHarness()
 		const body = { title: `Replay ${change}`, smols: [SYN(1), SYN(2)] }
@@ -1254,7 +1256,7 @@ test('Pass 4 P2-2: a delete or edit between replay reads never yields a 500 or a
 
 const claimRow = (h: ReturnType<typeof buildHarness>, id: string) => h.db.prepare('SELECT Finalized, Attempt_Token FROM MixtapeRetryClaim WHERE Mixtape_Id = ?').get(id) as { Finalized: number; Attempt_Token: string } | undefined
 
-test('Pass 5 P2-1: when every guarded classification write rolls back, the create is 503 create_pending (never 201) and recovers on retry', async () => {
+test('when every guarded classification write rolls back, the create is 503 create_pending (never 201) and recovers on retry', async () => {
 	const h = buildHarness({ ai: async () => clefAnswer(0.95) })
 	await seedBiggerSibling(h)
 	let unrelatedWrites = 0
@@ -1282,7 +1284,7 @@ test('Pass 5 P2-1: when every guarded classification write rolls back, the creat
 	assert.equal(countTitled(h, 'Early set'), 1)
 })
 
-test('Pass 5 P2-2: delete-then-restore between the replay read and the next claim check keeps one live row', async () => {
+test('delete-then-restore between the replay read and the next claim check keeps one live row', async () => {
 	const h = buildHarness()
 	const body = { title: 'Undo me', smols: [SYN(1), SYN(2)] }
 	const original = (await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })).body.id as string
@@ -1305,7 +1307,7 @@ test('Pass 5 P2-2: delete-then-restore between the replay read and the next clai
 	assert.equal(countTitled(h, 'Undo me'), 1)
 })
 
-test('Pass 5 P2-3: an expired holder failing after a takeover cannot flip the recovered claim from finalized to failed', async () => {
+test('an expired holder failing after a takeover cannot flip the recovered claim from finalized to failed', async () => {
 	const h = buildHarness()
 	let release!: () => void
 	const gate = new Promise<void>((resolve) => { release = resolve })
@@ -1345,7 +1347,7 @@ test('Pass 5 P2-3: an expired holder failing after a takeover cannot flip the re
 // Pass-6 regressions (reports/25b-review-mixtape-be.md §Pass 6)
 // ---------------------------------------------------------------------------
 
-test('Pass 6 P2-1: Undo right before the atomic replacement batch still yields the original as the only live row', async () => {
+test('Undo right before the atomic replacement batch still yields the original as the only live row', async () => {
 	const h = buildHarness()
 	const body = { title: 'Undo late', smols: [SYN(1), SYN(2)] }
 	const original = (await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body })).body.id as string
@@ -1375,7 +1377,7 @@ test('Pass 6 P2-1: Undo right before the atomic replacement batch still yields t
 	assert.equal(claimRow(h, original)?.Finalized, 1, 'the claim was never released')
 })
 
-test('Pass 6 P2-2: an expired creator whose finalize affects 0 rows returns the current committed verdict, never its stale one', async () => {
+test('an expired creator whose finalize affects 0 rows returns the current committed verdict, never its stale one', async () => {
 	let calls = 0
 	const h = buildHarness({
 		ai: async () => {
@@ -1422,7 +1424,7 @@ test('Pass 6 P2-2: an expired creator whose finalize affects 0 rows returns the 
 // Pass-7 regressions (reports/25b-review-mixtape-be.md §Pass 7)
 // ---------------------------------------------------------------------------
 
-test('Pass 7 P2-1: an expired creator waking after recovery finalized never calls Clef nor rewrites the verdict', async () => {
+test('an expired creator waking after recovery finalized never calls Clef nor rewrites the verdict', async () => {
 	let calls = 0
 	const h = buildHarness({
 		ai: async () => {
@@ -1463,7 +1465,7 @@ test('Pass 7 P2-1: an expired creator waking after recovery finalized never call
 	assert.deepEqual([next.status, next.body.visibility], [200, 'public'])
 })
 
-test('Pass 7 P2-2: a superseded recovery never reports deduplicated:true for content the owner changed after takeover', async () => {
+test('a superseded recovery never reports deduplicated:true for content the owner changed after takeover', async () => {
 	const h = buildHarness()
 	const body = { title: 'Morning set', smols: [SYN(1), SYN(2)] }
 	let failed = false
@@ -1508,7 +1510,7 @@ test('Pass 7 P2-2: a superseded recovery never reports deduplicated:true for con
 	assert.deepEqual([h.row(id)!.Title, h.row(id)!.Revision], ['Evening set', 2], 'the edited mixtape is untouched')
 })
 
-test('Pass 7 P2-1b: losing the claim during inference (no epoch change) aborts the guarded write batch itself', async () => {
+test('losing the claim during inference (no epoch change) aborts the guarded write batch itself', async () => {
 	let resolveAi!: (value: unknown) => void
 	const h = buildHarness({ ai: () => new Promise((resolve) => { resolveAi = resolve }) })
 	await seedBiggerSibling(h)
@@ -1530,7 +1532,7 @@ test('Pass 7 P2-1b: losing the claim during inference (no epoch change) aborts t
 // Pass-8 regressions (reports/25b-review-mixtape-be.md §Pass 8)
 // ---------------------------------------------------------------------------
 
-test('Pass 8 P2a/b: an owner DELETE or PATCH while the creator awaits Clef yields 409 create_conflict, never 500 or a mismatched 201', async () => {
+test('an owner DELETE or PATCH while the creator awaits Clef yields 409 create_conflict, never 500 or a mismatched 201', async () => {
 	for (const change of ['delete', 'patch'] as const) {
 		let resolveAi!: (value: unknown) => void
 		const h = buildHarness({ ai: () => new Promise((resolve) => { resolveAi = resolve }) })
@@ -1556,7 +1558,7 @@ test('Pass 8 P2a/b: an owner DELETE or PATCH while the creator awaits Clef yield
 	}
 })
 
-test('Pass 8 P2c: an owner DELETE right after commit on PATCH, restore and merge is reported, never a 500', async () => {
+test('an owner DELETE right after commit on PATCH, restore and merge is reported, never a 500', async () => {
 	const h = buildHarness()
 	const create = async (title: string, smols: string[]) => (await h.json('/mixtapes', { method: 'POST', as: NEW_OWNER, body: { title, smols } })).body.id as string
 	const deleteRightAfterCommit = (id: string) => {
@@ -1604,7 +1606,7 @@ test('Pass 8 P2c: an owner DELETE right after commit on PATCH, restore and merge
 // Pass-9 regression (reports/25b-review-mixtape-be.md §Pass 9)
 // ---------------------------------------------------------------------------
 
-test('Pass 9 P2: an owner DELETE or PATCH while an active recovery awaits Clef re-enters create (201), never 503', async () => {
+test('an owner DELETE or PATCH while an active recovery awaits Clef re-enters create (201), never 503', async () => {
 	for (const change of ['patch', 'delete'] as const) {
 		let calls = 0
 		let resolveRecovery!: (value: unknown) => void
@@ -1650,7 +1652,7 @@ test('Pass 9 P2: an owner DELETE or PATCH while an active recovery awaits Clef r
 	}
 })
 
-test('47b B1: the shared GET /mixtapes edge copy never replays one origin\'s CORS headers to another', async () => {
+test('the shared GET /mixtapes edge copy never replays one origin\'s CORS headers to another', async () => {
 	const h = buildHarness()
 
 	const first = await h.send('/mixtapes', { origin: 'https://noot.smol.xyz' })
@@ -1676,7 +1678,7 @@ test('47b B1: the shared GET /mixtapes edge copy never replays one origin\'s COR
 	assert.equal(foreign.headers.get('Access-Control-Allow-Origin'), null, 'a disallowed origin never inherits a cached allow-origin')
 })
 
-test('48b: a warm pre-deploy edge entry that still carries CORS/Vary headers is stripped on the HIT path', async () => {
+test('a warm pre-deploy edge entry that still carries CORS/Vary headers is stripped on the HIT path', async () => {
 	const h = buildHarness()
 
 	const first = await h.send('/mixtapes', { origin: 'https://noot.smol.xyz' })

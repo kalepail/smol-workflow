@@ -674,14 +674,7 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
 				}
 
 				const ownerSub = event.payload.ownerSub ?? event.payload.sub;
-				const userTags = new Set([
-					artistSmolsCacheTag(ownerSub),
-					`user:${ownerSub}:created`,
-					`user:${ownerSub}:smol:${id}`,
-					`user:${event.payload.sub}:smol:${id}`,
-				]);
-
-				await purgeMintCaches(this.env, [id], [...userTags, `smol:${id}:anonymous`]);
+				await purgeMintCaches(this.env, [id], [artistSmolsCacheTag(ownerSub), `smol:${id}:anonymous`]);
 			});
 		} else if (event.payload.type === 'batch-mint') {
 			await step.do('persist batch mint metadata', config, async () => {
@@ -737,9 +730,6 @@ export class TxWorkflow extends WorkflowEntrypoint<Env, WorkflowTxParams> {
 					persistedIds.push(id);
 					const ownerSub = event.payload.ownerSubsById?.[id] ?? event.payload.sub;
 					smolCacheTags.add(artistSmolsCacheTag(ownerSub));
-					smolCacheTags.add(`user:${ownerSub}:created`);
-					smolCacheTags.add(`user:${ownerSub}:smol:${id}`);
-					smolCacheTags.add(`user:${event.payload.sub}:smol:${id}`);
 					smolCacheTags.add(`smol:${id}:anonymous`);
 				}
 

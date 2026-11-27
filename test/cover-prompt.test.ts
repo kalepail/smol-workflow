@@ -9,7 +9,6 @@ import {
 	hasExplicitVisualInstrument,
 	MAX_COVER_INPUT_CHARS,
 	MAX_COVER_PROMPT_CHARS,
-	MOOD_SCENE_BUCKETS,
 	NEUTRAL_MOTIFS,
 	parseCoverPromptJson,
 	resolveCoverPrompt,
@@ -50,25 +49,14 @@ const VALID_SCENE_OUTPUT: CoverPromptModelOutput = {
 	light: 'warm yellow and peach morning glow',
 }
 
-// ============================================================================
-// 1. Invariant checks across ALL curated templates & neutral motifs
-// ============================================================================
-test('every curated mood template and neutral motif passes all cover lexical guards', () => {
+test('every neutral motif passes all cover lexical guards', () => {
 	for (const motif of NEUTRAL_MOTIFS) {
 		assert.equal(verifyTextPassesCoverGuards(motif), null, `motif failed guard: ${motif}`)
-	}
-	for (const bucket of MOOD_SCENE_BUCKETS) {
-		for (const tpl of bucket.templates) {
-			assert.equal(verifyTextPassesCoverGuards(tpl.text), null, `bucket ${bucket.name} template failed guard: ${tpl.text}`)
-			assert.ok(tpl.text.length <= 200, `bucket ${bucket.name} template too long: ${tpl.text.length}`)
-		}
+		assert.ok(motif.length <= 160, `motif too long: ${motif}`)
 	}
 })
 
-// ============================================================================
-// 2. Two-key explicit visual-instrument carve-out (#162 passes; 9 audit traps blocked)
-// ============================================================================
-test('two-key carve-out allows #162 explicit visual guitars and blocks all non-visual instrument prompts', () => {
+test('two-key carve-out allows explicit visual instruments and blocks non-visual instrument prompts', () => {
 	// Positive control: #162
 	const p162 = 'Godzilla and King Kong dressed as daft punk playing guitar as a band. The music is retro funk and EDM mix'
 	assert.equal(
@@ -111,7 +99,7 @@ test('two-key carve-out allows #162 explicit visual guitars and blocks all non-v
 	assert.equal(hasExplicitVisualInstrument('a cat playing guitar and drums in space', 'drum', 'a cat playing guitar and drums'), true)
 })
 
-test('audit fixes: role nouns, mood+figures clamp, portrait phrases, lexicon additions, false positives, and apostrophes', () => {
+test('guards: role nouns, mood+figures clamp, portrait phrases, lexicon additions, false positives, and apostrophes', () => {
 	// Mood + kind: "figures" with empty harbor clamps to scene (never appends "small full-body figures")
 	const moodHarbor: CoverPromptModelOutput = {
 		theme: 'calm harbor twilight',
@@ -191,7 +179,7 @@ test('audit fixes: role nouns, mood+figures clamp, portrait phrases, lexicon add
 	assert.match(rLong.prompt, /steaming bowl of oatmeal/)
 })
 
-test('validateAndAssembleCoverPrompt preserves #162 guitars and stage when both keys agree', () => {
+test('validateAndAssembleCoverPrompt keeps explicitly drawn guitars and stage when both keys agree', () => {
 	const p162 = 'Godzilla and King Kong dressed as daft punk playing guitar as a band. The music is retro funk and EDM mix'
 	const modelOut: CoverPromptModelOutput = {
 		theme: 'giant monsters performing in robot helmets',
@@ -212,9 +200,6 @@ test('validateAndAssembleCoverPrompt preserves #162 guitars and stage when both 
 	assert.ok(res.prompt.length <= MAX_COVER_PROMPT_CHARS)
 })
 
-// ============================================================================
-// 3. Lexical leak guards, repair order, and portrait suppression
-// ============================================================================
 test('instrument leak in subject repairs from surviving setting without a second AI call', () => {
 	const p001 = '1OF1 — OATMEAL & NINE LIVES\n[STYLE: acoustic guitar]\nPut the kettle on'
 	const leakyModel: CoverPromptModelOutput = {
@@ -295,9 +280,6 @@ test('audio gear is blocked unless prompted and allowed when user asked for it',
 	assert.match(allowed.prompt, /cassette/i)
 })
 
-// ============================================================================
-// 4. Strict JSON parser rejects song-intent JSON, extra keys, prose wrap, refusals
-// ============================================================================
 test('parseCoverPromptJson rejects song-intent JSON, arrays, and prose-wrapped JSON while tolerating optional/extra keys', () => {
 	const songIntentJson = '{"mode":"write","lyrics_lines":null,"title":null,"vocal_gender":"f","styles":["rock"],"exclusions":[]}'
 	assert.equal(parseCoverPromptJson(songIntentJson).output, null)
@@ -344,10 +326,7 @@ test('refusals, assistant dialogue, URLs, and lyric dumps inside valid JSON fall
 	}
 })
 
-// ============================================================================
-// 5. Deterministic fallback across all tricky audit prompts & adversarial inputs
-// ============================================================================
-test('deterministicCoverPrompt is stable, clean, and instrument-free across audit & adversarial inputs', () => {
+test('deterministicCoverPrompt is stable, clean, and instrument-free across tricky and adversarial inputs', () => {
 	const trickyPrompts = [
 		'1OF1 — OATMEAL & NINE LIVES\n[STYLE: acoustic progressive guitar, slap harmonics]\nPut the kettle on',
 		'blue rock song with more instrumental less vocal, english',
@@ -375,9 +354,12 @@ test('deterministicCoverPrompt is stable, clean, and instrument-free across audi
 		assert.doesNotMatch(out1, /ignore previous|https?:|guital|guitar|violin|piano/i, `unsafe leak in case ${i}: ${out1}`)
 	}
 
-	// Verify Nepali prompt maps to Himalayan landscape template
-	const nepali = deterministicCoverPrompt('Nepale language epic rock and roll song', false, 'smol-nepali')
-	assert.match(nepali, /Himalayan|mountain pass/i)
+	// Prompts with no drawable subject get a seeded neutral motif scene, never a keyword-matched template
+	for (const [i, p] of ['Nepale language epic rock and roll song', 'birthday edm banger with heavy bass, 128 bpm', 'melancholy heartbreak piano ballad, slow tempo'].entries()) {
+		const scene = deterministicCoverPrompt(p, false, `smol-motif-${i}`)
+		assert.ok(NEUTRAL_MOTIFS.some((motif) => scene.startsWith(motif)), `expected a neutral motif scene: ${scene}`)
+		assert.doesNotMatch(scene, /Himalayan|prayer flags|birthday|cake/i)
+	}
 
 	// Verify #161 preserves clean topic subject without leaking guitar solo
 	const mc = deterministicCoverPrompt('Monster Motorcycle Club. Include 30 second guitar solo and keyboards. [blues, acid rock]', false, 'smol-161')
@@ -407,9 +389,6 @@ test('deterministicCoverPrompt is stable, clean, and instrument-free across audi
 	assert.equal(sliced.isWellFormed?.() ?? true, true)
 })
 
-// ============================================================================
-// 6. Timeout, missing AI binding, AI error, and late resolution resilience
-// ============================================================================
 test('resolveCoverPrompt falls back deterministically on missing AI, error, and timeout without unhandled rejections', async () => {
 	const missingEnv = {} as unknown as Env
 	const r1 = await resolveCoverPrompt(missingEnv, 'soft rock and roll english', false, 'smol-t1')
@@ -468,9 +447,6 @@ test('buildCoverPromptUserMessage selects 3 distinct deterministic motifs per sm
 	assert.equal(new Set(items).size, 3)
 })
 
-// ============================================================================
-// 7. PixelLab transport payload contract (default vs legacy rollback)
-// ============================================================================
 test('pixellab omits deprecated negative_description and sprite view/direction by default, and preserves them in legacy mode', async () => {
 	const originalFetch = globalThis.fetch
 	const bodies: Array<Record<string, unknown>> = []

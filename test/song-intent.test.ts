@@ -15,7 +15,7 @@ import {
 	sanitizeLyrics,
 	SONG_INTENT_MODEL,
 } from '../src/ai/song-intent'
-import { generateLyrics, generateSongs, replayAisgTaskSubmit, submitAisgTask } from '../src/ai/aisonggenerator'
+import { generateLyrics, replayAisgTaskSubmit, submitAisgTask } from '../src/ai/aisonggenerator'
 
 // Real prompts + the recorded DeepSeek v4.1 flash text for each (no live calls in tests).
 type Fixture = { prompt: string; instrumental: boolean; deepseek: string; songwriter?: AiSongGeneratorLyrics }
@@ -175,7 +175,7 @@ test('model call: no gateway option, json_object, null on 429 / junk / timeout, 
 	assert.ok(!logs[0].includes('secret') && !logs[1].includes('secret'))
 })
 
-test('AISG wire: old lyrics give byte-identical submit/replay/legacy bodies; new lyrics add vocalGender + string negativeTags and an empty instrumental caption', async () => {
+test('AISG wire: old lyrics give byte-identical submit/replay bodies; new lyrics add vocalGender + string negativeTags and an empty instrumental caption', async () => {
 	const bodies: Record<string, string> = {}
 	const headersByPath: Record<string, Headers> = {}
 	const env = {
@@ -185,7 +185,7 @@ test('AISG wire: old lyrics give byte-identical submit/replay/legacy bodies; new
 				bodies[path] = String(init.body)
 				headersByPath[path] = new Headers(init.headers)
 				if (path === '/api/lyrics') return Response.json({ title: 't', style: ['a', 'b'], lyrics: 'l', service: 'aisonggenerator.io', model: 'openrouter/auto' })
-				return Response.json(path === '/api/songs' ? ['s1', 's2'] : { task_id: 'task-1' })
+				return Response.json({ task_id: 'task-1' })
 			},
 		},
 	} as unknown as Env
@@ -195,8 +195,6 @@ test('AISG wire: old lyrics give byte-identical submit/replay/legacy bodies; new
 		assert.equal(headersByPath['/api/tasks'].get('x-smol-id'), 'smol-wire-1')
 		await replayAisgTaskSubmit(env, 'raw prompt', 'pixel caption', lyrics, true, instrumental, 'key-1', 'smol-wire-1')
 		assert.equal(bodies['/api/tasks'], submit, 'replay body === submit body')
-		await generateSongs(env, 'raw prompt', 'pixel caption', lyrics, true, instrumental, 'key-1', 'smol-wire-1')
-		assert.equal(bodies['/api/songs'], submit, 'legacy body === submit body')
 		return submit
 	}
 

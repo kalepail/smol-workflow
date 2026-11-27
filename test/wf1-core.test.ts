@@ -166,9 +166,11 @@ test('public list cache: warm HIT with request-matched CORS, unlisted origins by
 	const coldBody = await cold.text()
 	assert.equal(cold.headers.get('Access-Control-Allow-Origin'), 'https://smol.xyz')
 	assert.equal(cold.headers.get('Cache-Control'), 'public, max-age=30, s-maxage=30, stale-while-revalidate=60')
+	assert.equal(cold.headers.get('Cache-Tag'), null, 'clients never see Cache-Tag')
 	assert.equal(edge.stats.putCalls, 1)
 	const [stored] = edge.entries.values()
 	assert.ok(stored.headers.every(([name]) => !name.startsWith('access-control-') && name !== 'vary'), 'shared copy is origin-neutral')
+	assert.deepEqual(stored.headers.find(([name]) => name === 'cache-tag'), ['cache-tag', 'public-smols'], 'the cached copy keeps its purge tag')
 
 	h.smol(id('c'))
 	const warm = await h.send('/?limit=5', { headers: { Origin: 'https://noot.smol.xyz' } })
@@ -201,8 +203,9 @@ test('public list cache: warm HIT with request-matched CORS, unlisted origins by
 	const playlist = await h.send(`/playlist/${encodeURIComponent(title)}`)
 	const tag = await playlistCacheTag(title)
 	assert.match(tag, /^playlist:[0-9a-f]{64}$/)
-	assert.equal(playlist.headers.get('Cache-Tag'), tag)
+	assert.equal(playlist.headers.get('Cache-Tag'), null)
 	assert.equal(edge.stats.putCalls, 2)
+	assert.deepEqual([...edge.entries.values()][1].headers.find(([name]) => name === 'cache-tag'), ['cache-tag', tag])
 
 	const failing = harness()
 	failing.env.SMOL_D1 = { prepare() { throw new Error('D1 secret internals') } } as unknown as D1Database
@@ -256,7 +259,8 @@ test('DELETE /:id: owner only, 409 for minted or minting, atomic guard, shared M
 	assert.deepEqual(h.flushed, [id('a')])
 	assert.deepEqual(h.queue.map((message) => message.type), ['delete'])
 	const tags = purged.flat()
-	for (const expected of ['public-smols', `user:${OTHER}:liked`, `song:mp3-a:media`, await playlistCacheTag('mix')]) assert.ok(tags.includes(expected), expected)
+	for (const expected of ['public-smols', `smol:${id('a')}:media`, `song:mp3-a:media`, await playlistCacheTag('mix')]) assert.ok(tags.includes(expected), expected)
+	assert.ok(!tags.some((tag) => tag.startsWith('user:')), 'per-user tags label nothing cached and are never purged')
 })
 
 test('DELETE /admin/bulk: admin JSON body, Mint_Token/Mint_Amm/receipt guards, allowPublic skip semantics', async () => {

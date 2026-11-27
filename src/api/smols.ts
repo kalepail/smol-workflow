@@ -32,7 +32,6 @@ const smols = new Hono<HonoEnv>()
 // Keep these in sync with smol-fe generation controls and provider payload limits.
 const MAX_LYRICAL_PROMPT_LENGTH = 2280
 const MAX_INSTRUMENTAL_PROMPT_LENGTH = 380
-const CURRENT_WORKFLOW_VERSION = 2
 
 interface SmolListItem {
 	Id: string
@@ -500,7 +499,6 @@ smols.get(
 
 			if (payload?.sub) {
 				response.headers.set('Cache-Control', 'private, max-age=30')
-				response.headers.append('Cache-Tag', `user:${payload.sub}:smol:${id}`)
 			} else {
 				response.headers.set('Cache-Control', 'public, max-age=30, stale-while-revalidate=60')
 				response.headers.append('Cache-Tag', `smol:${id}:anonymous`)
@@ -617,7 +615,6 @@ async function createSmolGeneration(
 		quota_day_key: reserveResult.dayKey,
 		quota_provider: provider,
 		quota_reuse_only: false,
-		workflow_version: CURRENT_WORKFLOW_VERSION,
 	}
 
 	const doid = env.DURABLE_OBJECT.idFromString(instanceId)
@@ -642,7 +639,6 @@ async function createSmolGeneration(
 					instrumental: workflowParams.instrumental,
 					...(workflowParams.playlist ? { playlist: workflowParams.playlist } : {}),
 					provider: workflowParams.provider,
-					workflow_version: workflowParams.workflow_version,
 				},
 				requested_provider: provider,
 				active_provider: provider,
@@ -1158,7 +1154,6 @@ smols.post('/retry/:id', optionalAuth, async (c) => {
 		public: retrySteps.payload!.public ?? true,
 		instrumental: retrySteps.payload!.instrumental ?? false,
 		provider: effectiveProvider,
-		workflow_version: CURRENT_WORKFLOW_VERSION,
 	}
 
 	let quotaReservationId: string | undefined
@@ -1444,7 +1439,6 @@ smols.post('/retry/:id', optionalAuth, async (c) => {
 		...(quotaDayKey ? { quota_day_key: quotaDayKey } : {}),
 		...(quotaProvider ? { quota_provider: quotaProvider } : {}),
 		quota_reuse_only: quotaReuseOnly,
-		workflow_version: CURRENT_WORKFLOW_VERSION,
 	}
 
 	let createdInstance: WorkflowInstance | null = null
@@ -1524,13 +1518,17 @@ smols.put('/:id', parseAuth, async (c) => {
 	const id = req.param('id')
 	const payload = c.get('jwtPayload')!
 
-	const smolRecord = await env.SMOL_D1.prepare(`
+	type VisibilityRow = { Public: number; Mint_Token?: string | null; Mint_Amm?: string | null }
+	const selectVisibility = () => env.SMOL_D1.prepare(`
 		SELECT Public, Mint_Token, Mint_Amm
 		FROM Smols
 		WHERE Id = ?1 AND "Address" = ?2
-	`)
-		.bind(id, payload.sub)
-		.first<{ Public: number; Mint_Token?: string | null; Mint_Amm?: string | null }>()
+	`).bind(id, payload.sub)
+
+	const [smolRecord, playlistTitles] = await Promise.all([
+		selectVisibility().first<VisibilityRow>(),
+		getPlaylistTitlesForSmol(env, id),
+	])
 
 	if (!smolRecord) {
 		throw new HTTPException(404, { message: 'Smol not found or not owned by you' })
@@ -1570,23 +1568,18 @@ smols.put('/:id', parseAuth, async (c) => {
 		WHERE Id = ?2 AND "Address" = ?3 AND Public = ?4
 	`
 
-	await env.SMOL_D1.prepare(updateSql)
-		.bind(targetPublic, id, payload.sub, currentPublic)
-		.run()
-
-	const updated = await env.SMOL_D1.prepare(`
-		SELECT Public, Mint_Token, Mint_Amm
-		FROM Smols
-		WHERE Id = ?1 AND "Address" = ?2
-	`)
-		.bind(id, payload.sub)
-		.first<{ Public: number; Mint_Token?: string | null; Mint_Amm?: string | null }>()
+	// The compare-and-set and the re-read run in one atomic D1 batch (one round trip).
+	const [, reread] = await env.SMOL_D1.batch<VisibilityRow>([
+		env.SMOL_D1.prepare(updateSql).bind(targetPublic, id, payload.sub, currentPublic),
+		selectVisibility(),
+	])
+	const updated = reread?.results?.[0] ?? null
 
 	const visibleUpdate = requireOwnedVisibilityToggle(updated)
 	if (targetPublic === 0 && visibleUpdate.Public === 1 && updated && isMintedSmolRecord(updated)) {
 		throw new HTTPException(409, { message: 'Minted songs must remain public' })
 	}
-	const playlistTags = await playlistCacheTags(await getPlaylistTitlesForSmol(env, id))
+	const playlistTags = await playlistCacheTags(playlistTitles)
 
 	runBackground(
 		c,
@@ -1607,8 +1600,6 @@ smols.put('/:id', parseAuth, async (c) => {
 			artistSmolsCacheTag(payload.sub),
 			'public-smols',
 			'mixtapes',
-			`user:${payload.sub}:created`,
-			`user:${payload.sub}:smol:${id}`,
 			`smol:${id}:anonymous`,
 			`smol:${id}:media`,
 			...playlistTags,
@@ -1651,11 +1642,9 @@ smols.put('/:smol_id/:song_id', parseAuth, async (c) => {
 	runBackground(
 		c,
 		purgeCacheByTags([
-			`user:${payload.sub}:smol:${smol_id}`,
 			`smol:${smol_id}:anonymous`,
 			'public-smols',
 			artistSmolsCacheTag(payload.sub),
-			`user:${payload.sub}:created`,
 			'mixtapes',
 			...playlistTags,
 		])
@@ -1702,8 +1691,7 @@ async function deleteSmolGuarded(env: Env, smol: DeletableSmol, extraGuard = '',
 	const guard = `Id = ?1 AND Mint_Token IS NULL AND Mint_Amm IS NULL${extraGuard} AND NOT EXISTS (SELECT 1 FROM MintBatchStatus
 		WHERE Phase IN ('existing', 'queued', 'submitting', 'submitted', 'confirmed') AND instr(Ids, '"' || substr(?1, 1, 12)) > 0)`
 	const statement = (sql: string) => env.SMOL_D1.prepare(sql).bind(smol.Id, ...extraBindings)
-	const [likes, playlistTags, steps] = await Promise.all([
-		env.SMOL_D1.prepare(`SELECT "Address" as Address FROM Likes WHERE Id = ?1`).bind(smol.Id).all<{ Address: string }>(),
+	const [playlistTags, steps] = await Promise.all([
 		getPlaylistTitlesForSmol(env, smol.Id).then(playlistCacheTags),
 		env.SMOL_KV.get<WorkflowSteps>(smol.Id, 'json').catch(() => null),
 	])
@@ -1737,13 +1725,10 @@ async function deleteSmolGuarded(env: Env, smol: DeletableSmol, extraGuard = '',
 		artistSmolsCacheTag(smol.Address),
 		'public-smols',
 		'mixtapes',
-		`user:${smol.Address}:created`,
-		`user:${smol.Address}:smol:${smol.Id}`,
 		`smol:${smol.Id}:anonymous`,
 		`smol:${smol.Id}:media`,
 		...musicIds.map((musicId) => `song:${musicId}:media`),
 		...playlistTags,
-		...likes.results.flatMap(({ Address }) => [`user:${Address}:liked`, `user:${Address}:likes`]),
 	]
 }
 

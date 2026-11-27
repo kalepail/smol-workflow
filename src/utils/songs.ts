@@ -266,7 +266,7 @@ export async function classifyRetryAdmission(
 		&& (retrySteps.active_provider === 'elevenlabs' || retrySteps.fallback_from === 'aisonggenerator')
 	) {
 		const prevSmolId = retrySteps.provider_attempt?.source_smol_id ?? retryId;
-		if (prevSmolId && typeof env.SMOL_BUCKET?.head === 'function') {
+		if (prevSmolId) {
 			const r2Key = `${getElevenLabsMusicId(prevSmolId)}.mp3`;
 			const head = await env.SMOL_BUCKET.head(r2Key);
 			if (head && head.size > 0) {
@@ -338,35 +338,6 @@ async function saveStateOnlyStep(
 	await doStub.saveStep(key, data, { persistMedia: false });
 }
 
-async function claimAttemptIfSupported(
-	stub: DurableObjectStub<SmolDurableObject>,
-	provider: MusicProvider,
-	meta?: Partial<ProviderAttemptState>
-): Promise<{ claimed: boolean; attempt?: ProviderAttemptState }> {
-	const doStub = stub as unknown as {
-		claimPaidAttempt?: (
-			p: MusicProvider,
-			m?: Partial<ProviderAttemptState>
-		) => Promise<{ claimed: boolean; attempt: ProviderAttemptState }>;
-	};
-	if (typeof doStub.claimPaidAttempt === 'function') {
-		return await doStub.claimPaidAttempt(provider, meta);
-	}
-	return { claimed: true };
-}
-
-async function updateAttemptIfSupported(
-	stub: DurableObjectStub<SmolDurableObject>,
-	attempt: ProviderAttemptState
-): Promise<void> {
-	const doStub = stub as unknown as {
-		updatePaidAttempt?: (a: ProviderAttemptState) => Promise<void>;
-	};
-	if (typeof doStub.updatePaidAttempt === 'function') {
-		await doStub.updatePaidAttempt(attempt);
-	}
-}
-
 function parseDeclaredContentLength(response: Response): number | null {
 	const header = response.headers.get('content-length');
 	if (!header || !/^\d+$/.test(header.trim())) {
@@ -416,9 +387,7 @@ export async function commitSongsAudioToR2(params: {
 
 		const r2Key = `${musicId}.mp3`;
 		const canonicalUrl = getCanonicalSongUrl(musicId);
-		const existing = typeof env.SMOL_BUCKET.head === 'function'
-			? await env.SMOL_BUCKET.head(r2Key)
-			: null;
+		const existing = await env.SMOL_BUCKET.head(r2Key);
 
 		const isCanonicalAudio = song.audio === canonicalUrl;
 		const existingMatchesSource = Boolean(
@@ -921,9 +890,6 @@ async function runElevenLabsGeneration(params: {
 	let existingR2Meta: { size: number; upstreamSongId?: string; gatewayLogId?: string } | null = null;
 	try {
 		existingR2Meta = await step.do('check existing elevenlabs r2 artifact', config, async () => {
-			if (typeof env.SMOL_BUCKET.head !== 'function') {
-				return null;
-			}
 			const head = await env.SMOL_BUCKET.head(`${existingMusicId}.mp3`);
 			if (!head || head.size <= 0) {
 				return null;
@@ -974,7 +940,7 @@ async function runElevenLabsGeneration(params: {
 
 		await step.do('save song ids', config, () => saveStateOnlyStep(stub, 'song_ids', song_ids));
 		await step.do('save songs', config, async () => {
-			await updateAttemptIfSupported(stub, {
+			await stub.updatePaidAttempt({
 				provider: 'elevenlabs',
 				status: 'committed',
 				source_smol_id: targetSmolId,
@@ -1085,7 +1051,7 @@ async function runElevenLabsGeneration(params: {
 			retries: { limit: 0, delay: '1 second' },
 		},
 		async () => {
-			const claim = await claimAttemptIfSupported(stub, 'elevenlabs', {
+			const claim = await stub.claimPaidAttempt('elevenlabs', {
 				source_smol_id: targetSmolId,
 			});
 			if (!claim.claimed && claim.attempt) {
@@ -1103,9 +1069,10 @@ async function runElevenLabsGeneration(params: {
 					lyrics,
 					isInstrumental: is_instrumental,
 					chunkDurationsMs: plannedChunkDurationsMs,
+					source: params.fallback_from ? 'fallback' : 'explicit',
 				});
 
-				await updateAttemptIfSupported(stub, {
+				await stub.updatePaidAttempt({
 					provider: 'elevenlabs',
 					status: 'committed',
 					source_smol_id: targetSmolId,
@@ -1135,7 +1102,7 @@ async function runElevenLabsGeneration(params: {
 				const errorCode = err instanceof ElevenLabsProviderError ? err.code : 'storage_commit_failed';
 				const errorMessage = err instanceof Error ? err.message : String(err);
 
-				await updateAttemptIfSupported(stub, {
+				await stub.updatePaidAttempt({
 					provider: 'elevenlabs',
 					status: isConfirmedRejection ? 'failed' : 'ambiguous',
 					source_smol_id: targetSmolId,
@@ -1328,7 +1295,7 @@ async function discoverAisgSongIds(params: {
 
 	const discoveredIds = Array.from(collected).slice(0, EXPECTED_AISG_TRACK_COUNT);
 	await step.do('record aisonggenerator discovery receipt', config, async () => {
-		await updateAttemptIfSupported(stub, {
+		await stub.updatePaidAttempt({
 			provider: 'aisonggenerator',
 			status: 'submitted',
 			...(attemptId ? { attempt_id: attemptId } : {}),
@@ -1399,7 +1366,7 @@ async function reconcileCarriedAttempt(params: {
 	// Copy the carried attempt into this successor DO immediately so replays within this
 	// workflow also see the predecessor's paid claim/receipt.
 	await step.do('carry predecessor attempt state', config, async () => {
-		await updateAttemptIfSupported(stub, attempt);
+		await stub.updatePaidAttempt(attempt);
 	});
 
 	// 1. ElevenLabs carried attempt (claimed / committed / ambiguous)
@@ -1407,9 +1374,7 @@ async function reconcileCarriedAttempt(params: {
 		const sourceSmolId = attempt.source_smol_id ?? retry_id ?? smolId;
 		const existingMusicId = getElevenLabsMusicId(sourceSmolId);
 		const existingR2 = await step.do('reconcile elevenlabs r2 artifact', config, async () => {
-			const head = typeof env.SMOL_BUCKET.head === 'function'
-				? await env.SMOL_BUCKET.head(`${existingMusicId}.mp3`)
-				: null;
+			const head = await env.SMOL_BUCKET.head(`${existingMusicId}.mp3`);
 			return head && head.size > 0 ? { size: head.size } : null;
 		});
 
@@ -2166,7 +2131,7 @@ export async function generateOrReuseSongs(params: {
 			retries: { limit: 0, delay: '1 second' },
 		},
 		async (): Promise<SubmitStepOutcome> => {
-			const claim = await claimAttemptIfSupported(stub, 'aisonggenerator', {
+			const claim = await stub.claimPaidAttempt('aisonggenerator', {
 				attempt_id: aisgAttemptId,
 				source_smol_id: smolId,
 			});
@@ -2211,7 +2176,7 @@ export async function generateOrReuseSongs(params: {
 					smolId
 				);
 
-				await updateAttemptIfSupported(stub, {
+				await stub.updatePaidAttempt({
 					provider: 'aisonggenerator',
 					status: 'submitted',
 					attempt_id: aisgAttemptId,
@@ -2225,7 +2190,7 @@ export async function generateOrReuseSongs(params: {
 				return { ok: true, result: submitted };
 			} catch (err) {
 				if (err instanceof AisgProviderError) {
-					await updateAttemptIfSupported(stub, {
+					await stub.updatePaidAttempt({
 						provider: 'aisonggenerator',
 						status: err.outcome === 'unknown' ? 'ambiguous' : 'failed',
 						attempt_id: aisgAttemptId,
@@ -2254,7 +2219,7 @@ export async function generateOrReuseSongs(params: {
 				}
 
 				const message = err instanceof Error ? err.message : String(err);
-				await updateAttemptIfSupported(stub, {
+				await stub.updatePaidAttempt({
 					provider: 'aisonggenerator',
 					status: 'ambiguous',
 					attempt_id: aisgAttemptId,
@@ -2606,7 +2571,7 @@ async function pollAndCommitAisgOrFallback(params: {
 
 		// Confirmed terminal AISG failure: mark AISG attempt failed so fallback can claim cleanly
 		await step.do('mark aisonggenerator attempt failed', config, async () => {
-			await updateAttemptIfSupported(stub, {
+			await stub.updatePaidAttempt({
 				provider: 'aisonggenerator',
 				status: 'failed',
 				source_smol_id: smolId,
@@ -2672,7 +2637,7 @@ async function pollAndCommitAisgOrFallback(params: {
 			provider: 'aisonggenerator',
 			swapped: anySwapDetected,
 		});
-		await updateAttemptIfSupported(stub, {
+		await stub.updatePaidAttempt({
 			provider: 'aisonggenerator',
 			status: 'committed',
 			source_smol_id: smolId,

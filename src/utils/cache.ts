@@ -4,6 +4,9 @@
 
 import { env } from 'cloudflare:workers'
 
+/** Cloudflare accepts up to 100 tags per purge request (Free: 5 requests/min, bucket 25). */
+const PURGE_TAGS_PER_REQUEST = 100
+
 /**
  * Purge cache by tags using Cloudflare API
  * This performs a global cache purge across all data centers
@@ -23,8 +26,8 @@ export async function purgeCacheByTags(tags: string[]): Promise<boolean> {
 
 	try {
 		const tagChunks: string[][] = []
-		for (let i = 0; i < uniqueTags.length; i += 30) {
-			tagChunks.push(uniqueTags.slice(i, i + 30))
+		for (let i = 0; i < uniqueTags.length; i += PURGE_TAGS_PER_REQUEST) {
+			tagChunks.push(uniqueTags.slice(i, i + PURGE_TAGS_PER_REQUEST))
 		}
 
 		const results = await Promise.all(tagChunks.map(async (chunk) => {
@@ -45,6 +48,8 @@ export async function purgeCacheByTags(tags: string[]): Promise<boolean> {
 				await response.body?.cancel().catch(() => {})
 				if (response.status === 401 || response.status === 403) {
 					console.warn('Cache purge skipped due auth error:', response.status)
+				} else if (response.status === 429) {
+					console.warn('Cache purge rate limited:', { tagCount: chunk.length, retryAfter: response.headers.get('Retry-After') })
 				} else {
 					console.error('Cache purge failed:', response.status)
 				}
@@ -52,35 +57,20 @@ export async function purgeCacheByTags(tags: string[]): Promise<boolean> {
 			}
 
 			const result = await response.json() as { success: boolean }
-			return result.success
+			return result.success === true
 		}))
 
-		console.log('Cache purged', { tagCount: uniqueTags.length, chunkCount: tagChunks.length })
-		return results.every(Boolean)
+		const succeeded = results.filter(Boolean).length
+		if (succeeded === results.length) {
+			console.log('Cache purged', { tagCount: uniqueTags.length, chunkCount: tagChunks.length })
+			return true
+		}
+		console.warn('Cache purge incomplete', { tagCount: uniqueTags.length, chunkCount: tagChunks.length, failedChunks: results.length - succeeded })
+		return false
 	} catch {
 		console.warn('Cache purge request failed')
 		return false
 	}
-}
-
-/**
- * Helper to purge cache for a specific user's liked smols
- * Purges both the /liked list and /likes array
- */
-export function purgeUserLikedCache(
-	userId: string,
-	smolId?: string
-): Promise<boolean> {
-	const tags = [`user:${userId}:liked`, `user:${userId}:likes`]
-
-	// Optionally purge the specific smol detail page for this user ONLY
-	// Since cache varies by Cookie, each user has their own cache entry
-	// We only need to purge the cache for the user who toggled the like
-	if (smolId) {
-		tags.push(`user:${userId}:smol:${smolId}`)
-	}
-
-	return purgeCacheByTags(tags)
 }
 
 /**

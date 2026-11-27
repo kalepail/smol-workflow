@@ -139,24 +139,29 @@ function createRetryCrudHarness() {
 						return { success: true, meta: { changes: 0 } }
 					}
 
-					return {
-						run,
-						first: async () => {
-							if (sql.includes('SELECT 1 FROM Smols WHERE Song_1 = ?1 OR Song_2 = ?1')) {
-								const musicId = String(args[0])
-								for (const row of smolsTable.values()) {
-									if (row.Song_1 === musicId || row.Song_2 === musicId) return { 1: 1 }
-								}
-								return null
-							}
-							if (/FROM\s+Smols\s+WHERE\s+Id\s*=\s*\?1/i.test(sql)) {
-								const row = smolsTable.get(String(args[0]))
-								if (!row) return null
-								if (sql.includes('"Address" = ?2') && row.Address !== args[1]) return null
-								return row
+					const first = async () => {
+						if (sql.includes('SELECT 1 FROM Smols WHERE Song_1 = ?1 OR Song_2 = ?1')) {
+							const musicId = String(args[0])
+							for (const row of smolsTable.values()) {
+								if (row.Song_1 === musicId || row.Song_2 === musicId) return { 1: 1 }
 							}
 							return null
-						},
+						}
+						if (/FROM\s+Smols\s+WHERE\s+Id\s*=\s*\?1/i.test(sql)) {
+							const row = smolsTable.get(String(args[0]))
+							if (!row) return null
+							if (sql.includes('"Address" = ?2') && row.Address !== args[1]) return null
+							return row
+						}
+						return null
+					}
+
+					return {
+						// A SELECT inside batch() yields its rows, like D1.
+						run: async () => /^\s*SELECT/i.test(sql)
+							? { success: true, results: [await first()].filter(Boolean), meta: { changes: 0 } }
+							: await run(),
+						first,
 						all: async () => {
 							if (sql.includes('SELECT Title FROM Playlists WHERE Id = ?1')) {
 								const id = String(args[0])
@@ -705,7 +710,7 @@ test('D1 migration 0001 rehearsal preserves live column values, indexes, nullabl
 	}
 })
 
-test('Post-review P0/P1 regressions: published smol protected even with override & D1 error, retry carries attempt/fallback/pending without double charge, successor claim recovery, failed ref-check preserves MP3, publication replay preserves search, and NSFW hide allowed', async () => {
+test('published smol protected even with override & D1 error, retry carries attempt/fallback/pending without double charge, successor claim recovery, failed ref-check preserves MP3, publication replay preserves search, and NSFW hide allowed', async () => {
 	const harness = createRetryCrudHarness()
 	const token = await createAuthToken(OWNER, TEST_SECRET)
 	const ctx = createMockExecutionContext()
@@ -785,6 +790,11 @@ test('Post-review P0/P1 regressions: published smol protected even with override
 		if (sql.includes('SELECT Public') && sql.includes('WHERE Id = ?1 AND "Address" = ?2')) {
 			return {
 				bind: (id: string, addr: string) => ({
+					// The post-update re-read runs inside batch() and is not part of the barrier.
+					run: async () => {
+						const row = hideEnv.smolsTable.get(id)
+						return { success: true, results: row && row.Address === addr ? [{ Public: row.Public }] : [] }
+					},
 					first: async () => {
 						const row = hideEnv.smolsTable.get(id)
 						const snapshot = row && row.Address === addr ? { Public: row.Public } : null
@@ -1266,7 +1276,7 @@ test('Post-review P0/P1 regressions: published smol protected even with override
 	}
 })
 
-test('Pass-2 P1 & gap regressions: active source cannot be forked or cleaned up, unreadable terminal successor fails closed (503), historical AISG singletons refused, and KV-lag search enqueue retries', async () => {
+test('active source cannot be forked or cleaned up, unreadable terminal successor fails closed (503), historical AISG singletons refused, and KV-lag search enqueue retries', async () => {
 	const ctx = createMockExecutionContext()
 
 	// --- 1. P1: First retry on a still-running source returns source ID without claiming or creating a successor ---
@@ -1474,7 +1484,7 @@ test('Pass-2 P1 & gap regressions: active source cannot be forked or cleaned up,
 	assert.equal(lagHarness.queueMessages.length, 1, 'Replay after KV visibility must send search indexing message')
 })
 
-test('Pass-3 P1 regressions: multi-generation retries (A -> B -> C) converge on ONE successor from any ancestor/descendant ID, and interrupted replacement recovery restores B ambiguous ElevenLabs claim with 0 provider calls', async () => {
+test('multi-generation retries (A -> B -> C) converge on ONE successor from any ancestor/descendant ID, and interrupted replacement recovery restores B ambiguous ElevenLabs claim with 0 provider calls', async () => {
 	const ctx = createMockExecutionContext()
 
 	// --- Case 1A: Normal multi-generation chain A -> B -> C -> D converges from ANY ID in chain ---
@@ -1650,7 +1660,7 @@ test('Pass-3 P1 regressions: multi-generation retries (A -> B -> C) converge on 
 	}
 })
 
-test('Pass-4 P1 regression: expired Workflow instance (instance.not_found) NEVER overwrites successor DO ambiguous ElevenLabs claim with predecessor failed claim, and blocks second paid submission', async () => {
+test('expired Workflow instance (instance.not_found) NEVER overwrites successor DO ambiguous ElevenLabs claim with predecessor failed claim, and blocks second paid submission', async () => {
 	const ctx = createMockExecutionContext()
 
 	// --- Case A: Full expired successor DO B (has payload + its own ambiguous ElevenLabs claim, NO remaining Workflow instance) ---
@@ -1849,14 +1859,15 @@ test('PUT /:id blocks hiding minted songs (Mint_Token, Mint_Amm, and concurrent 
 	;(harness.env.SMOL_D1 as any).prepare = (sql: string) => {
 		if (sql.includes('SELECT Public') && sql.includes('WHERE Id = ?1 AND "Address" = ?2')) {
 			return {
-				bind: (id: string, addr: string) => ({
-					first: async () => {
+				bind: (id: string, addr: string) => {
+					const first = async () => {
 						const row = harness.smolsTable.get(id)
 						if (!row || row.Address !== addr) return null
 						const mint = extraMintFields.get(id) ?? {}
 						return { Public: row.Public, Mint_Token: mint.Mint_Token ?? null, Mint_Amm: mint.Mint_Amm ?? null }
-					},
-				}),
+					}
+					return { first, run: async () => ({ success: true, results: [await first()].filter(Boolean) }) }
+				},
 			}
 		}
 		if (sql.includes('SET Public = ?1') && sql.includes('AND Public = ?4')) {
@@ -1953,7 +1964,7 @@ test('PUT /:id blocks hiding minted songs (Mint_Token, Mint_Amm, and concurrent 
 	assert.equal(harness.smolsTable.get(legacyPrivateMintedId)?.Public, 1)
 })
 
-test('A1: carried ambiguous AISG attempt reconciles by replaying POST /api/tasks with the stored Idempotency-Key (never GET /api/attempts)', async () => {
+test('carried ambiguous AISG attempt reconciles by replaying POST /api/tasks with the stored Idempotency-Key (never GET /api/attempts)', async () => {
 	const harness = createRetryCrudHarness()
 	const makeAudio = (seed: number) => Uint8Array.from({ length: 40_000 }, (_, i) => (seed + i * 17) & 0xff)
 	const audio1 = makeAudio(11)
@@ -2054,7 +2065,7 @@ test('A1: carried ambiguous AISG attempt reconciles by replaying POST /api/tasks
 	}
 })
 
-test('A1 quota: a legacy claimed AISG attempt with no reservation never replays POST /api/tasks without first holding an AISG quota reservation (missing AND existing worker receipt)', async () => {
+test('a legacy claimed AISG attempt with no reservation never replays POST /api/tasks without first holding an AISG quota reservation (missing AND existing worker receipt)', async () => {
 	const makeAudio = (seed: number) => Uint8Array.from({ length: 40_000 }, (_, i) => (seed + i * 13) & 0xff)
 	const audio1 = makeAudio(21)
 	const audio2 = makeAudio(87)
@@ -2215,7 +2226,7 @@ test('A1 quota: a legacy claimed AISG attempt with no reservation never replays 
 	}
 })
 
-test('A1 refunded carry: after a typed 402 rejection refunds the reconcile reservation, the next retry verifies the carried ID in the quota DO and reserves a fresh AISG slot before replaying POST /api/tasks', async () => {
+test('after a typed 402 rejection refunds the reconcile reservation, the next retry verifies the carried ID in the quota DO and reserves a fresh AISG slot before replaying POST /api/tasks', async () => {
 	const makeAudio = (seed: number) => Uint8Array.from({ length: 40_000 }, (_, i) => (seed + i * 29) & 0xff)
 	const audio1 = makeAudio(31)
 	const audio2 = makeAudio(97)

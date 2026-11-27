@@ -25,9 +25,6 @@ interface __BaseEnv_Env {
 	MIXTAPE_DEDUPE_AI_ENABLED: string;
 	NSFW_PROVIDER: string;
 	SEARCH_BACKFILL_CRON_ENABLED: string;
-	SEARCH_BACKFILL_CRON_PAGE_LIMIT: string;
-	SEARCH_BACKFILL_CRON_STALL_RUNS: string;
-	SEARCH_BACKFILL_CRON_MAX_WAVES: string;
 	DURABLE_OBJECT: DurableObjectNamespace<import("./src/index").SmolDurableObject>;
 	DO_STATE: DurableObjectNamespace<import("./src/index").SmolState>;
 	USER_QUOTA: DurableObjectNamespace<import("./src/index").UserQuotaDO>;
@@ -48,7 +45,7 @@ type StringifyValues<EnvType extends Record<string, unknown>> = {
 	[Binding in keyof EnvType]: EnvType[Binding] extends string ? EnvType[Binding] : string;
 };
 declare namespace NodeJS {
-	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "RPC_URL" | "NETWORK_PASSPHRASE" | "SMOL_CONTRACT_ID" | "MINT_SIGNING_ENABLED" | "CF_AI_GATEWAY_ID" | "CF_AIG_BYOK_ALIAS" | "ELEVENLABS_OUTPUT_FORMAT" | "ELEVENLABS_FALLBACK_ENABLED" | "DAILY_LIMIT_CLASSIC" | "DAILY_LIMIT_ELEVENLABS" | "BURST_LIMIT_PER_MINUTE" | "GLOBAL_DAILY_LIMIT_CLASSIC" | "GLOBAL_DAILY_LIMIT_ELEVENLABS" | "PLAY_COUNT_MODE" | "MIXTAPE_DEDUPE_AI_ENABLED" | "NSFW_PROVIDER" | "SEARCH_BACKFILL_CRON_ENABLED" | "SEARCH_BACKFILL_CRON_PAGE_LIMIT" | "SEARCH_BACKFILL_CRON_STALL_RUNS" | "SEARCH_BACKFILL_CRON_MAX_WAVES">> {}
+	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "RPC_URL" | "NETWORK_PASSPHRASE" | "SMOL_CONTRACT_ID" | "MINT_SIGNING_ENABLED" | "CF_AI_GATEWAY_ID" | "CF_AIG_BYOK_ALIAS" | "ELEVENLABS_OUTPUT_FORMAT" | "ELEVENLABS_FALLBACK_ENABLED" | "DAILY_LIMIT_CLASSIC" | "DAILY_LIMIT_ELEVENLABS" | "BURST_LIMIT_PER_MINUTE" | "GLOBAL_DAILY_LIMIT_CLASSIC" | "GLOBAL_DAILY_LIMIT_ELEVENLABS" | "PLAY_COUNT_MODE" | "MIXTAPE_DEDUPE_AI_ENABLED" | "NSFW_PROVIDER" | "SEARCH_BACKFILL_CRON_ENABLED">> {}
 }
 declare module "*.txt" {
 	const value: string;

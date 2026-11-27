@@ -1,6 +1,5 @@
 import {
 	getUtcDayKey,
-	type PendingUserReleaseInput,
 	type QuotaCommitResult,
 	type QuotaLimits,
 	type QuotaProvider,
@@ -274,171 +273,66 @@ function toGlobalLimitsForProvider(
 	}
 }
 
-async function reconcileFailedAdmission(
-	env: Env,
+/**
+ * Best-effort release of ONE caller's claim (by `claimId`, so a concurrent winner sharing the same
+ * reservation is never touched). `generation: null` resolves the generation from the claim row, for
+ * replies lost after the DO wrote. If both fresh-stub attempts fail the unadmitted row simply ages out
+ * (next-day rollover / retention prune); the user can lose at most that one slot for the day.
+ */
+async function releaseCallerClaim(
+	getFreshStub: () => DurableObjectStub<UserQuotaDO>,
 	params: {
-		address: string
 		reservationId: string
-		userGeneration: number
-		dayKey: string
+		generation: number | null
+		dayKey: string | null
 		claimId: string
-		rollbackUnsharedAdmitted: boolean
 		reason: string
 		nowMs: number
-		globalReserveAttempted: boolean
-		reservedGlobalGeneration?: number
+		rollbackUnsharedAdmitted?: boolean
 	}
 ): Promise<void> {
-	const userKey = `user:${params.address}`
-	const globalKey = `global:${params.dayKey}`
-
-	let userReleased = false
 	try {
-		await callWithFreshStubRetry(
-			() => getUserQuotaStub(env, params.address),
-			(freshUserStub) => freshUserStub.releaseClaim(
-				params.reservationId,
-				params.userGeneration,
-				params.dayKey,
-				params.reason,
-				params.nowMs,
-				{
-					claimId: params.claimId,
-					rollbackUnsharedAdmitted: params.rollbackUnsharedAdmitted,
-				}
-			)
-		)
-		userReleased = true
-	} catch {
-		userReleased = false
+		await callWithFreshStubRetry(getFreshStub, (stub) => stub.releaseClaim(
+			params.reservationId,
+			params.generation,
+			params.dayKey,
+			params.reason,
+			params.nowMs,
+			{ claimId: params.claimId, rollbackUnsharedAdmitted: Boolean(params.rollbackUnsharedAdmitted) }
+		))
+	} catch (err) {
+		console.warn('Quota claim release RPC failed:', params.reason, sanitizedErrorTag(err))
 	}
+}
 
-	const buildDeferredUserJob = (): PendingUserReleaseInput => ({
-		userKey,
-		reservationId: params.reservationId,
-		generation: params.userGeneration,
-		dayKey: params.dayKey,
-		claimId: params.claimId,
-		rollbackUnsharedAdmitted: params.rollbackUnsharedAdmitted,
-		reason: params.reason,
-		nowMs: params.nowMs,
-	})
-
-	const buildDeferredGlobalJob = (): PendingUserReleaseInput => ({
-		userKey: globalKey,
-		reservationId: params.reservationId,
-		generation: params.reservedGlobalGeneration ?? 0,
-		dayKey: params.dayKey,
-		claimId: params.claimId,
-		rollbackUnsharedAdmitted: false,
-		reason: params.reason,
-		nowMs: params.nowMs,
-	})
-
-	let globalReleased = !params.globalReserveAttempted
-	let userDeferredOnGlobal = false
-
-	if (params.globalReserveAttempted) {
-		try {
-			await callWithFreshStubRetry(
-				() => getGlobalQuotaStub(env, params.dayKey),
-				(freshGlobalStub) => freshGlobalStub.releaseClaim(
-					params.reservationId,
-					params.reservedGlobalGeneration ?? null,
-					params.dayKey,
-					params.reason,
-					params.nowMs,
-					{
-						claimId: params.claimId,
-						...(!userReleased ? { deferredUserRelease: buildDeferredUserJob() } : {}),
-					}
-				)
-			)
-			globalReleased = true
-			if (!userReleased) {
-				userDeferredOnGlobal = true
-			}
-		} catch {
-			globalReleased = false
-		}
-	} else if (!userReleased) {
-		try {
-			await callWithFreshStubRetry(
-				() => getGlobalQuotaStub(env, params.dayKey),
-				(freshGlobalStub) => freshGlobalStub.enqueuePendingUserRelease(buildDeferredUserJob())
-			)
-			userDeferredOnGlobal = true
-		} catch {
-			userDeferredOnGlobal = false
-		}
-	}
-
-	// If global release failed, persist deferred global release onto the reachable user DO.
-	// If userReleased is ALSO still false (overlapping release failures on BOTH DOs!), NEVER drop
-	// the pending user release: release it atomically alongside the deferred global job (or enqueue BOTH)!
-	if (!globalReleased) {
-		if (!userReleased) {
-			try {
-				await callWithFreshStubRetry(
-					() => getUserQuotaStub(env, params.address),
-					(freshUserStub) => freshUserStub.releaseClaim(
-						params.reservationId,
-						params.userGeneration,
-						params.dayKey,
-						params.reason,
-						params.nowMs,
-						{
-							claimId: params.claimId,
-							rollbackUnsharedAdmitted: params.rollbackUnsharedAdmitted,
-							deferredUserRelease: buildDeferredGlobalJob(),
-						}
-					)
-				)
-				userReleased = true
-			} catch {
-				await callWithFreshStubRetry(
-					() => getUserQuotaStub(env, params.address),
-					async (freshUserStub) => {
-						await freshUserStub.enqueuePendingUserRelease(buildDeferredGlobalJob())
-						await freshUserStub.enqueuePendingUserRelease(buildDeferredUserJob())
-					}
-				).catch(() => {})
-			}
-		} else {
-			await callWithFreshStubRetry(
-				() => getUserQuotaStub(env, params.address),
-				(freshUserStub) => freshUserStub.enqueuePendingUserRelease(buildDeferredGlobalJob())
-			).catch(() => {})
-		}
-	}
-
-	// Final safety net if user release is still neither completed nor durably queued on global
-	if (!userReleased && !userDeferredOnGlobal) {
-		let persistedOnGlobal = false
-		try {
-			await callWithFreshStubRetry(
-				() => getGlobalQuotaStub(env, params.dayKey),
-				(freshGlobalStub) => freshGlobalStub.enqueuePendingUserRelease(buildDeferredUserJob())
-			)
-			persistedOnGlobal = true
-		} catch {
-			persistedOnGlobal = false
-		}
-		if (!persistedOnGlobal) {
-			await callWithFreshStubRetry(
-				() => getUserQuotaStub(env, params.address),
-				(freshUserStub) => freshUserStub.enqueuePendingUserRelease(buildDeferredUserJob())
-			).catch(() => {})
-		}
+function quotaExceeded(
+	result: { provider: QuotaProvider; limit: number; used: number; resetAt: string },
+	scope: 'user' | 'global',
+	window: 'day' | 'minute'
+): { ok: false; code: 'quota_exceeded'; payload: QuotaExceededPayload } {
+	return {
+		ok: false,
+		code: 'quota_exceeded',
+		payload: {
+			error: buildQuotaExceededMessage({ ...result, scope, window }),
+			code: 'quota_exceeded',
+			provider: result.provider,
+			limit: result.limit,
+			used: result.used,
+			remaining: 0,
+			resetAt: result.resetAt,
+			scope,
+			window,
+		},
 	}
 }
 
 /**
- * Atomically reserve quota for a new generation, fresh retry, or independent fallback.
- * 1. Enforces per-user UTC-day + optional per-minute burst guard (fail-closed).
- * 2. Enforces daily global soft circuit-breaker bucket `global:YYYY-MM-DD`.
- *    Handles EVERY explicit negative global response (`quota_exceeded` AND `reservation_conflict`),
- *    compensating an unshared newly-created user reservation before returning the rejection.
+ * Reserve quota for a new generation, fresh retry, or independent fallback.
+ * 1. Per-user UTC-day + optional per-minute burst guard (fail-closed).
+ * 2. Daily global soft circuit breaker `global:YYYY-MM-DD`: an explicit denial releases this caller's
+ *    user claim and returns 429; an RPC error fails open.
+ * 3. Confirms the user admission (writes `admitted`, keeping rows rollback-compatible).
  */
 export async function reserveGenerationQuota(
 	env: Env,
@@ -450,88 +344,19 @@ export async function reserveGenerationQuota(
 	}
 ): Promise<CoordinatedReserveResult> {
 	const nowMs = params.nowMs ?? Date.now()
-	const initialDayKey = getUtcDayKey(nowMs)
 	const claimId = crypto.randomUUID()
-	const userKey = `user:${params.address}`
 	const userLimits = getUserQuotaLimits(env, params.address)
 	const globalLimits = toGlobalLimitsForProvider(getGlobalQuotaLimits(env))
-	const userStub = getUserQuotaStub(env, params.address)
+	const freshUserStub = () => getUserQuotaStub(env, params.address)
+	const userStub = freshUserStub()
+	const release = { reservationId: params.reservationId, claimId, nowMs }
 
 	let userResult: Awaited<ReturnType<typeof userStub.reserve>>
 	try {
-		userResult = await userStub.reserve(
-			params.reservationId,
-			params.provider,
-			userLimits,
-			nowMs,
-			undefined,
-			claimId
-		)
+		userResult = await userStub.reserve(params.reservationId, params.provider, userLimits, nowMs, undefined, claimId)
 	} catch (err) {
-		// Initial reserve() reply may have been lost AFTER writing to storage!
-		// Reconcile strictly by this caller's unique `claimId` via a fresh stub (never touching another caller's claim).
-		let userReleased = false
-		try {
-			await callWithFreshStubRetry(
-				() => getUserQuotaStub(env, params.address),
-				(freshUserStub) => freshUserStub.releaseClaim(
-					params.reservationId,
-					null,
-					null,
-					'user_reserve_rpc_failed',
-					nowMs,
-					{ claimId }
-				)
-			)
-			userReleased = true
-		} catch {
-			userReleased = false
-		}
-		if (!userReleased) {
-			const deferredUserJob: PendingUserReleaseInput = {
-				userKey,
-				reservationId: params.reservationId,
-				generation: 0,
-				dayKey: '',
-				claimId,
-				rollbackUnsharedAdmitted: false,
-				reason: 'user_reserve_rpc_failed',
-				nowMs,
-			}
-			// Persist deferred claim-ID release onto `global:<initialDayKey>` independently of whether
-			// daily global caps are enabled or `off`. If global enqueue also fails, fall back to a
-			// fresh user DO stub (direct releaseClaim, or self-enqueued outbox if releaseClaim rejects).
-			let persistedOnGlobal = false
-			try {
-				await callWithFreshStubRetry(
-					() => getGlobalQuotaStub(env, initialDayKey),
-					(freshGlobalStub) => freshGlobalStub.enqueuePendingUserRelease(deferredUserJob)
-				)
-				persistedOnGlobal = true
-			} catch {
-				persistedOnGlobal = false
-			}
-			if (!persistedOnGlobal) {
-				try {
-					await callWithFreshStubRetry(
-						() => getUserQuotaStub(env, params.address),
-						(freshUserStub) => freshUserStub.releaseClaim(
-							params.reservationId,
-							null,
-							null,
-							'user_reserve_rpc_failed',
-							nowMs,
-							{ claimId }
-						)
-					)
-				} catch {
-					await callWithFreshStubRetry(
-						() => getUserQuotaStub(env, params.address),
-						(freshUserStub) => freshUserStub.enqueuePendingUserRelease(deferredUserJob)
-					).catch(() => {})
-				}
-			}
-		}
+		// The reply may have been lost after the DO wrote: release strictly by this caller's claimId.
+		await releaseCallerClaim(freshUserStub, { ...release, generation: null, dayKey: null, reason: 'user_reserve_rpc_failed' })
 		throw err
 	}
 
@@ -540,35 +365,9 @@ export async function reserveGenerationQuota(
 			throw new Error('Stale day quota reservation rejected; please retry')
 		}
 		if (userResult.code === 'reservation_conflict') {
-			return {
-				ok: false,
-				code: 'reservation_conflict',
-				existingProvider: userResult.existingProvider,
-			}
+			return { ok: false, code: 'reservation_conflict', existingProvider: userResult.existingProvider }
 		}
-		const window = userResult.reason === 'burst_limit' ? 'minute' : 'day'
-		return {
-			ok: false,
-			code: 'quota_exceeded',
-			payload: {
-				error: buildQuotaExceededMessage({
-					provider: userResult.provider,
-					limit: userResult.limit,
-					used: userResult.used,
-					resetAt: userResult.resetAt,
-					scope: 'user',
-					window,
-				}),
-				code: 'quota_exceeded',
-				provider: userResult.provider,
-				limit: userResult.limit,
-				used: userResult.used,
-				remaining: 0,
-				resetAt: userResult.resetAt,
-				scope: 'user',
-				window,
-			},
-		}
+		return quotaExceeded(userResult, 'user', userResult.reason === 'burst_limit' ? 'minute' : 'day')
 	}
 
 	const dayKey = userResult.dayKey
@@ -579,22 +378,18 @@ export async function reserveGenerationQuota(
 			? [userResult.supersededDayKey]
 			: []
 
-	// Reconcile EVERY durably persisted superseded global bucket BEFORE reserving today's bucket,
-	// clearing each day individually ONLY after its refund against `global:<oldDayKey>` succeeds!
-	if (globalLimits && supersededDayKeys.length > 0) {
+	// A rolled-forward reservation releases its earlier day's global slot; each day is cleared from the
+	// user row only after that refund succeeds, so a failure is retried on the next reserve.
+	if (globalLimits) {
 		for (const oldDayKey of supersededDayKeys) {
 			try {
 				await callWithFreshStubRetry(
 					() => getGlobalQuotaStub(env, oldDayKey),
-					(supersededGlobalStub) => supersededGlobalStub.refund(
-						params.reservationId,
-						'superseded_by_next_day_rollover',
-						nowMs
-					)
+					(stub) => stub.refund(params.reservationId, 'superseded_by_next_day_rollover', nowMs)
 				)
 				await callWithFreshStubRetry(
-					() => getUserQuotaStub(env, params.address),
-					(freshUserStub) => freshUserStub.clearSupersededDay(params.reservationId, oldDayKey, nowMs)
+					freshUserStub,
+					(stub) => stub.clearSupersededDay(params.reservationId, oldDayKey, nowMs)
 				).catch(() => {})
 			} catch (err) {
 				console.warn('Superseded global daily quota cleanup RPC failed:', sanitizedErrorTag(err))
@@ -602,16 +397,12 @@ export async function reserveGenerationQuota(
 		}
 	}
 
-	let globalReserveAttempted = false
-	let reservedGlobalGeneration: number | undefined
-
+	// undefined: no global write attempted; null: global RPC threw (a write may still have landed).
+	let globalGeneration: number | null | undefined
 	if (globalLimits) {
+		let globalResult: Awaited<ReturnType<typeof userStub.reserve>> | undefined
 		try {
-			// Always pass `dayKey` explicitly as `bucketDayKey` and caller's unique `claimId` so
-			// `global:<dayKey>` DO name, SQL `day_key`, and per-caller claim idempotency all match.
-			const globalStub = getGlobalQuotaStub(env, dayKey)
-			globalReserveAttempted = true
-			const globalResult = await globalStub.reserve(
+			globalResult = await getGlobalQuotaStub(env, dayKey).reserve(
 				params.reservationId,
 				params.provider,
 				globalLimits,
@@ -619,134 +410,49 @@ export async function reserveGenerationQuota(
 				dayKey,
 				claimId
 			)
-			if (!globalResult.ok) {
-				globalReserveAttempted = false
-				// Per-caller idempotent claim release via fresh stub; if both fresh-stub attempts disconnect,
-				// persist a durable deferred release on the reachable global DO so its alarm drains it once reachable.
-				let userReleaseSucceeded = false
-				try {
-					await callWithFreshStubRetry(
-						() => getUserQuotaStub(env, params.address),
-						(freshUserStub) => freshUserStub.releaseClaim(
-							params.reservationId,
-							userGeneration,
-							dayKey,
-							'global_reserve_denied',
-							nowMs,
-							{ claimId }
-						)
-					)
-					userReleaseSucceeded = true
-				} catch {
-					userReleaseSucceeded = false
-				}
-				if (!userReleaseSucceeded) {
-					await callWithFreshStubRetry(
-						() => getGlobalQuotaStub(env, dayKey),
-						(freshGlobalStub) => freshGlobalStub.enqueuePendingUserRelease({
-							userKey,
-							reservationId: params.reservationId,
-							generation: userGeneration,
-							dayKey,
-							claimId,
-							rollbackUnsharedAdmitted: false,
-							reason: 'global_reserve_denied',
-							nowMs,
-						})
-					).catch(() => {})
-				}
-				if (globalResult.code === 'stale_day') {
-					throw new Error('Stale day global quota reservation rejected; please retry')
-				}
-				if (globalResult.code === 'reservation_conflict') {
-					return {
-						ok: false,
-						code: 'reservation_conflict',
-						existingProvider: globalResult.existingProvider,
-					}
-				}
-				return {
-					ok: false,
-					code: 'quota_exceeded',
-					payload: {
-						error: buildQuotaExceededMessage({
-							provider: globalResult.provider,
-							limit: globalResult.limit,
-							used: globalResult.used,
-							resetAt: globalResult.resetAt,
-							scope: 'global',
-							window: 'day',
-						}),
-						code: 'quota_exceeded',
-						provider: globalResult.provider,
-						limit: globalResult.limit,
-						used: globalResult.used,
-						remaining: 0,
-						resetAt: globalResult.resetAt,
-						scope: 'global',
-						window: 'day',
-					},
-				}
-			}
-			reservedGlobalGeneration = globalResult.generation
 		} catch (err) {
-			if (err instanceof Error && err.message.startsWith('Stale day ')) {
-				throw err
-			}
-			// Soft global circuit breaker: keep `globalReserveAttempted = true` so if admission fails
-			// below, any global write whose reply was lost is still released strictly by `claimId`!
+			globalGeneration = null
 			console.warn('Global daily quota circuit breaker RPC unavailable (soft fallback):', sanitizedErrorTag(err))
+		}
+		if (globalResult && !globalResult.ok) {
+			await releaseCallerClaim(freshUserStub, { ...release, generation: userGeneration, dayKey, reason: 'global_reserve_denied' })
+			if (globalResult.code === 'stale_day') {
+				throw new Error('Stale day global quota reservation rejected; please retry')
+			}
+			if (globalResult.code === 'reservation_conflict') {
+				return { ok: false, code: 'reservation_conflict', existingProvider: globalResult.existingProvider }
+			}
+			return quotaExceeded(globalResult, 'global', 'day')
+		}
+		if (globalResult?.ok) {
+			globalGeneration = globalResult.generation
 		}
 	}
 
-	// REQUIRE user confirmation bound to `(userGeneration, dayKey, claimId)` to succeed before returning ok!
-	// If confirmation throws or returns false, reconcile BOTH user and global claims symmetrically via fresh
-	// stubs and durable outboxes (including unknown-generation lost global reserve replies resolved by `claimId`!).
-	let userConfirmed = false
+	const releaseAdmission = async (reason: string, rollbackUnsharedAdmitted: boolean) => {
+		await releaseCallerClaim(freshUserStub, { ...release, generation: userGeneration, dayKey, reason, rollbackUnsharedAdmitted })
+		if (globalGeneration !== undefined) {
+			await releaseCallerClaim(() => getGlobalQuotaStub(env, dayKey), { ...release, generation: globalGeneration, dayKey, reason })
+		}
+	}
+
+	let userConfirmed: boolean
 	try {
 		userConfirmed = await userStub.confirmAdmission(params.reservationId, userGeneration, dayKey, nowMs, claimId)
 	} catch (err) {
-		await reconcileFailedAdmission(env, {
-			address: params.address,
-			reservationId: params.reservationId,
-			userGeneration,
-			dayKey,
-			claimId,
-			rollbackUnsharedAdmitted: true,
-			reason: 'user_confirm_rpc_failed',
-			nowMs,
-			globalReserveAttempted,
-			reservedGlobalGeneration,
-		})
+		await releaseAdmission('user_confirm_rpc_failed', true)
 		throw err
 	}
-
 	if (!userConfirmed) {
-		await reconcileFailedAdmission(env, {
-			address: params.address,
-			reservationId: params.reservationId,
-			userGeneration,
-			dayKey,
-			claimId,
-			rollbackUnsharedAdmitted: false,
-			reason: 'user_confirm_rejected',
-			nowMs,
-			globalReserveAttempted,
-			reservedGlobalGeneration,
-		})
+		await releaseAdmission('user_confirm_rejected', false)
 		throw new Error('User quota admission confirmation rejected (superseded or released)')
 	}
 
-	if (reservedGlobalGeneration !== undefined) {
+	if (typeof globalGeneration === 'number') {
+		const generation = globalGeneration
 		await callWithFreshStubRetry(
 			() => getGlobalQuotaStub(env, dayKey),
-			(freshGlobalStub) => freshGlobalStub.confirmAdmission(
-				params.reservationId,
-				reservedGlobalGeneration!,
-				dayKey,
-				nowMs,
-				claimId
-			)
+			(stub) => stub.confirmAdmission(params.reservationId, generation, dayKey, nowMs, claimId)
 		).catch(() => {})
 	}
 
@@ -798,28 +504,7 @@ export async function transitionFallbackQuota(
 				provider: userResult.provider,
 			}
 		}
-		return {
-			ok: false,
-			code: 'quota_exceeded',
-			payload: {
-				error: buildQuotaExceededMessage({
-					provider: userResult.provider,
-					limit: userResult.limit,
-					used: userResult.used,
-					resetAt: userResult.resetAt,
-					scope: 'user',
-					window: 'day',
-				}),
-				code: 'quota_exceeded',
-				provider: userResult.provider,
-				limit: userResult.limit,
-				used: userResult.used,
-				remaining: 0,
-				resetAt: userResult.resetAt,
-				scope: 'user',
-				window: 'day',
-			},
-		}
+		return quotaExceeded(userResult, 'user', 'day')
 	}
 
 	const newDayKey = userResult.reservation.dayKey
@@ -855,28 +540,7 @@ export async function transitionFallbackQuota(
 				}
 
 				if (globalResult.code === 'quota_exceeded') {
-					return {
-						ok: false,
-						code: 'quota_exceeded',
-						payload: {
-							error: buildQuotaExceededMessage({
-								provider: globalResult.provider,
-								limit: globalResult.limit,
-								used: globalResult.used,
-								resetAt: globalResult.resetAt,
-								scope: 'global',
-								window: 'day',
-							}),
-							code: 'quota_exceeded',
-							provider: globalResult.provider,
-							limit: globalResult.limit,
-							used: globalResult.used,
-							remaining: 0,
-							resetAt: globalResult.resetAt,
-							scope: 'global',
-							window: 'day',
-						},
-					}
+					return quotaExceeded(globalResult, 'global', 'day')
 				}
 
 				if (globalResult.code === 'stale_day') {

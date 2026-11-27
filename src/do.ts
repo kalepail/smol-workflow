@@ -19,10 +19,8 @@ export class SmolDurableObject extends DurableObject<Env> {
 	}
 
 	/**
-	 * Persist a single workflow step key in DO storage.
-	 * New v2 workflow calls pass `{ persistMedia: false }` and manage R2 uploads explicitly
-	 * in dedicated workflow steps (after swap resolution / inside the ElevenLabs step).
-	 * Legacy 2-argument callers keep backwards-compatible R2 behavior during drain.
+	 * Persist a single workflow step key in DO storage. `{ persistMedia: false }` skips the cover PNG
+	 * upload that a 2-argument `image_base64` save performs.
 	 */
 	async saveStep(step: string, data: any, options?: { persistMedia?: boolean }) {
 		if (step !== 'retry_chain_root_id') {
@@ -39,38 +37,13 @@ export class SmolDurableObject extends DurableObject<Env> {
 			return;
 		}
 
-		switch (step) {
-			case 'image_base64':
-				if (typeof data === 'string' && data.length > 0) {
-					await this.env.SMOL_BUCKET.put(`${this.id}.png`, Buffer.from(data, 'base64'), {
-						httpMetadata: { contentType: 'image/png' },
-						customMetadata: { smolId: this.id },
-					});
-				}
-				break;
-
-			case 'songs':
-				if (Array.isArray(data)) {
-					for (const song of data) {
-						if (song?.audio && song.status >= 4 && song.music_id) {
-							const key = `${song.music_id}.mp3`;
-							if (!await this.env.SMOL_BUCKET.head(key)) {
-								const res = await fetch(song.audio, { signal: AbortSignal.timeout(30_000) });
-								if (!res.ok) {
-									throw new Error(`Failed to fetch song audio: ${song.audio} (${res.status})`);
-								}
-								await this.env.SMOL_BUCKET.put(key, await res.arrayBuffer(), {
-									httpMetadata: { contentType: 'audio/mpeg' },
-									customMetadata: {
-										smolId: this.id,
-										provider: song.service || 'aisonggenerator',
-									},
-								});
-							}
-						}
-					}
-				}
-				break;
+		// The cover PNG is the only media written here (2-argument `saveStep('image_base64', b64)`);
+		// song audio goes to R2 inside the music steps.
+		if (step === 'image_base64' && typeof data === 'string' && data.length > 0) {
+			await this.env.SMOL_BUCKET.put(`${this.id}.png`, Buffer.from(data, 'base64'), {
+				httpMetadata: { contentType: 'image/png' },
+				customMetadata: { smolId: this.id },
+			});
 		}
 	}
 

@@ -330,7 +330,6 @@ type WorkflowParams = {
 	quota_day_key?: string
 	quota_provider?: MusicProvider
 	quota_reuse_only?: boolean
-	workflow_version?: number
 }
 
 type WorkflowTxParams = {

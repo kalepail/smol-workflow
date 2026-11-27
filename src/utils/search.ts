@@ -160,76 +160,33 @@ type SearchBackfillPageRow = {
 
 type SearchBackfillCronStatus = 'idle' | 'waiting' | 'complete'
 
-type SearchBackfillCronHealth = 'healthy' | 'watching' | 'stalled' | 'complete' | 'disabled'
-
-type SearchBackfillVectorizeSnapshot = {
-	processed_up_to_mutation?: string
-	processed_up_to_datetime?: string
-	vector_count?: number
-	dimensions?: number
-}
-
-type SearchBackfillCronRun = {
-	at: string
-	status: SearchBackfillCronStatus
-	cursor?: string
-	next_cursor: string | null
+type SearchBackfillCronStats = {
 	page_size: number
 	queued: number
 	ready: number
 	requeued: number
 	pending: number
-	cursor_advanced: boolean
-	made_progress: boolean
-	stalled: boolean
-	vectorize: SearchBackfillVectorizeSnapshot
+	has_more: boolean
 }
 
 type SearchBackfillCronState = {
 	version: string
 	status: SearchBackfillCronStatus
-	health: SearchBackfillCronHealth
 	cursor?: string
 	updated_at: string
-	last_progress_at?: string
-	page_limit: number
-	stall_threshold_runs: number
-	consecutive_stalled_runs: number
-	last_next_cursor: string | null
-	last_vectorize: SearchBackfillVectorizeSnapshot
-	last_stats: {
-		page_size: number
-		queued: number
-		skipped: Record<BatchQueueSkipReason, number>
-		reconcile: {
-			ready: number
-			requeued: number
-			skipped: Record<ReconcileSkipReason, number>
-		}
-		has_more: boolean
-	}
-	recent_runs: SearchBackfillCronRun[]
+	last_stats?: Partial<SearchBackfillCronStats>
 }
 
 export type SearchBackfillCronResult = {
-	status: 'disabled' | 'idle' | 'waiting' | 'complete'
-	health: SearchBackfillCronHealth
+	status: 'disabled' | SearchBackfillCronStatus
 	cursor?: string
-	nextCursor: string | null
+	updatedAt?: string
 	pageSize: number
 	queued: number
-	skipped: Record<BatchQueueSkipReason, number>
-	reconcile: {
-		ready: number
-		requeued: number
-		skipped: Record<ReconcileSkipReason, number>
-	}
+	ready: number
+	requeued: number
+	pending: number
 	hasMore: boolean
-	lastProgressAt?: string
-	consecutiveStalledRuns: number
-	stallThresholdRuns: number
-	vectorize: SearchBackfillVectorizeSnapshot
-	recentRuns?: SearchBackfillCronRun[]
 }
 
 export type SearchResultItem = {
@@ -255,10 +212,8 @@ export type SearchResponse = {
 
 const ACK_QUEUE_MESSAGE: SearchQueueDisposition = { action: 'ack' }
 const SEARCH_BACKFILL_CRON_STATE_KEY = '__internal:search-backfill:v2'
-const DEFAULT_SEARCH_BACKFILL_CRON_PAGE_LIMIT = 20
-const DEFAULT_SEARCH_BACKFILL_CRON_STALL_RUNS = 6
-const DEFAULT_SEARCH_BACKFILL_CRON_MAX_WAVES = 5
-const SEARCH_BACKFILL_CRON_RUN_HISTORY_LIMIT = 12
+const SEARCH_BACKFILL_CRON_PAGE_LIMIT = 20
+const SEARCH_BACKFILL_CRON_MAX_WAVES = 5
 
 function logSearchEvent(event: string, details: Record<string, unknown>): void {
 	console.log({
@@ -289,99 +244,24 @@ function parseEnvBoolean(value: unknown, fallback = false): boolean {
 	return fallback
 }
 
-function parseEnvPageLimit(value: unknown, fallback: number): number {
-	if (typeof value !== 'string') {
-		return fallback
-	}
-
-	const parsed = Number.parseInt(value, 10)
-	if (!Number.isFinite(parsed) || parsed < 1) {
-		return fallback
-	}
-
-	return Math.min(parsed, 100)
-}
-
-function parseEnvPositiveInt(value: unknown, fallback: number): number {
-	if (typeof value !== 'string') {
-		return fallback
-	}
-
-	const parsed = Number.parseInt(value, 10)
-	if (!Number.isFinite(parsed) || parsed < 1) {
-		return fallback
-	}
-
-	return parsed
-}
-
-function normalizeSearchBackfillVectorizeSnapshot(info: SearchIndexDescribeSnapshot): SearchBackfillVectorizeSnapshot {
+function toSearchBackfillCronResult(state: SearchBackfillCronState | null): SearchBackfillCronResult {
+	// Tolerates the older state shape (stall history, nested reconcile stats) still stored in KV.
+	const stats = (state?.last_stats ?? {}) as Partial<SearchBackfillCronStats> & { reconcile?: { ready?: number; requeued?: number; skipped?: { pending?: number } } }
 	return {
-		processed_up_to_mutation: normalizeMutationTrackerValue(info.processedUpToMutation),
-		processed_up_to_datetime: typeof info.processedUpToDatetime === 'string'
-			? info.processedUpToDatetime
-			: (typeof normalizeMutationTimestamp(info.processedUpToDatetime) === 'number'
-				? new Date(normalizeMutationTimestamp(info.processedUpToDatetime) as number).toISOString()
-				: undefined),
-		vector_count: typeof info.vectorCount === 'number' ? info.vectorCount : undefined,
-		dimensions: typeof info.dimensions === 'number' ? info.dimensions : undefined,
+		status: state?.status ?? 'idle',
+		cursor: state?.cursor,
+		updatedAt: state?.updated_at,
+		pageSize: stats.page_size ?? 0,
+		queued: stats.queued ?? 0,
+		ready: stats.ready ?? stats.reconcile?.ready ?? 0,
+		requeued: stats.requeued ?? stats.reconcile?.requeued ?? 0,
+		pending: stats.pending ?? stats.reconcile?.skipped?.pending ?? 0,
+		hasMore: stats.has_more ?? state?.status !== 'complete',
 	}
 }
 
-function hasVectorizeProgress(
-	current: SearchBackfillVectorizeSnapshot,
-	previous: SearchBackfillVectorizeSnapshot | undefined
-): boolean {
-	if (!previous) {
-		return Boolean(
-			current.processed_up_to_mutation
-			|| current.processed_up_to_datetime
-			|| current.vector_count
-		)
-	}
-
-	return current.processed_up_to_mutation !== previous.processed_up_to_mutation
-		|| current.processed_up_to_datetime !== previous.processed_up_to_datetime
-		|| (current.vector_count ?? -1) > (previous.vector_count ?? -1)
-}
-
-function defaultSearchBackfillReconcileSkipped(): Record<ReconcileSkipReason, number> {
-	return {
-		current: 0,
-		hidden: 0,
-		pending: 0,
-		missing: 0,
-		no_state: 0,
-	}
-}
-
-function defaultSearchBackfillBatchSkipped(): Record<BatchQueueSkipReason, number> {
-	return {
-		current: 0,
-		pending: 0,
-		missing: 0,
-	}
-}
-
-function buildSearchBackfillCronResultFromState(
-	state: SearchBackfillCronState
-): SearchBackfillCronResult {
-	return {
-		status: state.status,
-		health: state.health,
-		cursor: state.cursor,
-		nextCursor: state.last_next_cursor,
-		pageSize: state.last_stats.page_size,
-		queued: state.last_stats.queued,
-		skipped: state.last_stats.skipped,
-		reconcile: state.last_stats.reconcile,
-		hasMore: state.last_stats.has_more,
-		lastProgressAt: state.last_progress_at,
-		consecutiveStalledRuns: state.consecutive_stalled_runs,
-		stallThresholdRuns: state.stall_threshold_runs,
-		vectorize: state.last_vectorize,
-		recentRuns: state.recent_runs,
-	}
+const DISABLED_SEARCH_BACKFILL_CRON_RESULT: SearchBackfillCronResult = {
+	status: 'disabled', pageSize: 0, queued: 0, ready: 0, requeued: 0, pending: 0, hasMore: false,
 }
 
 export function normalizeText(input: string | undefined | null): string {
@@ -502,97 +382,15 @@ async function putStoredSmolRecord(env: Env, smolId: string, record: StoredSmolR
 }
 
 async function getSearchBackfillCronState(env: Env): Promise<SearchBackfillCronState | null> {
-	return await env.SMOL_KV.get(SEARCH_BACKFILL_CRON_STATE_KEY, 'json') as SearchBackfillCronState | null
-}
-
-async function putSearchBackfillCronState(env: Env, state: SearchBackfillCronState): Promise<void> {
-	await env.SMOL_KV.put(SEARCH_BACKFILL_CRON_STATE_KEY, JSON.stringify(state))
-}
-
-function normalizeSearchBackfillCronState(
-	state: SearchBackfillCronState,
-	stallThresholdRuns: number
-): SearchBackfillCronState {
-	return {
-		version: state.version,
-		status: state.status,
-		health: state.health ?? (state.status === 'complete'
-			? 'complete'
-			: (state.status === 'waiting' ? 'watching' : 'healthy')),
-		cursor: state.cursor,
-		updated_at: state.updated_at,
-		last_progress_at: state.last_progress_at ?? state.updated_at,
-		page_limit: state.page_limit ?? DEFAULT_SEARCH_BACKFILL_CRON_PAGE_LIMIT,
-		stall_threshold_runs: state.stall_threshold_runs ?? stallThresholdRuns,
-		consecutive_stalled_runs: state.consecutive_stalled_runs ?? 0,
-		last_next_cursor: state.last_next_cursor ?? null,
-		last_vectorize: state.last_vectorize ?? {},
-		last_stats: {
-			page_size: state.last_stats?.page_size ?? 0,
-			queued: state.last_stats?.queued ?? 0,
-			skipped: state.last_stats?.skipped ?? defaultSearchBackfillBatchSkipped(),
-			reconcile: {
-				ready: state.last_stats?.reconcile?.ready ?? 0,
-				requeued: state.last_stats?.reconcile?.requeued ?? 0,
-				skipped: state.last_stats?.reconcile?.skipped ?? defaultSearchBackfillReconcileSkipped(),
-			},
-			has_more: state.last_stats?.has_more ?? true,
-		},
-		recent_runs: state.recent_runs ?? [],
-	}
+	const state = await env.SMOL_KV.get(SEARCH_BACKFILL_CRON_STATE_KEY, 'json') as SearchBackfillCronState | null
+	return state?.version === SEARCH_INDEX_VERSION ? state : null
 }
 
 export async function getSearchBackfillCronStatus(env: Env): Promise<SearchBackfillCronResult> {
-	const stallThresholdRuns = parseEnvPositiveInt(
-		env.SEARCH_BACKFILL_CRON_STALL_RUNS,
-		DEFAULT_SEARCH_BACKFILL_CRON_STALL_RUNS
-	)
 	if (!parseEnvBoolean(env.SEARCH_BACKFILL_CRON_ENABLED, false)) {
-		return {
-			status: 'disabled',
-			health: 'disabled',
-			nextCursor: null,
-			pageSize: 0,
-			queued: 0,
-			skipped: defaultSearchBackfillBatchSkipped(),
-			reconcile: {
-				ready: 0,
-				requeued: 0,
-				skipped: defaultSearchBackfillReconcileSkipped(),
-			},
-			hasMore: false,
-			consecutiveStalledRuns: 0,
-			stallThresholdRuns,
-			vectorize: {},
-			recentRuns: [],
-		}
+		return DISABLED_SEARCH_BACKFILL_CRON_RESULT
 	}
-
-	const savedState = await getSearchBackfillCronState(env)
-	if (!savedState || savedState.version !== SEARCH_INDEX_VERSION) {
-		return {
-			status: 'idle',
-			health: 'healthy',
-			nextCursor: null,
-			pageSize: 0,
-			queued: 0,
-			skipped: defaultSearchBackfillBatchSkipped(),
-			reconcile: {
-				ready: 0,
-				requeued: 0,
-				skipped: defaultSearchBackfillReconcileSkipped(),
-			},
-			hasMore: true,
-			consecutiveStalledRuns: 0,
-			stallThresholdRuns,
-			vectorize: {},
-			recentRuns: [],
-		}
-	}
-
-	return buildSearchBackfillCronResultFromState(
-		normalizeSearchBackfillCronState(savedState, stallThresholdRuns)
-	)
+	return toSearchBackfillCronResult(await getSearchBackfillCronState(env))
 }
 
 async function updateStoredSmolRecord(
@@ -1063,33 +861,12 @@ async function extractSearchMetadata(env: Env, source: SmolIndexSource): Promise
 		if (parsed) {
 			return parsed
 		}
-	} catch (error) {
-		logSearchEvent('search_metadata_json_mode_failed', {
-			title: source.title,
-			error: error instanceof Error ? error.message : String(error),
-		})
-	}
-
-	try {
-		const response = await env.AI.run(TAG_EXTRACTION_MODEL, {
-			messages,
-			max_completion_tokens: 250,
-			temperature: 0,
-			chat_template_kwargs: { enable_thinking: false },
-		}) as TagExtractionOutput
-
-		const parsed = parseMetadataResponse(response)
-		if (parsed) {
-			return parsed
-		}
 
 		const content = extractTextGenerationContent(response)
 		logSearchEvent('search_metadata_parse_failed', {
 			title: source.title,
 			finishReason: response.choices?.[0]?.finish_reason ?? undefined,
-			responsePreview: typeof content === 'string'
-				? truncateText(content, 200)
-				: content,
+			responsePreview: typeof content === 'string' ? truncateText(content, 200) : content,
 		})
 	} catch (error) {
 		logSearchEvent('search_metadata_generation_failed', {
@@ -1991,7 +1768,7 @@ export async function getSearchBackfillPage(
 		cursor?: string
 	}
 ): Promise<{ rows: SearchBackfillPageRow[]; pagination: PaginationResponse }> {
-	const effectiveLimit = Math.min(Math.max(params.limit ?? DEFAULT_SEARCH_BACKFILL_CRON_PAGE_LIMIT, 1), 100)
+	const effectiveLimit = Math.min(Math.max(params.limit ?? SEARCH_BACKFILL_CRON_PAGE_LIMIT, 1), 100)
 	const whereClause = buildCursorWhereClause(params.cursor, 'Public = 1')
 	const bindings: unknown[] = []
 
@@ -2017,273 +1794,73 @@ export async function getSearchBackfillPage(
 	return { rows: items, pagination }
 }
 
+/**
+ * Scheduled sweep of public smols for the current SEARCH_INDEX_VERSION: up to 5 pages per run, holding the
+ * cursor while a page still has queued or Vectorize-pending work, and a no-op once complete. Repairs after
+ * that go through the admin backfill/reconcile endpoints and the queue's retries + DLQ.
+ */
 export async function runSearchBackfillCron(env: Env): Promise<SearchBackfillCronResult> {
-	const stallThresholdRuns = parseEnvPositiveInt(
-		env.SEARCH_BACKFILL_CRON_STALL_RUNS,
-		DEFAULT_SEARCH_BACKFILL_CRON_STALL_RUNS
-	)
 	if (!parseEnvBoolean(env.SEARCH_BACKFILL_CRON_ENABLED, false)) {
-		return {
-			status: 'disabled',
-			health: 'disabled',
-			nextCursor: null,
-			pageSize: 0,
-			queued: 0,
-			skipped: defaultSearchBackfillBatchSkipped(),
-			reconcile: {
-				ready: 0,
-				requeued: 0,
-				skipped: defaultSearchBackfillReconcileSkipped(),
-			},
-			hasMore: false,
-			consecutiveStalledRuns: 0,
-			stallThresholdRuns,
-			vectorize: {},
-			recentRuns: [],
-		}
+		return DISABLED_SEARCH_BACKFILL_CRON_RESULT
 	}
 
-	const pageLimit = parseEnvPageLimit(
-		env.SEARCH_BACKFILL_CRON_PAGE_LIMIT,
-		DEFAULT_SEARCH_BACKFILL_CRON_PAGE_LIMIT
-	)
-	const maxWaves = parseEnvPositiveInt(
-		env.SEARCH_BACKFILL_CRON_MAX_WAVES,
-		DEFAULT_SEARCH_BACKFILL_CRON_MAX_WAVES
-	)
-	const rawSavedState = await getSearchBackfillCronState(env)
-	const savedState = rawSavedState && rawSavedState.version === SEARCH_INDEX_VERSION
-		? normalizeSearchBackfillCronState(rawSavedState, stallThresholdRuns)
-		: rawSavedState
-	if (savedState?.status === 'complete' && savedState.version === SEARCH_INDEX_VERSION) {
-		return buildSearchBackfillCronResultFromState(savedState)
+	const saved = await getSearchBackfillCronState(env)
+	if (saved?.status === 'complete') {
+		return toSearchBackfillCronResult(saved)
 	}
 
-	const initialCursor = savedState?.version === SEARCH_INDEX_VERSION ? savedState.cursor : undefined
-	let cursor = initialCursor
-	let finalCursor = cursor
-	let finalNextCursor: string | null = savedState?.version === SEARCH_INDEX_VERSION ? savedState.last_next_cursor : null
-	let finalStatus: SearchBackfillCronResult['status'] = 'idle'
-	let finalHasMore = false
-	let finalVectorize = savedState?.version === SEARCH_INDEX_VERSION ? savedState.last_vectorize : {}
-	let totalPageSize = 0
-	let totalQueued = 0
-	const totalSkipped = defaultSearchBackfillBatchSkipped()
-	const totalReconcileSkipped = defaultSearchBackfillReconcileSkipped()
-	let totalReady = 0
-	let totalRequeued = 0
-	let wavesProcessed = 0
+	const startCursor = saved?.cursor
+	let cursor = startCursor
+	let status: SearchBackfillCronStatus = 'idle'
+	const stats: SearchBackfillCronStats = { page_size: 0, queued: 0, ready: 0, requeued: 0, pending: 0, has_more: true }
 
-	for (let wave = 0; wave < maxWaves; wave += 1) {
-		const info = await getSearchIndex(env).describe()
-		finalVectorize = normalizeSearchBackfillVectorizeSnapshot(info)
-		const page = await getSearchBackfillPage(env, {
-			limit: pageLimit,
-			cursor,
-		})
+	for (let wave = 0; wave < SEARCH_BACKFILL_CRON_MAX_WAVES; wave += 1) {
+		const page = await getSearchBackfillPage(env, { limit: SEARCH_BACKFILL_CRON_PAGE_LIMIT, cursor })
 		const smolIds = page.rows.map(({ Id }) => Id)
-
 		if (!smolIds.length) {
-			const state: SearchBackfillCronState = {
-				version: SEARCH_INDEX_VERSION,
-				status: 'complete',
-				health: 'complete',
-				cursor: undefined,
-				updated_at: nowIso(),
-				last_progress_at: nowIso(),
-				page_limit: pageLimit,
-				stall_threshold_runs: stallThresholdRuns,
-				consecutive_stalled_runs: 0,
-				last_next_cursor: null,
-				last_vectorize: finalVectorize,
-				last_stats: {
-					page_size: totalPageSize,
-					queued: totalQueued,
-					skipped: totalSkipped,
-					reconcile: {
-						ready: totalReady,
-						requeued: totalRequeued,
-						skipped: totalReconcileSkipped,
-					},
-					has_more: false,
-				},
-				recent_runs: savedState?.version === SEARCH_INDEX_VERSION ? savedState.recent_runs : [],
-			}
-			await putSearchBackfillCronState(env, state)
-			logSearchEvent('search_backfill_cron_complete', {
-				cursor,
-				pageLimit,
-				maxWaves,
-				wavesProcessed,
-			})
-			return buildSearchBackfillCronResultFromState(state)
-		}
-
-		wavesProcessed += 1
-		totalPageSize += smolIds.length
-		const batch = await queueSearchIndexingBatchById(env, smolIds)
-		const reconcile = await reconcileSearchIndexingBatchById(env, smolIds)
-		totalQueued += batch.queuedIds.length
-		totalReady += reconcile.readyIds.length
-		totalRequeued += reconcile.requeuedIds.length
-		for (const reason of Object.keys(totalSkipped) as BatchQueueSkipReason[]) {
-			totalSkipped[reason] += batch.skipped[reason]
-		}
-		for (const reason of Object.keys(totalReconcileSkipped) as ReconcileSkipReason[]) {
-			totalReconcileSkipped[reason] += reconcile.skipped[reason]
-		}
-
-		const shouldHoldCursor = batch.queuedIds.length > 0 || reconcile.skipped.pending > 0
-		finalNextCursor = page.pagination.nextCursor
-		finalHasMore = page.pagination.hasMore
-		if (shouldHoldCursor) {
-			finalStatus = 'waiting'
-			finalCursor = cursor
+			status = 'complete'
+			cursor = undefined
+			stats.has_more = false
 			break
 		}
 
+		const info = await getSearchIndex(env).describe()
+		const batch = await queueSearchIndexingBatchById(env, smolIds, { info })
+		const reconcile = await reconcileSearchIndexingBatchById(env, smolIds, info)
+		stats.page_size += smolIds.length
+		stats.queued += batch.queuedIds.length
+		stats.ready += reconcile.readyIds.length
+		stats.requeued += reconcile.requeuedIds.length
+		stats.pending += reconcile.skipped.pending
+		stats.has_more = page.pagination.hasMore
+
+		if (batch.queuedIds.length > 0 || reconcile.skipped.pending > 0) {
+			status = 'waiting'
+			break
+		}
 		if (!page.pagination.hasMore) {
-			finalStatus = 'complete'
-			finalCursor = undefined
-			finalNextCursor = null
+			status = 'complete'
+			cursor = undefined
 			break
 		}
-
 		cursor = page.pagination.nextCursor ?? undefined
-		finalCursor = cursor
-		finalStatus = wave === maxWaves - 1 ? 'idle' : finalStatus
 	}
 
-	if (wavesProcessed > 0 && finalStatus === 'idle' && finalCursor === initialCursor) {
-		finalCursor = cursor
-	}
-
-	const nextStoredCursor = finalStatus === 'waiting'
-		? finalCursor
-		: (finalStatus === 'complete' ? undefined : finalCursor)
-	const previousPending = savedState?.version === SEARCH_INDEX_VERSION
-		? savedState.last_stats.reconcile.skipped.pending
-		: undefined
-	const currentPending = totalReconcileSkipped.pending
-	const cursorAdvanced = initialCursor !== nextStoredCursor
-	const pageProgress = totalReady > 0
-		|| totalRequeued > 0
-		|| (
-			finalStatus === 'waiting'
-			&& savedState?.version === SEARCH_INDEX_VERSION
-			&& savedState.cursor === finalCursor
-			&& previousPending !== undefined
-			&& currentPending < previousPending
-		)
-	const vectorizeProgress = hasVectorizeProgress(
-		finalVectorize,
-		savedState?.version === SEARCH_INDEX_VERSION ? savedState.last_vectorize : undefined
-	)
-	const madeProgress = finalStatus === 'complete'
-		|| cursorAdvanced
-		|| pageProgress
-		|| vectorizeProgress
-	const stalled = finalStatus === 'waiting'
-		&& savedState?.version === SEARCH_INDEX_VERSION
-		&& savedState.status === 'waiting'
-		&& savedState.cursor === finalCursor
-		&& currentPending === previousPending
-		&& !pageProgress
-		&& !vectorizeProgress
-	const consecutiveStalledRuns = stalled
-		? (savedState?.consecutive_stalled_runs ?? 0) + 1
-		: 0
-	const health: SearchBackfillCronHealth = finalStatus === 'complete'
-		? 'complete'
-		: (consecutiveStalledRuns >= stallThresholdRuns
-			? 'stalled'
-			: (finalStatus === 'waiting' && !madeProgress ? 'watching' : 'healthy'))
-	const updatedAt = nowIso()
-	const lastProgressAt = madeProgress
-		? updatedAt
-		: savedState?.version === SEARCH_INDEX_VERSION
-			? savedState.last_progress_at
-			: undefined
-	const recentRun: SearchBackfillCronRun = {
-		at: updatedAt,
-		status: finalStatus,
-		cursor: initialCursor,
-		next_cursor: finalNextCursor,
-		page_size: totalPageSize,
-		queued: totalQueued,
-		ready: totalReady,
-		requeued: totalRequeued,
-		pending: currentPending,
-		cursor_advanced: cursorAdvanced,
-		made_progress: madeProgress,
-		stalled,
-		vectorize: finalVectorize,
-	}
-	const recentRuns = [
-		recentRun,
-		...(savedState?.version === SEARCH_INDEX_VERSION ? savedState.recent_runs : []),
-	].slice(0, SEARCH_BACKFILL_CRON_RUN_HISTORY_LIMIT)
-
-	await putSearchBackfillCronState(env, {
+	const state: SearchBackfillCronState = {
 		version: SEARCH_INDEX_VERSION,
-		status: finalStatus,
-		health,
-		cursor: nextStoredCursor,
-		updated_at: updatedAt,
-		last_progress_at: lastProgressAt,
-		page_limit: pageLimit,
-		stall_threshold_runs: stallThresholdRuns,
-		consecutive_stalled_runs: consecutiveStalledRuns,
-		last_next_cursor: finalNextCursor,
-		last_vectorize: finalVectorize,
-		last_stats: {
-			page_size: totalPageSize,
-			queued: totalQueued,
-			skipped: totalSkipped,
-			reconcile: {
-				ready: totalReady,
-				requeued: totalRequeued,
-				skipped: totalReconcileSkipped,
-			},
-			has_more: finalHasMore,
-		},
-		recent_runs: recentRuns,
-	})
-
-	logSearchEvent('search_backfill_cron_step', {
-		status: finalStatus,
-		health,
-		cursor: initialCursor,
-		nextCursor: finalNextCursor,
-		pageSize: totalPageSize,
-		wavesProcessed,
-		cursorAdvanced,
-		madeProgress,
-		stalled,
-		consecutiveStalledRuns,
-		queued: totalQueued,
-		skipped: totalSkipped,
-		reconcile: {
-			ready: totalReady,
-			requeued: totalRequeued,
-			skipped: totalReconcileSkipped,
-		},
-		vectorize: finalVectorize,
-		hasMore: finalHasMore,
-	})
-
-	if (health === 'stalled') {
-		logSearchEvent('search_backfill_cron_stalled', {
-			cursor: finalCursor,
-			nextCursor: finalNextCursor,
-			consecutiveStalledRuns,
-			stallThresholdRuns,
-			pending: currentPending,
-			vectorize: finalVectorize,
-		})
+		status,
+		cursor,
+		updated_at: nowIso(),
+		last_stats: stats,
 	}
-
-	return await getSearchBackfillCronStatus(env)
+	await env.SMOL_KV.put(SEARCH_BACKFILL_CRON_STATE_KEY, JSON.stringify(state))
+	logSearchEvent(status === 'complete' ? 'search_backfill_cron_complete' : 'search_backfill_cron_step', {
+		status,
+		cursor: startCursor,
+		nextCursor: cursor,
+		...stats,
+	})
+	return toSearchBackfillCronResult(state)
 }
 
 async function hydrateRankedCandidates(env: Env, ranked: RankedCandidate[], limit: number): Promise<SearchResultItem[]> {
@@ -2400,7 +1977,7 @@ function isSearchMutationStillPending(
 export async function queueSearchIndexingBatchById(
 	env: Env,
 	smolIds: string[],
-	options: { force?: boolean } = {}
+	options: { force?: boolean; info?: SearchIndexDescribeSnapshot } = {}
 ): Promise<BatchQueueResult> {
 	const uniqueSmolIds = uniqueStrings(smolIds)
 	if (!uniqueSmolIds.length) {
@@ -2414,7 +1991,7 @@ export async function queueSearchIndexingBatchById(
 		}
 	}
 
-	const info = await getSearchIndex(env).describe()
+	const info = options.info ?? await getSearchIndex(env).describe()
 	const progress = {
 		processedMutation: normalizeMutationTrackerValue(info.processedUpToMutation),
 		processedAt: normalizeMutationTimestamp(info.processedUpToDatetime),
@@ -2472,7 +2049,11 @@ export async function queueSearchIndexingBatchById(
 	}
 }
 
-export async function reconcileSearchIndexingBatchById(env: Env, smolIds: string[]): Promise<SearchReconcileResult> {
+export async function reconcileSearchIndexingBatchById(
+	env: Env,
+	smolIds: string[],
+	describeSnapshot?: SearchIndexDescribeSnapshot
+): Promise<SearchReconcileResult> {
 	const uniqueSmolIds = uniqueStrings(smolIds)
 	const result: SearchReconcileResult = {
 		readyIds: [],
@@ -2490,14 +2071,17 @@ export async function reconcileSearchIndexingBatchById(env: Env, smolIds: string
 		return result
 	}
 
-	const info = await getSearchIndex(env).describe()
+	const [info, records] = await Promise.all([
+		describeSnapshot ?? getSearchIndex(env).describe(),
+		Promise.all(uniqueSmolIds.map((smolId) => getStoredSmolRecord(env, smolId))),
+	])
 	const watermark = {
 		processedMutation: normalizeMutationTrackerValue(info.processedUpToMutation),
 		processedAt: normalizeMutationTimestamp(info.processedUpToDatetime),
 	}
 
-	for (const smolId of uniqueSmolIds) {
-		const record = await getStoredSmolRecord(env, smolId)
+	for (const [index, smolId] of uniqueSmolIds.entries()) {
+		const record = records[index]
 		if (!record) {
 			result.skipped.missing += 1
 			continue

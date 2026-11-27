@@ -2,7 +2,6 @@ import { Hono } from 'hono'
 import { HTTPException } from 'hono/http-exception'
 import type { HonoEnv } from '../types'
 import { parseAuth } from '../middleware/auth'
-import { purgeUserLikedCache } from '../utils/cache'
 import { privateNoStore } from '../utils/http'
 
 const likes = new Hono<HonoEnv>()
@@ -33,10 +32,8 @@ likes.put('/:id', parseAuth, async (c) => {
 		.bind(id, payload.sub)
 		.run()
 
+	// Like state is only ever served from private/no-store responses, so there is no shared cache to purge.
 	if (deleteResult.meta.changes > 0) {
-		c.executionCtx.waitUntil(
-			purgeUserLikedCache(payload.sub, id)
-		)
 		return c.body(null, 204)
 	}
 
@@ -53,12 +50,6 @@ likes.put('/:id', parseAuth, async (c) => {
 	await env.SMOL_D1.prepare(`INSERT OR IGNORE INTO Likes (Id, "Address") VALUES (?1, ?2)`)
 		.bind(id, payload.sub)
 		.run()
-
-	// Purge cache for this user's liked and likes lists, plus the individual smol detail page
-	// This ensures the liked button updates immediately on the smol detail page
-	c.executionCtx.waitUntil(
-		purgeUserLikedCache(payload.sub, id)
-	)
 
 	return c.body(null, 204)
 })

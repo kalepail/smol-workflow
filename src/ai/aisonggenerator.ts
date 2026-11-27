@@ -337,7 +337,7 @@ Put [Section] headings on their own lines. Never write stage directions or instr
 /**
  * Submit a paid AISG v6 generation task without blocking on song ID discovery.
  * Passes Idempotency-Key / attempt_id when provided so aisonggenerator-worker can deduplicate
- * and reconcile retries safely. Falls back to POST /api/songs only on HTTP 404 (staged rollout).
+ * and reconcile retries safely.
  */
 export async function submitAisgTask(
 	env: Env,
@@ -386,15 +386,6 @@ export async function submitAisgTask(
 		});
 	}
 
-	// Staged rollout fallback: if aisonggenerator-worker does not expose /api/tasks yet, use POST /api/songs.
-	if (res.status === 404) {
-		const songIds = await generateSongs(env, prompt, description, lyrics, is_public, is_instrumental, attemptId, smolId);
-		return {
-			kind: 'song_ids',
-			song_ids: normalizeDistinctSongIds(songIds),
-		};
-	}
-
 	if (!res.ok) {
 		const errText = await res.text().catch(() => '');
 		throw classifyAisgHttpError(res.status, errText, { isPaidSubmit: true });
@@ -438,7 +429,6 @@ export async function submitAisgTask(
  * - payload hash mismatch       -> 409 `idempotency_conflict`
  * - no receipt (never dispatched, or a confirmed rejection cleared it) -> first submit under this key
  * The payload must match submitAisgTask byte-for-byte in its fields, or the hash check returns 409.
- * Never falls back to the legacy /api/songs route.
  */
 export async function replayAisgTaskSubmit(
 	env: Env,
@@ -539,60 +529,6 @@ export async function discoverAisgTaskSongs(
 		music_ids: normalizeDistinctSongIds(data?.music_ids),
 		...(nextPage !== undefined ? { next_page: nextPage } : {}),
 	};
-}
-
-// Legacy AISG song submission route (used only during staged rollout if /api/tasks returns 404)
-export async function generateSongs(
-	env: Env,
-	prompt: string,
-	description: string,
-	lyrics: AiSongGeneratorLyrics,
-	is_public = true,
-	is_instrumental = false,
-	attemptId?: string,
-	smolId?: string
-): Promise<string[]> {
-	const headers: Record<string, string> = {
-		'Content-Type': 'application/json',
-	};
-	if (attemptId) {
-		headers['Idempotency-Key'] = attemptId;
-	}
-	if (smolId) {
-		headers['X-Smol-Id'] = smolId;
-	}
-
-	let res: Response;
-	try {
-		res = await env.AISONGGENERATOR.fetch('http://aisonggenerator-worker/api/songs', {
-			method: 'POST',
-			headers,
-			body: JSON.stringify({
-				...lyrics,
-				prompt,
-				description: aisgSubmitDescription(description, lyrics, is_instrumental),
-				public: is_public,
-				instrumental: is_instrumental,
-				...(attemptId ? { attempt_id: attemptId } : {}),
-			}),
-			signal: AbortSignal.timeout(45_000),
-		});
-	} catch (err) {
-		throw new AisgProviderError({
-			message: `AISG submit outcome unknown after dispatch: ${err instanceof Error ? err.message : String(err)}`,
-			code: 'submit_outcome_unknown',
-			retryable: false,
-			outcome: 'unknown',
-			fallbackEligible: false,
-		});
-	}
-
-	if (!res.ok) {
-		const errText = await res.text().catch(() => '');
-		throw classifyAisgHttpError(res.status, errText, { isPaidSubmit: true });
-	}
-
-	return normalizeDistinctSongIds(await res.json());
 }
 
 // Read-only AISG song status snapshot

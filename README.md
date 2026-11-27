@@ -38,7 +38,7 @@ src/
 │   ├── cf.ts                # Image description (@cf/moondream/moondream3.1-9B-A2B)
 │   ├── song-intent.ts       # Prompt intent extraction (@cf/deepseek-ai/deepseek-v4.1-flash-1017 + det fallback)
 │   ├── nsfw.ts              # Fail-closed NSFW classification (@cf/cloudflare/clef 27B + cover PNG)
-│   ├── aisonggenerator.ts   # AISG v6 HTTP Service Binding client (lyrics, split tasks, songs)
+│   ├── aisonggenerator.ts   # AISG v6 HTTP Service Binding client (lyrics, POST /api/tasks, discovery, song status)
 │   ├── elevenlabs.ts        # ElevenLabs Music v2.5 via Cloudflare AI Gateway BYOK -> R2
 │   └── mixtape-dedupe.ts    # Tier 2 clef-flash mixtape uniqueness tie-breaker (fail-open)
 ├── api/
@@ -63,7 +63,8 @@ src/
     ├── mixtape-visibility.ts# Tier 1 derived mixtape visibility rubric
     ├── audio-fingerprint.ts # Stream-capped 32KB audio swap fingerprinting (2-track AISG only)
     ├── search.ts            # Vectorize v2 indexing, queue consumer, DLQ recovery, cron backfill
-    ├── cache.ts             # Cloudflare cache tag invalidation
+    ├── cache.ts             # Cloudflare cache tag purge (100 tags/request)
+    ├── mint-status-prune.ts # Hourly prune of expired terminal MintBatchStatus rows
     └── pagination.ts        # Cursor-based pagination
 migrations/
 ├── 0001_smol_music_providers.sql        # Nullable Song_2 + Requested_Provider / Actual_Provider
@@ -115,7 +116,7 @@ migrations/
 - `ADMIN_SECRET` — Dedicated optional admin token (`x-admin-secret` or `Authorization: Bearer`) for `DELETE /admin/bulk` and `/search/admin/*`; admin routes fail closed with `404` when unset
 - `SK` — Stellar secret key for mint auth-entry signing
 - `PIXELLAB_KEY` — Pixellab API key
-- `CF_API_TOKEN` / `CF_ZONE_ID` — Cloudflare zone cache tag purge credentials
+- `CF_API_TOKEN` / `CF_ZONE_ID` — Cloudflare zone cache tag purge credentials (tags label cached copies only; `Cache-Tag` is stripped from every client response)
 - `CF_AIG_TOKEN` — Cloudflare AI Gateway Run token for ElevenLabs BYOK (fail-closed if missing)
 - `USER_QUOTA_OVERRIDES` — Optional JSON object keyed by Stellar address. Each entry can set `classic`, `elevenlabs`, or `burstPerMinute` to a non-negative integer.
 
@@ -130,14 +131,14 @@ migrations/
 - `PLAY_COUNT_MODE` — `beacon` (current live mode: count via `POST /plays/:musicId`) or `server` (count on media GET); optional `PLAY_BEACON_COOLDOWN_SECONDS` (30), `PLAY_BEACON_RATE_LIMIT_PER_MINUTE` (30)
 - `MIXTAPE_DEDUPE_AI_ENABLED` — Tier 2 clef-flash mixtape tie-breaker (enabled unless exactly `false`)
 - `RPC_URL`, `NETWORK_PASSPHRASE`, `SMOL_CONTRACT_ID` — Stellar mainnet RPC & contract config
-- `SEARCH_BACKFILL_CRON_*` — Search backfill cron controls (`ENABLED`, `PAGE_LIMIT`, `STALL_RUNS`, `MAX_WAVES`)
+- `SEARCH_BACKFILL_CRON_ENABLED` — Hourly search backfill sweep (`true` / `false`; 20-row pages, up to 5 per run)
 
 ### Bindings
 - **Workflows**: `WORKFLOW` (`Workflow`), `TX_WORKFLOW` (`TxWorkflow`)
 - **Durable Objects**: `DURABLE_OBJECT` (`SmolDurableObject`, v1), `DO_STATE` (`SmolState`, v2 — retained; live namespace contains stored data), and `USER_QUOTA` (`UserQuotaDO`, SQLite, v3 — quota + `play-gate:NN` beacon shards)
 - **Storage**: `SMOL_D1` (`smol-d1`), `SMOL_KV`, `SMOL_BUCKET` (`smol-r2`), `SMOL_SEARCH_INDEX` (`smol-search-index`), `SEARCH_QUEUE` (`smol-search-queue` + `smol-search-queue-dlq`)
 - **Services & AI**: `AI`, `AISONGGENERATOR` (`aisonggenerator-worker`), `KALE_WORKER` (`kale-worker`: relay + chain reads)
-- **Cron**: `0 * * * *` (search backfill; a no-op once a full pass completes — see `docs/search-index-setup.md`)
+- **Cron**: `0 * * * *` — search backfill (a no-op once a full pass completes; see `docs/search-index-setup.md`) and pruning of terminal `MintBatchStatus` rows whose TxWorkflow instance has expired (30-day `default_retention` on `TX_WORKFLOW`)
 
 ## Development & Verification
 
@@ -161,7 +162,7 @@ git diff --check
 pnpm start
 ```
 
-See [docs/workflows-and-media.md](./docs/workflows-and-media.md) (providers, quota, migrations, media, plays, mixtapes, chain, minting), [docs/music-provider-economics.md](./docs/music-provider-economics.md), [docs/search-index-setup.md](./docs/search-index-setup.md), and [docs/up-next.md](./docs/up-next.md) for details and backlog. The production cutover runbook is `smol/orchestration/CUTOVER_CHECKLIST.md`.
+See [docs/workflows-and-media.md](./docs/workflows-and-media.md) (providers, quota, migrations, media, plays, mixtapes, chain, minting), [docs/music-provider-economics.md](./docs/music-provider-economics.md), and [docs/search-index-setup.md](./docs/search-index-setup.md) for details. The production cutover runbook is `smol/orchestration/CUTOVER_CHECKLIST.md`.
 
 ## License
 

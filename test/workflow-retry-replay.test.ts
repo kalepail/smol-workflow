@@ -100,7 +100,7 @@ function createStep(cache: Map<string, unknown>, suspendBefore?: string) {
 	return { step, executed }
 }
 
-function createEnv(options: { flushedDurableObject?: boolean } = {}) {
+function createEnv(options: { flushedDurableObject?: boolean; coverPng?: Uint8Array | null } = {}) {
 	const retryState = {
 		payload: {
 			address: 'GORIGINALCREATOR',
@@ -129,11 +129,15 @@ function createEnv(options: { flushedDurableObject?: boolean } = {}) {
 		kvPut: [] as string[],
 		kvDelete: [] as string[],
 		r2Delete: [] as string[],
+		r2Get: [] as string[],
 		queue: [] as unknown[],
 	}
+	const coverPng = options.coverPng === undefined ? Buffer.from('image-bytes') : options.coverPng
 	const kv = new Map<string, string>()
 	if (options.flushedDurableObject) {
-		kv.set(RETRY_ID, JSON.stringify(retryState))
+		// Published KV detail carries `image: true`; the cover bytes live in R2 as `${id}.png`.
+		const { image_base64: _bytes, ...detail } = retryState
+		kv.set(RETRY_ID, JSON.stringify({ ...detail, image: true }))
 	}
 
 	const retryStub = {
@@ -186,6 +190,11 @@ function createEnv(options: { flushedDurableObject?: boolean } = {}) {
 				size: 1234,
 				customMetadata: { sourceUrl: key === 'song-1.mp3' ? 'https://example.com/1.mp3' : 'https://example.com/2.mp3' },
 			}),
+			get: async (key: string) => {
+				calls.r2Get.push(key)
+				if (key !== `${RETRY_ID}.png` || !coverPng) return null
+				return { size: coverPng.byteLength, arrayBuffer: async () => new Uint8Array(coverPng).buffer }
+			},
 			delete: async (key: string) => {
 				calls.r2Delete.push(key)
 			},
@@ -273,7 +282,32 @@ test('retry workflow falls back to KV when the durable object has flushed, and s
 		assert.equal(calls.retryGetSteps, 1)
 		assert.equal(payload.address, 'GORIGINALCREATOR')
 		assert.equal(payload.playlist, 'playlist-1')
-		assert.equal(image_base64, 'aW1hZ2UtYnl0ZXM=')
+		assert.equal(image_base64, 'aW1hZ2UtYnl0ZXM=', 'cover restored from the predecessor PNG in R2')
+		assert.deepEqual(calls.r2Get, [`${RETRY_ID}.png`], 'R2 read once; replay reuses the checkpointed snapshot')
+		const published = JSON.parse(await env.SMOL_KV.get(NEW_ID) as string) as Record<string, unknown>
+		assert.equal(published.image, true)
+		assert.equal('image_base64' in published, false, 'KV detail no longer stores cover bytes')
+	} finally {
+		console.warn = originalWarn
+	}
+})
+
+test('retry from KV with no predecessor PNG regenerates the cover and re-derives description and NSFW', async () => {
+	const { Workflow } = await loadWorkflow()
+	const { env } = createEnv({ flushedDurableObject: true, coverPng: null })
+	const cache = new Map<string, unknown>()
+	const event = { payload: { retry_id: RETRY_ID }, instanceId: NEW_ID, timestamp: new Date() }
+	const workflow = new Workflow({} as ExecutionContext, env as unknown as Env)
+	const originalWarn = console.warn
+	console.warn = () => {}
+	try {
+		// No PixelLab key in this env, so reaching the image step proves the cover is regenerated.
+		await assert.rejects(workflow.run(event as never, createStep(cache).step as never), /Missing Pixellab API key/)
+		const snapshot = cache.get('retry workflow#1') as WorkflowSteps
+		assert.equal(snapshot.image_base64, undefined)
+		assert.equal(snapshot.description, undefined)
+		assert.equal(snapshot.nsfw, undefined)
+		assert.ok(snapshot.lyrics, 'lyrics are independent of the cover and stay reused')
 	} finally {
 		console.warn = originalWarn
 	}
@@ -285,7 +319,7 @@ test('toRetrySnapshot returns null without a saved payload', async () => {
 	assert.equal(toRetrySnapshot({} as WorkflowSteps, RETRY_ID), null)
 })
 
-test('toRetrySnapshot drops an oversized image (and its NSFW verdict) so the step result stays under 1 MiB', async () => {
+test('toRetrySnapshot drops an oversized image (with its description and NSFW verdict) so the step result stays under 1 MiB', async () => {
 	const { toRetrySnapshot } = await loadWorkflow()
 	const originalWarn = console.warn
 	console.warn = () => {}
@@ -299,7 +333,7 @@ test('toRetrySnapshot drops an oversized image (and its NSFW verdict) so the ste
 
 		assert.equal(snapshot?.image_base64, undefined)
 		assert.equal(snapshot?.nsfw, undefined, 'a verdict never outlives the cover it judged')
-		assert.equal(snapshot?.description, 'd')
+		assert.equal(snapshot?.description, undefined, 'the description is re-derived from the regenerated cover')
 		assert.ok(JSON.stringify(snapshot).length < 1024 * 1024)
 	} finally {
 		console.warn = originalWarn

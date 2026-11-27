@@ -47,11 +47,6 @@ const config: WorkflowStepConfig = {
 // Non-stream step results are capped at 1 MiB. Leave headroom for encoding.
 const MAX_RETRY_SNAPSHOT_BYTES = 900 * 1024;
 
-function isSchemaCompatError(error: unknown): boolean {
-	const msg = error instanceof Error ? error.message : String(error);
-	return /no such column|has no column named|NOT NULL constraint failed:\s*Smols\.Song_2/i.test(msg);
-}
-
 /**
  * Reduce restored retry state to the fields `run` and `generateOrReuseSongs`
  * read, as a plain JSON value safe to persist as a step result.
@@ -85,12 +80,28 @@ export function toRetrySnapshot(restored: WorkflowSteps | null | undefined, retr
 
 	if (new TextEncoder().encode(JSON.stringify(snapshot)).byteLength > MAX_RETRY_SNAPSHOT_BYTES) {
 		console.warn('Retry snapshot too large for a step result; regenerating image', retry_id);
-		// A regenerated cover was never moderated: drop the verdict with the image it judged.
 		snapshot.image_base64 = undefined;
+	}
+	if (!snapshot.image_base64) {
+		// A regenerated cover was never described or moderated: drop what was derived from the old one.
+		snapshot.description = undefined;
 		snapshot.nsfw = undefined;
 	}
 
 	return snapshot;
+}
+
+/**
+ * The predecessor's cover as base64 from R2 (`${id}.png`, written by the image step), for retries
+ * restored from KV detail, which carries `image: true` instead of the bytes. `undefined` when the PNG
+ * is missing or too large for a step result; an R2 error throws so the step retries.
+ */
+async function readPredecessorCover(env: Env, retryId: string): Promise<string | undefined> {
+	const object = await env.SMOL_BUCKET.get(`${retryId}.png`);
+	if (!object || object.size <= 0 || object.size * 4 / 3 > MAX_RETRY_SNAPSHOT_BYTES) {
+		return undefined;
+	}
+	return Buffer.from(await object.arrayBuffer()).toString('base64');
 }
 
 async function persistSmolAndPlaylistD1(params: {
@@ -137,40 +148,13 @@ async function persistSmolAndPlaylistD1(params: {
 		: null;
 
 	// Replay can encounter a row published by the prior worker, so fill only missing tags.
-	for (const includeTags of [true, false]) {
-		const insert = env.SMOL_D1.prepare(`
-			INSERT INTO Smols (Id, Title, Song_1, Song_2, Address, Public, Instrumental,
-				Requested_Provider, Actual_Provider${includeTags ? ', Tags' : ''})
-			VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9${includeTags ? ', ?10' : ''})
-			ON CONFLICT (Id) DO ${includeTags ? 'UPDATE SET Tags = excluded.Tags WHERE Smols.Tags IS NULL' : 'NOTHING'}
-		`).bind(
-			id, title, song1, song2, address, isSearchPublic, isInstrumental, requestedProvider, actualProvider,
-			...(includeTags ? [JSON.stringify(tags)] : []),
-		);
-		try {
-			await runStatements(playlistStmt ? [insert, playlistStmt] : [insert]);
-			return;
-		} catch (err) {
-			if (!isSchemaCompatError(err)) throw err;
-		}
-	}
-
-	// Pre-migration compatibility fallback (Song_2 TEXT NOT NULL -> '' for 1-track Smols, no provider columns)
-	const preMigrationInsert = env.SMOL_D1.prepare(`
-		INSERT INTO Smols (Id, Title, Song_1, Song_2, Address, Public, Instrumental)
-		VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-		ON CONFLICT (Id) DO NOTHING
-	`).bind(
-		id,
-		title,
-		song1,
-		song2 ?? '',
-		address,
-		isSearchPublic,
-		isInstrumental,
-	);
-
-	await runStatements(playlistStmt ? [preMigrationInsert, playlistStmt] : [preMigrationInsert]);
+	const insert = env.SMOL_D1.prepare(`
+		INSERT INTO Smols (Id, Title, Song_1, Song_2, Address, Public, Instrumental,
+			Requested_Provider, Actual_Provider, Tags)
+		VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+		ON CONFLICT (Id) DO UPDATE SET Tags = excluded.Tags WHERE Smols.Tags IS NULL
+	`).bind(id, title, song1, song2, address, isSearchPublic, isInstrumental, requestedProvider, actualProvider, JSON.stringify(tags));
+	await runStatements(playlistStmt ? [insert, playlistStmt] : [insert]);
 }
 
 export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
@@ -204,6 +188,9 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 
 					if (!restored?.payload) {
 						restored = await this.env.SMOL_KV.get(retry_id, 'json') as WorkflowSteps | null;
+					}
+					if (restored?.payload && !restored.image_base64) {
+						restored = { ...restored, image_base64: await readPredecessorCover(this.env, retry_id) };
 					}
 
 					return toRetrySnapshot(restored, retry_id);
@@ -278,7 +265,6 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 			instrumental: is_instrumental,
 			...(playlist ? { playlist } : {}),
 			provider: requested_provider,
-			...(payload.workflow_version ? { workflow_version: payload.workflow_version } : {}),
 		};
 
 		await step.do('save payload', config, async () => {
@@ -690,7 +676,6 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 			// Write durable detail KV BEFORE D1 so GET /:id immediately sees KV once D1 row exists
 			await this.env.SMOL_KV.put(event.instanceId, JSON.stringify({
 				payload: persistedPayload,
-				image_base64,
 				image: true,
 				description,
 				lyrics,
@@ -793,9 +778,7 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 		// STEP 7D: Batched cache purge + schedule new DO flush alarm LAST
 		// =====================================================================
 		await step.do('finalize workflow', config, async () => {
-			const purgeTags = new Set<string>([
-				`user:${address}:created`,
-			]);
+			const purgeTags = new Set<string>();
 			if (isSearchPublic) {
 				purgeTags.add('public-smols');
 				purgeTags.add(artistSmolsCacheTag(address));
@@ -804,7 +787,9 @@ export class Workflow extends WorkflowEntrypoint<Env, WorkflowParams> {
 				purgeTags.add(await playlistCacheTag(playlist));
 			}
 
-			await purgeCacheByTags([...purgeTags]);
+			if (purgeTags.size) {
+				await purgeCacheByTags([...purgeTags]);
+			}
 			await stub.setToFlush();
 		});
 

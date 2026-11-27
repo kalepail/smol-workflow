@@ -260,7 +260,7 @@ test('GET/HEAD /video/v1/:smolId/:musicId.mp4 persists to R2, coalesces cold hit
 	assert.equal(r3.headers.get('CDN-Cache-Control'), 'no-store')
 	assert.equal(r3.headers.get('Cache-Control'), 'public, max-age=300, stale-while-revalidate=60')
 	assert.equal(r3.headers.get('X-Robots-Tag'), 'noindex, nofollow')
-	assert.ok(r3.headers.get('Cache-Tag')?.includes(`video-mux:${VIDEO_MUX_VERSION}`))
+	assert.equal(r3.headers.get('Cache-Tag'), null, 'clients never see Cache-Tag')
 	assert.equal(bucket.counts.put.get(`video/${VIDEO_MUX_VERSION}/${smolId}/${song1}.mp4`), 1, 'must mux & put only once')
 	assert.equal(bucket.counts.get.get(`${song1}.mp3`), 1, 'must read source MP3 only once across concurrent cold requests')
 
